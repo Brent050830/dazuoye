@@ -1,14 +1,26 @@
 import math
 import time
 from dataclasses import dataclass
+from threading import Lock
 
 import carla
+
+try:
+    import pygame
+except ImportError:
+    pygame = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 # Scenario configuration
 HOST = "localhost"
 PORT = 2000
 MAP_NAME = "Town04"
+CLIENT_TIMEOUT = 120.0
 FIXED_DELTA_SECONDS = 0.05
 SIM_SECONDS = 28.0
 
@@ -313,8 +325,115 @@ class CollisionMonitor:
         print("Collision detected with actor id {}".format(event.other_actor.id))
 
 
+class PygameCameraDisplay:
+    def __init__(self, world, vehicle, actor_list, width=1280, height=720):
+        self.enabled = pygame is not None and np is not None
+        self.width = width
+        self.height = height
+        self.surface = None
+        self.latest_image = None
+        self.latest_size = None
+        self.lock = Lock()
+
+        if not self.enabled:
+            print("pygame or numpy is not installed; running without animation window.")
+            self.sensor = None
+            return
+
+        pygame.init()
+        pygame.font.init()
+        self.display = pygame.display.set_mode((width, height), pygame.HWSURFACE | pygame.DOUBLEBUF)
+        pygame.display.set_caption("CARLA Emergency Avoidance Demo")
+        self.font = pygame.font.SysFont("consolas", 18)
+        self.clock = pygame.time.Clock()
+
+        blueprint = world.get_blueprint_library().find("sensor.camera.rgb")
+        blueprint.set_attribute("image_size_x", str(width))
+        blueprint.set_attribute("image_size_y", str(height))
+        blueprint.set_attribute("fov", "90")
+
+        camera_transform = carla.Transform(
+            carla.Location(x=-7.0, z=3.2),
+            carla.Rotation(pitch=-14.0),
+        )
+        self.sensor = world.spawn_actor(blueprint, camera_transform, attach_to=vehicle)
+        self.sensor.listen(self._on_image)
+        actor_list.append(self.sensor)
+
+    def _on_image(self, image):
+        with self.lock:
+            self.latest_image = bytes(image.raw_data)
+            self.latest_size = (image.width, image.height)
+
+    def process_events(self):
+        if not self.enabled:
+            return True
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+            if event.type == pygame.KEYUP and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                return False
+        return True
+
+    def render(self, sim_time, state, distance, ttc, ego_speed, lead_speed):
+        if not self.enabled:
+            return
+
+        with self.lock:
+            image_bytes = self.latest_image
+            image_size = self.latest_size
+
+        if image_bytes is not None and image_size is not None:
+            image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+            image_array = np.reshape(image_array, (image_size[1], image_size[0], 4))
+            image_array = image_array[:, :, :3][:, :, ::-1]
+            image_array = np.ascontiguousarray(image_array.swapaxes(0, 1))
+            self.surface = pygame.surfarray.make_surface(image_array)
+
+        if self.surface is not None:
+            self.display.blit(self.surface, (0, 0))
+
+        info = "t={:05.2f}s  state={}  dist={:05.1f}m  TTC={:05.2f}s  ego={:04.1f}m/s  lead={:04.1f}m/s".format(
+            sim_time,
+            state,
+            distance,
+            ttc if math.isfinite(ttc) else 99.99,
+            ego_speed,
+            lead_speed,
+        )
+        text_surface = self.font.render(info, True, (255, 255, 255))
+        background = pygame.Surface((self.width, 32))
+        background.set_alpha(150)
+        background.fill((0, 0, 0))
+        self.display.blit(background, (0, 0))
+        self.display.blit(text_surface, (12, 7))
+
+        pygame.display.flip()
+        self.clock.tick_busy_loop(60)
+
+    def close(self):
+        if self.enabled:
+            pygame.quit()
+
+
 def setup_world(client):
-    world = client.load_world(MAP_NAME)
+    world = client.get_world()
+    current_map = world.get_map().name
+    if MAP_NAME not in current_map:
+        print("Loading map {} from {}. This can take 1-2 minutes in CARLA.".format(MAP_NAME, current_map))
+        for attempt in range(3):
+            try:
+                world = client.load_world(MAP_NAME)
+                break
+            except RuntimeError as exc:
+                if attempt == 2:
+                    raise
+                print("Map load attempt {} failed: {}. Retrying...".format(attempt + 1, exc))
+                time.sleep(2.0)
+    else:
+        print("Using already loaded map {}.".format(current_map))
+
     settings = world.get_settings()
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
@@ -367,12 +486,13 @@ def choose_avoidance_side(sensor):
 
 def main():
     actor_list = []
+    camera_display = None
     world = None
     original_settings = None
 
     try:
         client = carla.Client(HOST, PORT)
-        client.set_timeout(30.0)
+        client.set_timeout(CLIENT_TIMEOUT)
 
         world = client.get_world()
         original_settings = world.get_settings()
@@ -384,6 +504,7 @@ def main():
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
         sensor = VirtualGroundTruthSensor(world, carla_map, ego_vehicle, lead_vehicle)
         mpc = SamplingMPCTracker()
+        camera_display = PygameCameraDisplay(world, ego_vehicle, actor_list)
 
         world.tick()
         set_spectator(world, ego_vehicle)
@@ -398,6 +519,10 @@ def main():
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
 
         while frame * FIXED_DELTA_SECONDS < SIM_SECONDS:
+            if camera_display is not None and not camera_display.process_events():
+                print("Animation window closed by user.")
+                break
+
             sim_time = frame * FIXED_DELTA_SECONDS
 
             if sim_time < LEAD_BRAKE_TIME:
@@ -490,6 +615,15 @@ def main():
 
             world.tick()
             set_spectator(world, ego_vehicle)
+            if camera_display is not None:
+                camera_display.render(
+                    sim_time,
+                    state,
+                    front.distance,
+                    front.ttc,
+                    ego_speed,
+                    get_speed(lead_vehicle),
+                )
             frame += 1
 
         elapsed = time.time() - start_time
@@ -502,6 +636,8 @@ def main():
     finally:
         if world is not None and original_settings is not None:
             restore_world(world, original_settings)
+        if camera_display is not None:
+            camera_display.close()
         for actor in actor_list:
             if actor is not None:
                 actor.destroy()
