@@ -16,44 +16,50 @@ except ImportError:
     np = None
 
 
-# Scenario configuration
-HOST = "localhost"
-PORT = 2000
-MAP_NAME = "Town04"
-CLIENT_TIMEOUT = 120.0
-FIXED_DELTA_SECONDS = 0.05
-SIM_SECONDS = 28.0
+# ===================== 场景全局配置 =====================
+HOST = "localhost"          # CARLA 服务器地址
+PORT = 2000                 # CARLA 服务器端口
+MAP_NAME = "Town04"         # 使用的地图（多车道直道场景）
+CLIENT_TIMEOUT = 120.0      # 客户端连接超时时间（秒）
+FIXED_DELTA_SECONDS = 0.05  # 同步仿真步长（20Hz）
+SIM_SECONDS = 28.0          # 最大仿真时长（秒）
 
-INITIAL_GAP = 48.0
-LEAD_BRAKE_TIME = 6.0
-EGO_TARGET_SPEED = 15.5
-LEAD_TARGET_SPEED = 13.0
+INITIAL_GAP = 48.0          # 自车与前车的初始纵向间距（米）
+LEAD_BRAKE_TIME = 6.0       # 前车开始紧急制动的仿真时刻（秒）
+EGO_TARGET_SPEED = 15.5     # 自车期望行驶速度（m/s）
+LEAD_TARGET_SPEED = 13.0    # 前车期望行驶速度（m/s）
 
-TTC_BRAKE_THRESHOLD = 4.5
-TTC_AVOID_THRESHOLD = 3.6
-SAFE_DISTANCE = 34.0
-LANE_CLEAR_FRONT = 45.0
-LANE_CLEAR_REAR = 18.0
+TTC_BRAKE_THRESHOLD = 4.5   # TTC低于此值时触发辅助制动（秒）
+TTC_AVOID_THRESHOLD = 3.6   # TTC低于此值时触发紧急换道（秒）
+SAFE_DISTANCE = 34.0        # 换道触发所需的最小安全距离（米）
+LANE_CLEAR_FRONT = 45.0     # 判断邻道净空：前方检测距离（米）
+LANE_CLEAR_REAR = 18.0      # 判断邻道净空：后方检测距离（米）
 
-LANE_CHANGE_LENGTH = 28.0
-MPC_HORIZON_STEPS = 18
-MPC_DT = 0.10
-WHEEL_BASE = 2.85
+LANE_CHANGE_LENGTH = 28.0   # 换道轨迹的纵向长度（米）
+MPC_HORIZON_STEPS = 18      # MPC 预测时域步数
+MPC_DT = 0.10               # MPC 每步时间间隔（秒）
+WHEEL_BASE = 2.85           # 车辆轴距（米，用于自行车模型）
 
+
+# ===================== 通用工具函数 =====================
 
 def clamp(value, low, high):
+    """将 value 限制在 [low, high] 范围内"""
     return max(low, min(high, value))
 
 
 def vector_length(vector):
+    """计算三维向量的欧几里得长度"""
     return math.sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z)
 
 
 def dot_2d(a, b):
+    """计算两个向量在水平面（XY）上的点积"""
     return a.x * b.x + a.y * b.y
 
 
 def normalize_angle(angle):
+    """将任意角度归一化到 (-π, π] 区间"""
     while angle > math.pi:
         angle -= 2.0 * math.pi
     while angle < -math.pi:
@@ -62,14 +68,17 @@ def normalize_angle(angle):
 
 
 def yaw_to_rad(rotation):
+    """将 CARLA Rotation 的偏航角（度）转换为弧度"""
     return math.radians(rotation.yaw)
 
 
 def get_speed(vehicle):
+    """获取车辆当前速度的标量值（m/s）"""
     return vector_length(vehicle.get_velocity())
 
 
 def speed_control(current_speed, target_speed):
+    """简单比例速度控制器，返回 (油门, 制动) 元组"""
     error = target_speed - current_speed
     if error >= 0.0:
         return clamp(0.18 + 0.06 * error, 0.0, 0.75), 0.0
@@ -77,6 +86,7 @@ def speed_control(current_speed, target_speed):
 
 
 def waypoint_steer(vehicle, carla_map, lookahead=12.0):
+    """基于前视路点的纯追踪转向控制，返回归一化转向量"""
     waypoint = carla_map.get_waypoint(
         vehicle.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
     )
@@ -94,12 +104,14 @@ def waypoint_steer(vehicle, carla_map, lookahead=12.0):
 
 
 def vehicle_transform_from_waypoint(waypoint):
+    """从路点生成车辆生成位置，Z轴抬高0.45m避免穿地"""
     transform = waypoint.transform
     transform.location.z += 0.45
     return transform
 
 
 def same_direction_lane(source_wp, target_wp):
+    """判断目标路点是否为与源路点同向的行驶车道"""
     if target_wp is None or target_wp.lane_type != carla.LaneType.Driving:
         return False
     yaw_error = abs(normalize_angle(yaw_to_rad(source_wp.transform.rotation) - yaw_to_rad(target_wp.transform.rotation)))
@@ -107,7 +119,7 @@ def same_direction_lane(source_wp, target_wp):
 
 
 def find_fixed_scenario_waypoint(carla_map):
-    """Pick a deterministic straight multi-lane start in Town04."""
+    """为紧急避险场景寻找一个确定性的起始路点，要求：非交叉口、前方至少70米直道、且有至少一条同向邻道。"""
     spawn_points = sorted(
         carla_map.get_spawn_points(),
         key=lambda t: (round(t.location.x, 1), round(t.location.y, 1), round(t.rotation.yaw, 1)),
@@ -147,17 +159,22 @@ def find_fixed_scenario_waypoint(carla_map):
     return selected[1]
 
 
+# ===================== 传感器模块 =====================
+
 @dataclass
-class FrontVehicleReading:
-    distance: float
-    closing_speed: float
-    ttc: float
-    lateral_offset: float
-    is_front_vehicle: bool
+class FrontVehicleReading: # 定义类
+    """前车感知数据结构"""
+    distance: float       # 纵向间距（米）
+    closing_speed: float  # 接近速度（m/s，正值表示靠近）
+    ttc: float            # 碰撞时间（秒）
+    lateral_offset: float # 横向偏移（米）
+    is_front_vehicle: bool  # 是否确认为正前方车辆
 
 
 class VirtualGroundTruthSensor:
-    """Ground-truth sensor used first; later it can be replaced by radar/lidar perception."""
+    """虚拟真值传感器：直接从仿真引擎读取精确状态，供决策与控制使用。
+    注意：此传感器无噪声和延迟，仅用于算法验证阶段，后续可替换为雷达/激光雷达感知。
+    """
 
     def __init__(self, world, carla_map, ego_vehicle, lead_vehicle):
         self.world = world
@@ -166,6 +183,7 @@ class VirtualGroundTruthSensor:
         self.lead = lead_vehicle
 
     def front_vehicle(self):
+        """计算前车的纵向距离、横向偏移、接近速度和TTC"""
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
         lead_loc = self.lead.get_location()
@@ -173,25 +191,27 @@ class VirtualGroundTruthSensor:
         right = ego_tf.get_right_vector()
         relative = lead_loc - ego_loc
 
-        longitudinal = dot_2d(relative, forward)
-        lateral = dot_2d(relative, right)
+        longitudinal = dot_2d(relative, forward)  # 纵向距离分量
+        lateral = dot_2d(relative, right)          # 横向距离分量
         lane_width = self.carla_map.get_waypoint(ego_loc).lane_width
 
         ego_speed_along = dot_2d(self.ego.get_velocity(), forward)
         lead_speed_along = dot_2d(self.lead.get_velocity(), forward)
-        closing_speed = ego_speed_along - lead_speed_along
+        closing_speed = ego_speed_along - lead_speed_along  # 接近速度（正值为靠近）
         ttc = longitudinal / closing_speed if closing_speed > 0.1 and longitudinal > 0.0 else float("inf")
 
+        # 判断前车：在正前方且横向偏移小于车道宽度的65%
         is_front = longitudinal > 0.0 and abs(lateral) < lane_width * 0.65
         return FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, is_front)
 
     def lane_clear(self, side):
+        """检测指定侧邻道在前后安全范围内是否无车"""
         ego_wp = self.carla_map.get_waypoint(
             self.ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
         )
         target_wp = ego_wp.get_left_lane() if side == "left" else ego_wp.get_right_lane()
         if not same_direction_lane(ego_wp, target_wp):
-            return False
+            return False  # 邻道不存在或方向不同
 
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
@@ -199,26 +219,36 @@ class VirtualGroundTruthSensor:
 
         for actor in self.world.get_actors().filter("vehicle.*"):
             if actor.id == self.ego.id:
-                continue
+                continue  # 跳过自车本身
 
             actor_wp = self.carla_map.get_waypoint(
                 actor.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
             )
             if actor_wp.road_id != target_wp.road_id or actor_wp.lane_id != target_wp.lane_id:
-                continue
+                continue  # 不在目标车道上，跳过
 
             relative = actor.get_location() - ego_loc
             longitudinal = dot_2d(relative, forward)
             if -LANE_CLEAR_REAR <= longitudinal <= LANE_CLEAR_FRONT:
-                return False
+                return False  # 邻道安全范围内有车，不可换道
 
         return True
 
 
+# ===================== 换道轨迹规划 =====================
+
 class QuinticLaneChangeTrajectory:
-    """Lateral offset d(s) = D * (10t^3 - 15t^4 + 6t^5), t=s/L."""
+    """五次多项式换道轨迹：d(s) = D * (10t³ - 15t⁴ + 6t⁵)，t=s/L。
+    保证起止点的位移、速度、加速度均为零，轨迹平滑。
+    """
 
     def __init__(self, start_transform, lateral_offset, length):
+        """初始化换道轨迹
+        参数：
+            start_transform: 换道起点的车辆坐标变换
+            lateral_offset:  目标侧向偏移量（负值为左换道）
+            length:          换道纵向总长度（米）
+        """
         self.origin = start_transform.location
         self.start_yaw = yaw_to_rad(start_transform.rotation)
         self.forward = start_transform.get_forward_vector()
@@ -227,10 +257,12 @@ class QuinticLaneChangeTrajectory:
         self.length = length
 
     def to_local(self, location):
+        """将全局坐标转换为以起点为原点的局部纵横坐标 (s, d)"""
         relative = location - self.origin
         return dot_2d(relative, self.forward), dot_2d(relative, self.right)
 
     def lateral_at(self, s):
+        """计算纵向位置 s 处的目标横向偏移量"""
         if s <= 0.0:
             return 0.0
         if s >= self.length:
@@ -240,6 +272,7 @@ class QuinticLaneChangeTrajectory:
         return self.lateral_offset * blend
 
     def lateral_slope_at(self, s):
+        """计算纵向位置 s 处的轨迹横向斜率（用于计算参考航向角）"""
         if s <= 0.0 or s >= self.length:
             return 0.0
         tau = s / self.length
@@ -247,26 +280,35 @@ class QuinticLaneChangeTrajectory:
         return self.lateral_offset * blend_dot / self.length
 
 
+# ===================== MPC 轨迹跟踪控制器 =====================
+
 class SamplingMPCTracker:
-    """Small receding-horizon MPC using a kinematic bicycle prediction model."""
+    """基于采样的后退时域MPC控制器，使用运动学自行车模型进行滚动优化。
+    通过枚举转向角和加速度候选值，选取预测代价最小的控制动作。
+    """
 
     def __init__(self):
-        self.previous_steer = 0.0
+        self.previous_steer = 0.0  # 上一帧的转向量，用于连续性惩罚
 
     def control(self, ego_vehicle, trajectory, target_speed):
+        """计算当前帧的最优控制指令
+        返回：carla.VehicleControl（油门、制动、转向）
+        """
         transform = ego_vehicle.get_transform()
-        s0, d0 = trajectory.to_local(transform.location)
-        yaw0 = normalize_angle(yaw_to_rad(transform.rotation) - trajectory.start_yaw)
-        v0 = get_speed(ego_vehicle)
+        s0, d0 = trajectory.to_local(transform.location)  # 当前局部纵横坐标
+        yaw0 = normalize_angle(yaw_to_rad(transform.rotation) - trajectory.start_yaw)  # 相对航向角
+        v0 = get_speed(ego_vehicle)  # 当前速度
 
+        # 候选转向角集合（共9个离散值）
         steer_candidates = [
             clamp(self.previous_steer + delta, -0.65, 0.65)
             for delta in (-0.45, -0.32, -0.20, -0.10, 0.0, 0.10, 0.20, 0.32, 0.45)
         ]
+        # 候选加速度集合（共5个离散值，单位 m/s²）
         accel_candidates = (-4.0, -2.0, -1.0, 0.0, 1.0)
 
         best_cost = float("inf")
-        best_action = (0.0, -3.0)
+        best_action = (0.0, -3.0)  # 默认保守制动动作
 
         for steer in steer_candidates:
             for accel in accel_candidates:
@@ -276,32 +318,34 @@ class SamplingMPCTracker:
                 speed = v0
                 cost = 0.0
 
+                # 沿预测时域逐步积分代价
                 for step in range(MPC_HORIZON_STEPS):
                     speed = max(0.0, speed + accel * MPC_DT)
                     s += speed * math.cos(yaw) * MPC_DT
                     d += speed * math.sin(yaw) * MPC_DT
                     yaw = normalize_angle(yaw + speed / WHEEL_BASE * math.tan(steer) * MPC_DT)
 
-                    ref_d = trajectory.lateral_at(s)
-                    ref_yaw = math.atan(trajectory.lateral_slope_at(s))
-                    lateral_error = d - ref_d
-                    yaw_error = normalize_angle(yaw - ref_yaw)
-                    speed_error = speed - target_speed
+                    ref_d = trajectory.lateral_at(s)          # 参考横向偏移
+                    ref_yaw = math.atan(trajectory.lateral_slope_at(s))  # 参考航向角
+                    lateral_error = d - ref_d                  # 横向跟踪误差
+                    yaw_error = normalize_angle(yaw - ref_yaw) # 航向误差
+                    speed_error = speed - target_speed         # 速度误差
 
-                    cost += 6.0 * lateral_error**2
-                    cost += 1.7 * yaw_error**2
-                    cost += 0.07 * speed_error**2
-                    cost += 0.08 * steer**2
-                    cost += 0.01 * accel**2
-                    cost += 0.02 * step * abs(steer - self.previous_steer)
+                    cost += 6.0 * lateral_error**2    # 横向误差惩罚
+                    cost += 1.7 * yaw_error**2        # 航向误差惩罚
+                    cost += 0.07 * speed_error**2     # 速度误差惩罚
+                    cost += 0.08 * steer**2           # 转向幅度惩罚
+                    cost += 0.01 * accel**2           # 加速度幅度惩罚
+                    cost += 0.02 * step * abs(steer - self.previous_steer)  # 转向连续性惩罚
 
                 if cost < best_cost:
                     best_cost = cost
                     best_action = (steer, accel)
 
         steer, accel = best_action
-        self.previous_steer = steer
+        self.previous_steer = steer  # 保存本帧转向量供下帧使用
 
+        # 将加速度映射为油门/制动量
         if accel >= 0.0:
             throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
             brake = 0.0
@@ -312,20 +356,31 @@ class SamplingMPCTracker:
         return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
 
 
+# ===================== 碰撞监测传感器 =====================
+
 class CollisionMonitor:
+    """CARLA 内置碰撞传感器封装，实时记录自车碰撞事件"""
+
     def __init__(self, world, vehicle, actor_list):
-        self.history = []
+        self.history = []  # 碰撞事件历史列表
         blueprint = world.get_blueprint_library().find("sensor.other.collision")
         self.sensor = world.spawn_actor(blueprint, carla.Transform(), attach_to=vehicle)
         self.sensor.listen(self._on_collision)
         actor_list.append(self.sensor)
 
     def _on_collision(self, event):
+        """碰撞事件回调：记录并打印碰撞对象信息"""
         self.history.append(event)
-        print("Collision detected with actor id {}".format(event.other_actor.id))
+        print("检测到碰撞，对象 actor id：{}".format(event.other_actor.id))
 
+
+# ===================== Pygame 相机显示模块 =====================
 
 class PygameCameraDisplay:
+    """基于Pygame的实时相机画面显示封装，实现第三人称跟随视角。
+    若未pygame或numpy则静默禁用。
+    """
+
     def __init__(self, world, vehicle, actor_list, width=1280, height=720):
         self.enabled = pygame is not None and np is not None
         self.width = width
@@ -333,7 +388,7 @@ class PygameCameraDisplay:
         self.surface = None
         self.latest_image = None
         self.latest_size = None
-        self.lock = Lock()
+        self.lock = Lock()  # 线程锁，保护图像数据线程安全
 
         if not self.enabled:
             print("pygame or numpy is not installed; running without animation window.")
@@ -361,11 +416,13 @@ class PygameCameraDisplay:
         actor_list.append(self.sensor)
 
     def _on_image(self, image):
+        """相机回调：将原始图像数据缓存到内存，不在此处解码避免造成仿真延迟"""
         with self.lock:
             self.latest_image = bytes(image.raw_data)
             self.latest_size = (image.width, image.height)
 
     def process_events(self):
+        """处理Pygame窗口事件，返回 False 则应退出仿真"""
         if not self.enabled:
             return True
 
@@ -377,6 +434,7 @@ class PygameCameraDisplay:
         return True
 
     def render(self, sim_time, state, distance, ttc, ego_speed, lead_speed):
+        """渲染当前帧图像并叠加调试信息 HUD"""
         if not self.enabled:
             return
 
@@ -385,15 +443,17 @@ class PygameCameraDisplay:
             image_size = self.latest_size
 
         if image_bytes is not None and image_size is not None:
+            # 将 BGRA 原始数昶转换为 Pygame Surface
             image_array = np.frombuffer(image_bytes, dtype=np.uint8)
             image_array = np.reshape(image_array, (image_size[1], image_size[0], 4))
-            image_array = image_array[:, :, :3][:, :, ::-1]
-            image_array = np.ascontiguousarray(image_array.swapaxes(0, 1))
+            image_array = image_array[:, :, :3][:, :, ::-1]  # BGRA -> RGB
+            image_array = np.ascontiguousarray(image_array.swapaxes(0, 1))  # HWC -> WHC
             self.surface = pygame.surfarray.make_surface(image_array)
 
         if self.surface is not None:
             self.display.blit(self.surface, (0, 0))
 
+        # 构建 HUD 信息字符串
         info = "t={:05.2f}s  state={}  dist={:05.1f}m  TTC={:05.2f}s  ego={:04.1f}m/s  lead={:04.1f}m/s".format(
             sim_time,
             state,
@@ -410,18 +470,22 @@ class PygameCameraDisplay:
         self.display.blit(text_surface, (12, 7))
 
         pygame.display.flip()
-        self.clock.tick_busy_loop(60)
+        self.clock.tick(0)  # 非阻塞计时，避免限制CARLA同步亻真的步长
 
     def close(self):
+        """close 仿真结束时释放 Pygame 资源"""
         if self.enabled:
             pygame.quit()
 
 
+# ===================== 仿真世界初始化 =====================
+
 def setup_world(client):
+    """加载指定地图并启用同步模式，返回配置好的世界对象"""
     world = client.get_world()
     current_map = world.get_map().name
     if MAP_NAME not in current_map:
-        print("Loading map {} from {}. This can take 1-2 minutes in CARLA.".format(MAP_NAME, current_map))
+        print("正在加载地图 {}...原地图: {}".format(MAP_NAME, current_map))
         for attempt in range(3):
             try:
                 world = client.load_world(MAP_NAME)
@@ -429,11 +493,12 @@ def setup_world(client):
             except RuntimeError as exc:
                 if attempt == 2:
                     raise
-                print("Map load attempt {} failed: {}. Retrying...".format(attempt + 1, exc))
+                print("地图加载失败（第{}次）: {}，正在重试...".format(attempt + 1, exc))
                 time.sleep(2.0)
     else:
-        print("Using already loaded map {}.".format(current_map))
+        print("使用已加载地图 {}。".format(current_map))
 
+    # 启用同步模式并设置固定步长
     settings = world.get_settings()
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
@@ -442,10 +507,12 @@ def setup_world(client):
 
 
 def restore_world(world, original_settings):
+    """仿真结束后恢复世界为异步模式，不影响其他程序使用CARLA"""
     world.apply_settings(original_settings)
 
 
 def spawn_scenario(world):
+    """生成场景车辆：自车（Tesla Model3）和前车（Lincoln MKZ）"""
     carla_map = world.get_map()
     blueprint_library = world.get_blueprint_library()
 
@@ -454,10 +521,10 @@ def spawn_scenario(world):
     ego_bp.set_attribute("role_name", "ego")
     lead_bp.set_attribute("role_name", "lead")
 
-    ego_wp = find_fixed_scenario_waypoint(carla_map)
-    lead_waypoints = ego_wp.next(INITIAL_GAP)
+    ego_wp = find_fixed_scenario_waypoint(carla_map)  # 找到确定性起始路点
+    lead_waypoints = ego_wp.next(INITIAL_GAP)         # 前车在自车前方INITIAL_GAP米处
     if not lead_waypoints:
-        raise RuntimeError("Could not place the lead vehicle ahead of the ego vehicle.")
+        raise RuntimeError("无法在自车前方放置前车。")
 
     ego_vehicle = world.spawn_actor(ego_bp, vehicle_transform_from_waypoint(ego_wp))
     lead_vehicle = world.spawn_actor(lead_bp, vehicle_transform_from_waypoint(lead_waypoints[0]))
@@ -466,6 +533,7 @@ def spawn_scenario(world):
 
 
 def set_spectator(world, ego_vehicle):
+    """将观察者视角定位到自车正上方，仿真中提供上帝视角"""
     ego_tf = ego_vehicle.get_transform()
     spectator = world.get_spectator()
     spectator.set_transform(
@@ -477,6 +545,7 @@ def set_spectator(world, ego_vehicle):
 
 
 def choose_avoidance_side(sensor):
+    """根据邻道净空状况选择换道方向：优先左转，其次右转，无道则返回 None"""
     if sensor.lane_clear("left"):
         return "left"
     if sensor.lane_clear("right"):
@@ -514,6 +583,7 @@ def main():
         avoidance_side = None
         start_time = time.time()
         frame = 0
+        lane_keep_frames = 0  # 记录换道成功后保持LANE_KEEP状态的帧数
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
@@ -625,6 +695,18 @@ def main():
                     get_speed(lead_vehicle),
                 )
             frame += 1
+
+            # 碰撞发生后立即提前终止仿真
+            if collision_monitor.history:
+                print("检测到碰撞，提前终止仿真。")
+                break
+
+            # 换道成功后再保持3秒（60帧）即视为任务完成，提前退出
+            if state == "LANE_KEEP":
+                lane_keep_frames += 1
+                if lane_keep_frames >= int(3.0 / FIXED_DELTA_SECONDS):
+                    print("换道避障成功，任务完成，提前结束仿真。")
+                    break
 
         elapsed = time.time() - start_time
         print(
