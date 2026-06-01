@@ -1,66 +1,175 @@
-# CARLA 前车急停与后车紧急避障程序框架
+# CARLA 城市环形道路紧急避障程序框架
 
-> 维护约定：后续如果需要更新程序说明、框架说明、参数说明或维护记录，只更新本文档，不再新建新的说明文件。
+> 维护约定：后续如果需要更新选题说明、程序框架、模块职责、参数说明、运行方式或维护记录，只更新本文档，不再新建新的说明文件。
 
-## 1. 程序目标
+## 1. 最终选题
 
-本程序基于 CARLA 搭建一个自动驾驶紧急避障演示场景：
+本项目最终选题确定为：
 
-- 前车正常行驶一段时间后突然急停。
-- 后车作为自车，先正常跟车。
-- 当检测到前车急停导致 TTC 过低时，自车进行纵向制动。
-- 如果相邻车道安全，自车生成五次多项式换道轨迹，并通过 MPC 跟踪轨迹完成横向避障。
-- 使用 pygame 打开摄像头演示窗口，实时显示后车视角和关键状态信息。
+```text
+城市交通流中自动驾驶车辆在环形道路区域内的紧急避障控制
+```
 
-主程序文件：
+核心目标不是单纯跟车，而是突出“避障”：
+
+- 在城市道路交通流中运行。
+- 选择一个环形或近似环形的道路区域作为测试路线。
+- 控制自车沿路线安全行驶一圈。
+- 在直线行驶时，前方车辆突然刹停，自车需要紧急制动并尽可能通过转向避障。
+- 在右转弯时，右侧出现或行进非机动车辆，自车需要及时避让，可以通过制动、转向或二者结合完成。
+- 整个过程中不发生碰撞，尽量不冲出车道，不出现明显失控。
+
+当前主程序文件：
 
 ```text
 dazuoye/guiji.py
 ```
 
-## 2. 运行方式
+本文档是该程序后续唯一维护文档。
 
-先启动 CARLA 服务端，等待 `CarlaUE4.exe` 的仿真窗口完全打开。
+## 2. 场景设计
 
-然后在 PowerShell 中运行：
+### 2.1 道路区域
 
-```powershell
-& E:/Anaconda_envs/envs/carla_env/python.exe d:/17871/CARLA_0.9.15/WindowsNoEditor/PythonAPI/examples/dazuoye/guiji.py
-```
-
-如果 pygame 窗口打开后需要退出，可以按：
+目标道路区域：
 
 ```text
-Esc 或 Q
+城市地图中的环形道路或近似闭环道路
 ```
 
-也可以直接关闭 pygame 窗口。
+选择原则：
 
-## 3. 整体框架
+- 道路具有明显城市交通属性。
+- 存在直线段，便于布置“前车突然刹停”工况。
+- 存在右转弯段，便于布置“右侧非机动车避让”工况。
+- 路线能够形成一圈闭环或近似闭环，便于定义“安全行驶一圈”的任务目标。
+- 尽量避免过多复杂路口干扰第一版验证。
 
-程序可以分为 7 个部分：
+当前代码中地图仍以 `Town04` 为基础，后续代码阶段可根据地图实际道路形状调整为更适合环形城市道路的地图和起点。
+
+### 2.2 交通流
+
+场景中应包含：
+
+- 自车，也就是被控制车辆。
+- 前方机动车，用于触发直线段急停避障。
+- 城市交通流车辆，用于提高场景真实感。
+- 右侧非机动车辆，用于触发右转弯避让。
+
+交通流第一版可以保持简单：
+
+- 只生成少量背景车。
+- 背景车不主动制造复杂冲突。
+- 主要危险目标仍然是前车和右侧非机动车。
+
+后续再扩展为更密集、更随机的交通流。
+
+## 3. 两个核心避障工况
+
+### 3.1 工况一：直线段前车突然刹停
+
+触发位置：
 
 ```text
-参数配置
-  ↓
-工具函数
-  ↓
-场景与车辆生成
-  ↓
-虚拟传感器感知
-  ↓
-决策状态机
-  ↓
-五次多项式轨迹生成 + MPC 跟踪控制
-  ↓
-pygame 可视化 + 资源清理
+环形路线中的直线道路段
 ```
 
-## 4. 参数配置区
+过程：
 
-位置：`guiji.py` 文件开头。
+1. 自车沿直线段正常行驶。
+2. 前方车辆在同车道内正常行驶。
+3. 到达指定时间或指定位置后，前车突然紧急制动。
+4. 自车检测到前车距离快速缩短、TTC 降低。
+5. 自车先进行纵向制动。
+6. 如果相邻车道或避让空间安全，则执行紧急转向避障。
+7. 避障完成后恢复路线跟踪，继续沿环形道路行驶。
 
-主要参数：
+控制目标：
+
+- 避免追尾前车。
+- 制动过程尽量平稳但优先保证安全。
+- 转向避障时不与旁车碰撞。
+- 避障完成后能回到可继续行驶的道路路径。
+
+### 3.2 工况二：右转弯时避让右侧非机动车
+
+触发位置：
+
+```text
+环形路线中的右转弯道路段
+```
+
+非机动车目标可以是：
+
+```text
+自行车、摩托车、行人替代目标或 CARLA 中可用的两轮车 actor
+```
+
+过程：
+
+1. 自车进入右转弯区域。
+2. 右侧非机动车沿道路右侧、路口边缘或自车右前方区域运动。
+3. 自车预测到右转轨迹与非机动车存在冲突。
+4. 自车降低速度。
+5. 如果空间允许，自车适当调整转向轨迹，避开非机动车。
+6. 非机动车通过或风险解除后，自车继续右转并回到环形路线。
+
+控制目标：
+
+- 避免与右侧非机动车发生碰撞。
+- 转弯时不压出道路边界。
+- 不出现急剧方向盘振荡。
+- 避让后继续完成一圈行驶任务。
+
+## 4. 整体程序框架
+
+新的程序框架按任务链路划分为 8 层：
+
+```text
+场景配置层
+  ↓
+环形路线规划层
+  ↓
+交通参与者生成层
+  ↓
+虚拟感知层
+  ↓
+风险评估层
+  ↓
+行为决策层
+  ↓
+轨迹生成与控制层
+  ↓
+可视化与评估层
+```
+
+当前 `guiji.py` 已经具备其中一部分基础能力：
+
+- CARLA 连接和地图加载。
+- 自车与前车生成。
+- 前车急停。
+- 虚拟传感器。
+- TTC 计算。
+- 五次多项式避障轨迹。
+- 采样式 MPC 跟踪。
+- pygame 摄像头显示。
+- 碰撞监测。
+
+后续代码需要重点补充：
+
+- 环形路线定义。
+- 行驶一圈的进度判断。
+- 城市交通流生成。
+- 右转弯区域识别。
+- 右侧非机动车目标生成。
+- 右转弯冲突检测与避让策略。
+- 紧急制动灯或车辆灯光状态控制。
+
+## 5. 场景配置层
+
+场景配置层负责统一管理地图、车辆、路线、风险阈值和控制参数。
+
+建议保留集中参数区，例如：
 
 ```python
 HOST = "localhost"
@@ -68,582 +177,601 @@ PORT = 2000
 MAP_NAME = "Town04"
 CLIENT_TIMEOUT = 120.0
 FIXED_DELTA_SECONDS = 0.05
-SIM_SECONDS = 28.0
+SIM_SECONDS = 60.0
+```
+
+后续针对新选题建议增加：
+
+```python
+ROUTE_LAPS = 1
+TRAFFIC_VEHICLE_COUNT = 10
+ENABLE_TRAFFIC_FLOW = True
+ENABLE_BICYCLE_SCENARIO = True
+ENABLE_FRONT_BRAKE_SCENARIO = True
 ```
 
 含义：
 
-- `HOST` / `PORT`：CARLA 服务端连接地址。
-- `MAP_NAME`：使用地图，当前为 `Town04`。
-- `CLIENT_TIMEOUT`：客户端等待 CARLA 响应的超时时间。
-- `FIXED_DELTA_SECONDS`：同步仿真步长，当前为 0.05 秒，即 20Hz。
-- `SIM_SECONDS`：单次演示最长运行时间。
+- `ROUTE_LAPS`：目标行驶圈数，当前为 1 圈。
+- `TRAFFIC_VEHICLE_COUNT`：背景交通车辆数量。
+- `ENABLE_TRAFFIC_FLOW`：是否启用城市交通流。
+- `ENABLE_BICYCLE_SCENARIO`：是否启用右转弯非机动车避让工况。
+- `ENABLE_FRONT_BRAKE_SCENARIO`：是否启用直线段前车急停工况。
 
-车辆和场景参数：
-
-```python
-INITIAL_GAP = 48.0
-LEAD_BRAKE_TIME = 6.0
-EGO_TARGET_SPEED = 15.5
-LEAD_TARGET_SPEED = 13.0
-```
-
-含义：
-
-- `INITIAL_GAP`：后车与前车初始距离。
-- `LEAD_BRAKE_TIME`：前车开始急刹的时间。
-- `EGO_TARGET_SPEED`：后车目标速度。
-- `LEAD_TARGET_SPEED`：前车急刹前的目标速度。
-
-安全决策参数：
+安全阈值建议分为两类：
 
 ```python
-TTC_BRAKE_THRESHOLD = 4.5
-TTC_AVOID_THRESHOLD = 3.6
-SAFE_DISTANCE = 34.0
-LANE_CLEAR_FRONT = 45.0
-LANE_CLEAR_REAR = 18.0
+FRONT_TTC_BRAKE_THRESHOLD
+FRONT_TTC_AVOID_THRESHOLD
+RIGHT_OBJECT_TTC_THRESHOLD
+RIGHT_OBJECT_DISTANCE_THRESHOLD
 ```
 
-含义：
+其中：
 
-- `TTC_BRAKE_THRESHOLD`：低于该 TTC 时开始辅助制动。
-- `TTC_AVOID_THRESHOLD`：低于该 TTC 时触发紧急换道避障。
-- `SAFE_DISTANCE`：换道触发时的前车距离条件。
-- `LANE_CLEAR_FRONT` / `LANE_CLEAR_REAR`：判断相邻车道是否安全的前后检测范围。
+- `FRONT_*` 用于前车急停。
+- `RIGHT_OBJECT_*` 用于右转弯时右侧非机动车避让。
 
-轨迹与 MPC 参数：
+## 6. 环形路线规划层
+
+环形路线规划层是新选题的关键新增内容。
+
+目标：
+
+- 在地图上选择一条闭环或近似闭环路线。
+- 自车沿该路线行驶。
+- 能判断车辆是否已经安全完成一圈。
+
+建议设计：
 
 ```python
-LANE_CHANGE_LENGTH = 28.0
-MPC_HORIZON_STEPS = 18
-MPC_DT = 0.10
-WHEEL_BASE = 2.85
+class RingRoute:
+    def __init__(self, carla_map, start_waypoint):
+        ...
+
+    def build_route(self):
+        ...
+
+    def get_target_waypoint(self, ego_location):
+        ...
+
+    def progress(self, ego_location):
+        ...
+
+    def is_lap_completed(self):
+        ...
 ```
 
-含义：
+主要职责：
 
-- `LANE_CHANGE_LENGTH`：五次多项式换道轨迹纵向长度。
-- `MPC_HORIZON_STEPS`：MPC 预测步数。
-- `MPC_DT`：MPC 每一步的时间间隔。
-- `WHEEL_BASE`：车辆轴距，用于运动学自行车模型。
+- 保存路线 waypoint 序列。
+- 提供当前最近路线点。
+- 提供前视目标点。
+- 记录自车沿路线的行驶进度。
+- 判断是否完成一圈。
 
-## 5. 工具函数
+第一版实现可以不追求复杂全局规划，先手动选择一组关键 waypoint 或固定 spawn 点，并通过 `waypoint.next()` / `get_right_lane()` / `get_left_lane()` 生成路线。
 
-工具函数负责基础数学计算和简单车辆控制。
+## 7. 交通参与者生成层
 
-主要函数：
+该层负责生成和管理场景中的其他交通参与者。
+
+建议拆分：
 
 ```python
-clamp(value, low, high)
-vector_length(vector)
-dot_2d(a, b)
-normalize_angle(angle)
-yaw_to_rad(rotation)
-get_speed(vehicle)
+spawn_ego_vehicle()
+spawn_front_brake_vehicle()
+spawn_background_traffic()
+spawn_right_side_bicycle()
 ```
 
-作用：
+### 7.1 自车
 
-- 限幅。
-- 计算向量长度。
-- 计算二维点积。
-- 角度归一化。
-- 将 CARLA yaw 转成弧度。
-- 计算车辆速度。
-
-基础控制函数：
-
-```python
-speed_control(current_speed, target_speed)
-waypoint_steer(vehicle, carla_map, lookahead=12.0)
-```
-
-作用：
-
-- `speed_control`：根据目标速度输出油门和制动。
-- `waypoint_steer`：根据 CARLA 路点进行简单车道保持转向。
-
-## 6. 场景生成模块
-
-### 6.1 地图设置
-
-函数：
-
-```python
-setup_world(client)
-restore_world(world, original_settings)
-```
-
-作用：
-
-- 加载或复用目标地图。
-- 设置同步模式。
-- 设置固定仿真步长。
-- 程序结束时恢复原始 world settings。
-
-### 6.2 固定起点选择
-
-函数：
-
-```python
-find_fixed_scenario_waypoint(carla_map)
-```
-
-作用：
-
-- 从地图 spawn points 中筛选适合演示的起点。
-- 要求路段不是路口。
-- 要求前方较长距离接近直线。
-- 要求至少存在一个同向相邻车道。
-- 最后选择一个确定性的候选点，保证每次演示尽量一致。
-
-### 6.3 车辆生成
-
-函数：
-
-```python
-spawn_scenario(world)
-```
-
-当前车型：
+推荐车型：
 
 ```text
-后车/自车：vehicle.tesla.model3
-前车：vehicle.lincoln.mkz_2020
+vehicle.tesla.model3
 ```
 
-生成方式：
+原因：
 
-- 后车生成在固定起点。
-- 前车生成在后车前方 `INITIAL_GAP` 米处。
-- 两车初始处于同一车道。
+- CARLA 示例中常用。
+- 动力响应稳定。
+- 适合演示自动驾驶控制。
 
-## 7. 虚拟传感器模块
+### 7.2 前车
 
-类：
+推荐车型：
+
+```text
+vehicle.lincoln.mkz_2020
+```
+
+作用：
+
+- 在直线段前方行驶。
+- 到达触发条件后急停。
+
+### 7.3 背景交通流
+
+背景车辆建议使用普通轿车、SUV、小型车。
+
+第一版数量不宜太多，建议：
+
+```text
+5 到 10 辆
+```
+
+背景车辆可以先使用 Traffic Manager 自动驾驶，后续再做更细的行为控制。
+
+### 7.4 右侧非机动车
+
+优先使用 CARLA 可用的两轮车蓝图，例如：
+
+```text
+vehicle.bh.crossbike
+vehicle.diamondback.century
+vehicle.gazelle.omafiets
+```
+
+如果对应蓝图不可用，可以使用摩托车或小型目标临时代替。
+
+右侧非机动车的运动位置应布置在：
+
+- 自车右转弯路径右侧。
+- 自车右前方潜在冲突区。
+- 或右转入口附近。
+
+## 8. 虚拟感知层
+
+当前代码已经有：
 
 ```python
 VirtualGroundTruthSensor
 ```
 
-当前没有使用真实 Radar/Lidar，而是使用 CARLA ground truth 作为虚拟传感器。
+后续需要从“只感知前车”扩展为“多目标虚拟感知”。
 
-### 7.1 前车检测
-
-方法：
+建议输出两类目标：
 
 ```python
-front_vehicle()
+FrontVehicleReading
+RightSideObjectReading
 ```
 
-输出：
+### 8.1 前方车辆感知
+
+继续保留：
+
+- 前车距离。
+- 相对速度。
+- TTC。
+- 横向偏移。
+- 是否为本车道前方车辆。
+
+### 8.2 右侧非机动车感知
+
+建议新增：
 
 ```python
-FrontVehicleReading(
-    distance,
-    closing_speed,
-    ttc,
-    lateral_offset,
-    is_front_vehicle
-)
+@dataclass
+class RightSideObjectReading:
+    distance: float
+    lateral_offset: float
+    relative_speed: float
+    ttc: float
+    is_conflict_object: bool
 ```
 
-含义：
+重点不只是判断“在不在右侧”，还要判断：
 
-- `distance`：前车相对自车的纵向距离。
-- `closing_speed`：自车相对前车的接近速度。
-- `ttc`：Time To Collision，预计碰撞时间。
-- `lateral_offset`：前车相对自车的横向偏移。
-- `is_front_vehicle`：是否判定为本车道前方车辆。
+- 是否位于右转轨迹附近。
+- 是否将与自车未来轨迹产生冲突。
+- 是否处于自车右前方危险区域。
 
-TTC 计算逻辑：
+第一版可以用几何规则：
 
 ```text
-ttc = distance / closing_speed
+目标在自车右侧
+目标距离小于阈值
+目标位置接近右转目标路径
 ```
 
-当接近速度很小或前车不在前方时，TTC 记为无穷大。
+后续再升级为轨迹预测。
 
-### 7.2 相邻车道安全判断
+## 9. 风险评估层
 
-方法：
+风险评估层负责把感知信息转换成风险等级。
+
+建议定义风险类型：
+
+```text
+NO_RISK
+FRONT_BRAKE_RISK
+FRONT_COLLISION_RISK
+RIGHT_SIDE_CONFLICT_RISK
+```
+
+### 9.1 前车急停风险
+
+判断依据：
+
+```text
+前车是否在本车道前方
+前车距离
+自车与前车相对速度
+TTC
+相邻车道是否可用
+```
+
+### 9.2 右侧非机动车风险
+
+判断依据：
+
+```text
+自车是否处于右转弯阶段
+非机动车是否在右侧危险区域
+非机动车与自车未来路径是否冲突
+距离是否低于阈值
+TTC 是否低于阈值
+```
+
+风险评估层应输出给行为决策层：
 
 ```python
-lane_clear(side)
+risk_type
+risk_level
+recommended_action
 ```
 
-作用：
+## 10. 行为决策层
 
-- 判断左侧或右侧相邻车道是否存在。
-- 判断相邻车道是否与当前车道同向。
-- 检查目标车道前后一定范围内是否有其他车辆。
+行为决策层负责根据风险选择驾驶行为。
 
-## 8. 轨迹生成模块
+建议状态机更新为：
 
-类：
+```text
+ROUTE_FOLLOW
+FRONT_EMERGENCY_BRAKE
+FRONT_AVOIDANCE
+RIGHT_TURN_APPROACH
+RIGHT_OBJECT_YIELD
+RIGHT_OBJECT_AVOIDANCE
+RECOVER_TO_ROUTE
+FINISHED
+```
+
+### 10.1 ROUTE_FOLLOW
+
+默认巡航状态。
+
+动作：
+
+- 跟踪环形路线。
+- 保持目标速度。
+- 持续检测前方车辆和右侧非机动车。
+
+### 10.2 FRONT_EMERGENCY_BRAKE
+
+前方风险较高但不适合转向时进入。
+
+动作：
+
+- 油门为 0。
+- 制动增大。
+- 保持或轻微修正方向。
+- 打开紧急制动灯。
+
+### 10.3 FRONT_AVOIDANCE
+
+前车急停且存在安全避让空间时进入。
+
+动作：
+
+- 生成紧急避障轨迹。
+- MPC 跟踪轨迹。
+- 同时保持必要制动。
+- 避障后回到环形路线。
+
+### 10.4 RIGHT_TURN_APPROACH
+
+接近右转弯区域时进入。
+
+动作：
+
+- 降低目标速度。
+- 加强右侧目标检测。
+- 准备右转路径跟踪。
+
+### 10.5 RIGHT_OBJECT_YIELD
+
+右侧非机动车有冲突风险，但通过减速可以解决时进入。
+
+动作：
+
+- 主动制动或低速滑行。
+- 等待非机动车通过。
+- 保持转向轨迹不过度靠右。
+
+### 10.6 RIGHT_OBJECT_AVOIDANCE
+
+右侧非机动车风险更高，需要制动和转向共同避让时进入。
+
+动作：
+
+- 降低速度。
+- 调整右转轨迹，使自车避开非机动车。
+- 必要时扩大转弯半径。
+- 风险解除后恢复路线。
+
+### 10.7 RECOVER_TO_ROUTE
+
+避障结束后的恢复状态。
+
+动作：
+
+- 重新寻找环形路线上的目标 waypoint。
+- 平滑回到正常路线跟踪。
+- 恢复目标速度。
+
+### 10.8 FINISHED
+
+完成一圈后进入。
+
+动作：
+
+- 减速停车。
+- 输出评价结果。
+- 清理 actor 和传感器。
+
+## 11. 轨迹生成与控制层
+
+当前已有：
 
 ```python
 QuinticLaneChangeTrajectory
+SamplingMPCTracker
 ```
 
-轨迹形式：
+后续应扩展为三类轨迹：
+
+```text
+正常路线跟踪轨迹
+直线段紧急避障轨迹
+右转弯避让轨迹
+```
+
+### 11.1 正常路线跟踪
+
+用于沿环形道路行驶。
+
+可先使用 waypoint 前视控制。
+
+后续可统一交给 MPC 跟踪。
+
+### 11.2 前车急停避障轨迹
+
+继续使用五次多项式：
 
 ```text
 d(s) = D * (10t^3 - 15t^4 + 6t^5)
 t = s / L
 ```
 
-其中：
+用于快速完成横向避障。
 
-- `s`：沿车道方向的纵向进度。
-- `d`：相对起始车道的横向偏移。
-- `D`：目标横向偏移，通常约等于一个车道宽。
-- `L`：换道轨迹纵向长度。
+### 11.3 右转弯避让轨迹
 
-特点：
+右转弯场景不一定适合简单直线换道轨迹。
 
-- 起点横向位移为 0。
-- 终点横向位移为目标车道偏移量。
-- 起点和终点横向速度为 0。
-- 起点和终点横向加速度为 0。
-- 适合做平滑换道轨迹。
-
-主要方法：
-
-```python
-to_local(location)
-lateral_at(s)
-lateral_slope_at(s)
-```
-
-作用：
-
-- `to_local`：把 CARLA 世界坐标转换为轨迹局部坐标。
-- `lateral_at`：计算某个纵向位置对应的横向参考位置。
-- `lateral_slope_at`：计算轨迹斜率，用于参考航向角。
-
-## 9. MPC 跟踪模块
-
-类：
-
-```python
-SamplingMPCTracker
-```
-
-当前实现是轻量采样式 MPC，不依赖外部优化器。
-
-### 9.1 车辆模型
-
-使用运动学自行车模型近似车辆运动：
+建议第一版使用：
 
 ```text
-s_next = s + v * cos(yaw) * dt
-d_next = d + v * sin(yaw) * dt
-yaw_next = yaw + v / Lw * tan(steer) * dt
-v_next = v + accel * dt
+路线 waypoint + 横向安全偏移 + 速度降低
 ```
 
-其中：
+也就是：
 
-- `s`：轨迹纵向坐标。
-- `d`：轨迹横向坐标。
-- `yaw`：车辆相对轨迹起始方向的航向角。
-- `v`：车速。
-- `steer`：方向盘控制量。
-- `accel`：加速度候选值。
-- `Lw`：车辆轴距。
+- 保留右转大方向。
+- 当右侧非机动车靠近时，自车目标轨迹稍微向左偏移。
+- 同时降低速度。
+- 风险解除后回到正常右转路线。
 
-### 9.2 控制量搜索
+如果后续精度要求更高，可以为右转弯区域单独生成 Frenet 轨迹或基于曲线路径的五次多项式偏移。
 
-MPC 在多个候选控制量中搜索：
+## 12. 紧急制动灯与车辆灯光
 
-```text
-steer_candidates
-accel_candidates
-```
+新选题明确要求体现紧急制动。
 
-对每一组候选控制量，在预测时域内模拟车辆运动，并计算总代价。
-
-### 9.3 代价函数
-
-主要考虑：
-
-- 横向误差。
-- 航向角误差。
-- 速度误差。
-- 转向幅度。
-- 加速度幅度。
-- 转向变化平滑性。
-
-总代价越小，说明该控制量越适合当前轨迹跟踪。
-
-### 9.4 输出
-
-方法：
+后续代码中应加入车辆灯光控制：
 
 ```python
-control(ego_vehicle, trajectory, target_speed)
+carla.VehicleLightState.Brake
 ```
 
-输出：
+建议规则：
 
-```python
-carla.VehicleControl(
-    throttle,
-    brake,
-    steer
-)
-```
+- 正常巡航：关闭制动灯。
+- 普通减速：根据 brake 控制量开启制动灯。
+- 紧急制动：开启制动灯，并可考虑开启危险警示灯。
 
-## 10. 决策状态机
+如果 CARLA 版本或车辆蓝图不支持完整灯光效果，应在文档和程序输出中说明。
 
-主状态机位于：
+## 13. pygame 可视化与演示
 
-```python
-main()
-```
-
-当前状态：
-
-```text
-FOLLOW
-AVOID
-LANE_KEEP
-EMERGENCY_BRAKE
-```
-
-### 10.1 FOLLOW
-
-正常跟车状态。
-
-逻辑：
-
-- 前车未急停或 TTC 较大时，后车保持目标速度并沿当前车道行驶。
-- 如果 TTC 低于制动阈值，开始降低速度。
-- 如果 TTC 低于避障阈值且前车距离小于安全距离，则尝试换道避障。
-
-### 10.2 AVOID
-
-紧急避障状态。
-
-进入条件：
-
-```text
-front.is_front_vehicle == True
-front.distance < SAFE_DISTANCE
-front.ttc < TTC_AVOID_THRESHOLD
-相邻车道安全
-```
-
-动作：
-
-- 选择左侧或右侧安全车道。
-- 生成五次多项式换道轨迹。
-- 使用 MPC 跟踪轨迹。
-- 同时保留一定纵向制动，降低追尾风险。
-
-### 10.3 LANE_KEEP
-
-避障完成后的车道保持状态。
-
-进入条件：
-
-- 自车沿轨迹前进超过换道长度。
-- 横向位置接近目标车道。
-
-动作：
-
-- 重新使用路点车道保持控制。
-- 继续向前行驶。
-
-### 10.4 EMERGENCY_BRAKE
-
-纯紧急制动状态。
-
-进入条件：
-
-- TTC 过低。
-- 相邻车道不可用。
-
-动作：
-
-```python
-throttle = 0.0
-brake = 1.0
-steer = 0.0
-```
-
-## 11. pygame 可视化模块
-
-类：
+当前已有：
 
 ```python
 PygameCameraDisplay
 ```
 
-作用：
-
-- 给后车挂载一个 RGB 摄像头。
-- 将 CARLA camera 的 BGRA 图像转为 RGB。
-- 使用 `pygame.surfarray.make_surface` 显示图像。
-- 在窗口上方叠加演示状态。
-
-显示内容：
+后续可视化建议显示：
 
 ```text
-仿真时间
 当前状态
-前车距离
-TTC
+已完成路线进度
+当前工况：前车急停 / 右侧非机动车 / 正常行驶
+前车 TTC
+右侧目标 TTC
 自车速度
-前车速度
+制动值
+转向值
+碰撞次数
 ```
 
-退出方式：
+pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置为俯视跟随，方便观察整体交通流和环形路线。
+
+## 14. 评价指标
+
+为了证明“安全行驶一圈”，建议记录以下指标：
 
 ```text
-Esc
-Q
-关闭窗口
+是否完成一圈
+是否发生碰撞
+是否成功避开前车急停
+是否成功避开右侧非机动车
+最大制动值
+最大转向值
+最小前车距离
+最小前车 TTC
+最小右侧目标距离
+最小右侧目标 TTC
+是否离开道路
+是否压线或明显越界
 ```
 
-如果环境中缺少 `pygame` 或 `numpy`，程序会自动禁用动画窗口，但仍可以继续运行 CARLA 控制逻辑。
-
-## 12. 碰撞监测模块
-
-类：
-
-```python
-CollisionMonitor
-```
-
-作用：
-
-- 给后车挂载 CARLA collision sensor。
-- 如果发生碰撞，记录到 `history`。
-- 程序结束时打印碰撞次数。
-
-成功演示的目标结果：
+最终成功条件建议定义为：
 
 ```text
-Collisions: 0
+完成环形路线 1 圈
+碰撞次数为 0
+前车急停工况避障成功
+右转非机动车工况避让成功
+车辆最终仍在可行驶道路上
 ```
 
-## 13. 主程序执行流程
+## 15. 主程序执行流程
 
-主入口：
-
-```python
-if __name__ == "__main__":
-    main()
-```
-
-`main()` 的核心流程：
+新选题下，`main()` 的目标流程应调整为：
 
 ```text
-1. 创建 CARLA client
-2. 设置 timeout
-3. 保存原始 world settings
-4. 加载或复用目标地图
-5. 设置同步模式和固定步长
-6. 生成后车和前车
-7. 挂载 collision sensor
-8. 创建虚拟传感器
-9. 创建 MPC 控制器
-10. 创建 pygame 摄像头窗口
-11. 进入仿真主循环
-12. 前车在指定时间后急刹
-13. 后车读取虚拟感知信息
-14. 决策 FOLLOW / AVOID / LANE_KEEP / EMERGENCY_BRAKE
-15. 输出车辆控制量
-16. 刷新 CARLA 世界和 pygame 窗口
-17. 仿真结束后恢复设置并销毁 actor
+1. 连接 CARLA 服务端
+2. 加载或复用城市地图
+3. 设置同步模式和固定仿真步长
+4. 选择环形道路区域
+5. 构建环形路线
+6. 生成自车
+7. 生成前车急停目标
+8. 生成右侧非机动车目标
+9. 生成少量背景交通流
+10. 挂载碰撞传感器和 pygame 摄像头
+11. 进入仿真循环
+12. 自车默认跟踪环形路线
+13. 在直线段触发前车急停工况
+14. 自车执行紧急制动和转向避障
+15. 自车恢复到环形路线
+16. 在右转弯段触发右侧非机动车工况
+17. 自车执行制动和转向避让
+18. 自车继续沿环形路线行驶
+19. 判断是否完成一圈
+20. 输出评价结果
+21. 恢复 world settings 并销毁 actor
 ```
 
-## 14. 关键运行现象
+## 16. 当前代码与新选题的关系
 
-正常运行时控制台会输出类似：
+当前 `guiji.py` 可以视为新选题的第一阶段原型。
+
+已经具备：
+
+- 前车急停。
+- 自车紧急制动。
+- 自车横向转向避障。
+- 五次多项式轨迹生成。
+- MPC 跟踪。
+- pygame 演示窗口。
+- 碰撞监测。
+
+尚未完成：
+
+- 城市环形路线。
+- 行驶一圈判断。
+- 交通流背景车辆。
+- 右转弯区域识别。
+- 右侧非机动车生成。
+- 右转弯非机动车避让。
+- 紧急制动灯显示控制。
+- 完整评价指标记录。
+
+后续代码修改应围绕这些未完成项展开。
+
+## 17. 建议开发顺序
+
+建议按以下顺序推进代码：
 
 ```text
-Scenario started: map=Town04, ego=Tesla Model3, lead=Lincoln MKZ 2020
-Lead car will brake hard at 6.0s.
-t=00.00s state=FOLLOW ...
-Avoidance started at ... side=right ...
-Avoidance completed at ...
-Scenario finished ... Collisions: 0
-Cleanup finished.
+第一步：固定城市环形路线和起点
+第二步：实现自车沿环形路线稳定行驶一圈
+第三步：把现有前车急停避障工况嵌入直线段
+第四步：加入右转弯区域识别
+第五步：生成右侧非机动车并设计冲突触发
+第六步：实现右转弯制动和转向避让
+第七步：加入背景交通流
+第八步：加入制动灯和演示状态显示
+第九步：记录评价指标并输出结果
 ```
+
+这个顺序的好处是每一步都能单独验证，不会一次性把路线、交通流、非机动车和避障控制全部混在一起调试。
+
+## 18. 常见运行问题
+
+### 18.1 地图加载较慢
 
 如果看到：
 
 ```text
-Loading map Town04 ...
+Loading map ...
 ```
 
 说明 CARLA 正在切换地图，可能需要等待几十秒到一两分钟。
 
-## 15. 常见问题
+不要在 `client.load_world(MAP_NAME)` 时频繁按 `Ctrl+C`。
 
-### 15.1 程序卡在加载地图
+### 18.2 无法导入 carla
 
-原因：
-
-- CARLA 正在从当前地图切换到 `MAP_NAME`。
-- 地图第一次加载可能较慢。
-
-处理：
-
-- 等待 1 到 2 分钟。
-- 不要在 `client.load_world(MAP_NAME)` 时按 `Ctrl+C`。
-- 如果想使用当前地图，可以把 `MAP_NAME` 改成当前 CARLA 窗口中已加载的地图。
-
-### 15.2 无法导入 carla
-
-原因：
-
-- 使用了错误的 Python 环境。
-
-处理：
-
-使用：
+应使用 CARLA 对应的 Python 环境：
 
 ```powershell
 E:/Anaconda_envs/envs/carla_env/python.exe
 ```
 
-不要直接使用系统默认 Python 3.13。
+不要直接使用系统默认 Python。
 
-### 15.3 pygame 图像格式错误
-
-现已处理。
-
-程序使用 numpy 将 CARLA camera 的 BGRA 数据转换为 RGB，再交给 pygame 显示。
-
-### 15.4 pygame 窗口没有打开
+### 18.3 pygame 窗口没有打开
 
 可能原因：
 
-- 没有安装 pygame。
-- 没有安装 numpy。
-- CARLA 没有连接成功，程序还没有进入显示阶段。
+- CARLA 服务端没有启动。
+- 程序还在加载地图。
+- 缺少 pygame。
+- 缺少 numpy。
 
-## 16. 后续可扩展方向
+### 18.4 pygame 图像格式错误
 
-可以在现有框架上继续扩展：
+当前程序已使用 numpy 将 CARLA camera 的 BGRA 数据转换为 RGB，再交给 pygame 显示。
 
-- 将虚拟传感器替换为真实 Radar。
-- 将虚拟传感器替换为 Lidar 点云聚类。
-- 加入前方多车场景。
-- 加入旁车，测试无法换道时的纯制动逻辑。
-- 将采样式 MPC 替换为带约束优化器的 MPC。
-- 记录轨迹数据并导出 CSV。
-- 使用 matplotlib 绘制距离、TTC、速度、转向角随时间变化曲线。
+## 19. 维护记录
 
-## 17. 维护记录
+### 2026-06-01
+
+- 根据最终选题重写维护文档。
+- 将项目目标更新为“城市交通流中环形道路一圈安全行驶与紧急避障”。
+- 新增两个核心工况：直线段前车突然刹停、右转弯避让右侧非机动车。
+- 新增环形路线规划、交通流、右侧非机动车、风险评估、制动灯、评价指标等后续代码设计内容。
+- 保持维护约定：后续文档只更新本文档。
 
 ### 2026-05-30
 
 - 建立本文档。
-- 记录 `guiji.py` 的程序框架、模块职责、主流程和常见问题。
+- 记录 `guiji.py` 的初始程序框架、模块职责、主流程和常见问题。
 - 明确后续文档维护只更新本文档。
