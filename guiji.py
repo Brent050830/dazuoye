@@ -58,8 +58,6 @@ TOWN10_RIGHT_TURN_PREPARE_MAX_X = 56.0
 TOWN10_RIGHT_TURN_PREPARE_HEADING_DEGREES = 180.0
 TOWN10_RIGHT_TURN_PREPARE_HEADING_TOLERANCE = 15.0
 ROUTE_COMPLETION_HOLD_SECONDS = 4.0
-LAP_MIN_DISTANCE = 520.0 # 完成一圈的最小行驶距离（米），用于判断是否满足绕场一周的条件，避免过早结束仿真。Town10 的一圈大约 550 米，因此设置为 520 米 留有一定余量。
-LAP_COMPLETION_RADIUS = 70.0 # 判断一圈完成的半径（米），用于确定车辆是否回到了起始位置
 
 
 # ===================== 通用工具函数 =====================
@@ -139,63 +137,30 @@ def same_direction_lane(source_wp, target_wp):
     return yaw_error < math.radians(30.0)
 
 
-def find_fixed_scenario_waypoint(carla_map):
-    """在地图中找到一个满足条件的固定起始路点，确保每次仿真从同一位置开始。"""
+def get_town10_start_waypoint(carla_map):
+    """获取 Town10 固定起点，确保每次仿真从同一位置开始。"""
     spawn_points = sorted(
         carla_map.get_spawn_points(),
         key=lambda t: (round(t.location.x, 1), round(t.location.y, 1), round(t.rotation.yaw, 1)),
     )
 
-    if "Town10HD_Opt" in carla_map.name:
-        if TOWN10_START_SPAWN_INDEX >= len(spawn_points):
-            raise RuntimeError("Town10 fixed spawn index is out of range.")
-        transform = spawn_points[TOWN10_START_SPAWN_INDEX]
-        waypoint = carla_map.get_waypoint(
-            transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
-        )
-        print(
-            "Town10 fixed loop start: sorted_spawn_index={}, location=({:.1f}, {:.1f}), road={}, lane={}".format(
-                TOWN10_START_SPAWN_INDEX,
-                waypoint.transform.location.x,
-                waypoint.transform.location.y,
-                waypoint.road_id,
-                waypoint.lane_id,
-            )
-        )
-        return waypoint
+    if TOWN10_START_SPAWN_INDEX >= len(spawn_points):
+        raise RuntimeError("Town10 fixed spawn index is out of range.")
 
-    candidates = []
-    for index, transform in enumerate(spawn_points):
-        waypoint = carla_map.get_waypoint(
-            transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
-        )
-        if waypoint.is_junction:
-            continue
-
-        future = waypoint.next(70.0)
-        if not future or future[0].is_junction:
-            continue
-
-        yaw_now = yaw_to_rad(waypoint.transform.rotation)
-        yaw_future = yaw_to_rad(future[0].transform.rotation)
-        if abs(normalize_angle(yaw_future - yaw_now)) > math.radians(8.0):
-            continue
-
-        left_ok = same_direction_lane(waypoint, waypoint.get_left_lane())
-        right_ok = same_direction_lane(waypoint, waypoint.get_right_lane())
-        if left_ok or right_ok:
-            candidates.append((index, waypoint, left_ok, right_ok))
-
-    if not candidates:
-        raise RuntimeError("No straight multi-lane spawn point found for the emergency avoidance scenario.")
-
-    selected = candidates[len(candidates) // 2]
+    transform = spawn_points[TOWN10_START_SPAWN_INDEX]
+    waypoint = carla_map.get_waypoint(
+        transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
+    )
     print(
-        "Fixed scenario start: sorted_spawn_index={}, left_lane={}, right_lane={}".format(
-            selected[0], selected[2], selected[3]
+        "Town10 fixed loop start: sorted_spawn_index={}, location=({:.1f}, {:.1f}), road={}, lane={}".format(
+            TOWN10_START_SPAWN_INDEX,
+            waypoint.transform.location.x,
+            waypoint.transform.location.y,
+            waypoint.road_id,
+            waypoint.lane_id,
         )
     )
-    return selected[1]
+    return waypoint
 
 
 # ===================== 传感器模块 =====================
@@ -506,7 +471,7 @@ class DemoHUD:
             ),
             "lap_distance={}m / target={}m".format(
                 self._format_number(lap_distance, 1),
-                self._format_number(telemetry.get("lap_target_distance", LAP_MIN_DISTANCE), 1),
+                self._format_number(telemetry.get("lap_target_distance"), 1),
             ),
         ]
 
@@ -618,7 +583,7 @@ def spawn_scenario(world):
     ego_bp.set_attribute("role_name", "ego")
     lead_bp.set_attribute("role_name", "lead")
 
-    ego_wp = find_fixed_scenario_waypoint(carla_map)  # 找到确定性起始路点
+    ego_wp = get_town10_start_waypoint(carla_map)  # 找到确定性起始路点
     lead_waypoints = ego_wp.next(INITIAL_GAP)         # 前车在自车前方INITIAL_GAP米处
     if not lead_waypoints:
         raise RuntimeError("无法在自车前方放置前车。")
@@ -648,34 +613,6 @@ def choose_avoidance_side(sensor):
     if sensor.lane_clear("right"):
         return "right"
     return None
-
-
-class LapTracker:
-    """跟踪车辆绕场一周的进度，判断是否满足完成条件：行驶距离超过 min_distance 且回到起始位置附近。
-    通过 update() 方法持续更新状态，返回是否完成一圈。"""
-
-    def __init__(self, vehicle, min_distance, completion_radius): # 初始化方法，记录起始位置和完成条件
-        location = vehicle.get_location()
-        self.start_location = carla.Location(location.x, location.y, location.z)
-        self.previous_location = carla.Location(location.x, location.y, location.z)
-        self.min_distance = min_distance
-        self.completion_radius = completion_radius
-        self.distance = 0.0
-        self.completed = False
-
-    def update(self, vehicle): # 更新方法，计算行驶距离并判断是否完成一圈
-        location = vehicle.get_location()
-        current_location = carla.Location(location.x, location.y, location.z)
-        self.distance += current_location.distance(self.previous_location)
-        self.previous_location = current_location
-
-        if (
-            not self.completed
-            and self.distance >= self.min_distance
-            and current_location.distance(self.start_location) <= self.completion_radius
-        ):
-            self.completed = True
-        return self.completed
 
 
 class LoopRoute:
@@ -829,15 +766,11 @@ class LoopRoute:
         return events
 
     def _make_turn_event(self, direction, total_degrees, start_index, end_index):
-        start_location = self.points[start_index]
-        end_location = self.points[end_index]
         return {
             "direction": direction,
             "degrees": total_degrees,
             "start_index": start_index,
             "end_index": end_index,
-            "start_location": start_location,
-            "end_location": end_location,
         }
 
     def _nearest_index(self, location, anchor_index=None, search_back=5, search_ahead=45):
@@ -913,7 +846,6 @@ def main():
 
         state = "FOLLOW"
         trajectory = None
-        avoidance_side = None
         start_time = time.time()
         frame = 0
         route_completion_time = None

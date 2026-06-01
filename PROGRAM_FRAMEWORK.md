@@ -821,6 +821,10 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 主要改动：删除 `ROUTE_COMPLETION_HOLD_SPEED`；`ROUTE_HOLD` 阶段改为 `throttle=0.0`、`brake=1.0`、`steer=0.0`，车辆到达路线终点后直接停车并保持 `4s`。
 - 验证情况：已运行 `py_compile` 语法检查通过；已实际运行 `guiji.py`，输出显示路线长度 `520.0m`、`131` 个 waypoint、完成路线后进入 `ROUTE_HOLD`，`steer=+0.00`、`brake=1.00`，速度从约 `11.1m/s` 降到 `0.0m/s` 并保持到结束，碰撞次数为 0。
 - 未覆盖风险：已验证当前固定路线与终点停车保持；目前仍未加入右转路口行人/非机动车目标，也未验证该目标出现后的横向/纵向避让策略。
+- 本次目标：对当前已跑通版本做一次保守剪枝和收敛，删除不再需要的旧逻辑，降低后续继续加场景时的维护成本。
+- 主要改动：删除已被 `LoopRoute` 取代的旧 `LapTracker` 和 `LAP_*` 常量；将起点选择收敛为 Town10 固定起点函数 `get_town10_start_waypoint`，移除其他地图自动搜索直道起点的旧分支；删除右转事件中未使用的起止坐标字段；清理主循环中不再需要的外层 `avoidance_side` 变量。
+- 验证情况：已运行 `py_compile` 语法检查通过；已实际运行 `guiji.py`，输出显示路线长度 `520.0m`、`131` 个 waypoint、`right_lane_before_turn=True`、`prepare_index=45`、最后路口右转事件 `right:72.9deg@126-130`、前车急停避障完成、进入 `ROUTE_HOLD` 后停车保持、碰撞次数为 0。
+- 未覆盖风险：本次只做保守剪枝，未重构 MPC、换道轨迹、显示层或路线核心生成逻辑；尚未加入右转路口行人/非机动车目标。
 
 ### 2026-05-30
 
@@ -857,5 +861,15 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 为什么这样改：短路线更接近当前大作业场景调试需要，避免车辆绕 Town10 外侧大圈；右转前靠右更符合后续路口避让行人/非机动车的场景要求；终点停车可以避免继续追踪最后 waypoint 导致车辆回摆。
 - 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile dazuoye\guiji.py`；已实际运行 `guiji.py`，输出显示路线长度 `520.0m`、`131` 个 waypoint、`right_lane_before_turn=True`、`prepare_index=45`、最后路口右转事件 `right:72.9deg@126-130`、前车急停避障完成、进入 `ROUTE_HOLD` 后 `steer=+0.00`、`brake=1.00`、速度降到 `0.0m/s`，碰撞次数为 0。
 - 未覆盖风险：尚未加入右转路口行人/非机动车目标、背景交通流、制动灯控制和真实传感器；目前验证集中在当前固定起点、固定路线和前车急停避障。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- PR/分支信息：准备直接推送到 `origin/main`，未创建独立 PR。
+
+### 2026-06-01 - 剪枝收敛 Town10 演示旧逻辑
+
+- 本次目标：对当前已跑通的 Town10 演示代码做一次保守剪枝和收敛，删除不再需要的旧逻辑，降低后续继续加入右转非机动车/行人避让场景时的维护成本。
+- 主要改动：删除已被 `LoopRoute` 取代的旧 `LapTracker`；删除不再使用的 `LAP_MIN_DISTANCE` 和 `LAP_COMPLETION_RADIUS`；将起点选择收敛为 `get_town10_start_waypoint`，移除其他地图自动搜索直道起点的旧分支；删除右转事件中未使用的起止坐标字段；清理主循环中不再需要的外层 `avoidance_side` 变量；更新维护记录。
+- 为什么这样改：当前代码已经固定在 `Town10HD_Opt`、固定起点和 `LoopRoute` 短路线方案上，旧的一圈判断和其他地图起点搜索逻辑已经不再承担实际职责。先剪掉这些复杂度，可以让后续加非机动车/行人避让时更容易定位核心流程，也减少误读旧逻辑的风险。
+- 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile dazuoye\guiji.py`；已实际运行 `guiji.py`，输出显示路线长度 `520.0m`、`131` 个 waypoint、`right_lane_before_turn=True`、`prepare_index=45`、最后路口右转事件 `right:72.9deg@126-130`、前车急停避障完成、进入 `ROUTE_HOLD` 后停车保持，碰撞次数为 0。
+- 未覆盖风险：本次只做保守剪枝，未重构 MPC、换道轨迹、显示层或路线核心生成逻辑；尚未加入右转路口行人/非机动车目标；尚未验证行人/非机动车目标出现后的横向/纵向避让策略。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - PR/分支信息：准备直接推送到 `origin/main`，未创建独立 PR。
