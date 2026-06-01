@@ -41,6 +41,23 @@ MPC_DT = 0.10               # MPC 每步时间间隔（秒）
 WHEEL_BASE = 2.85           # 车辆轴距（米，用于自行车模型）
 
 TOWN10_START_SPAWN_INDEX = 141 # Town10HD_Opt 的固定起始点在排序后的生成点列表中的索引位置，确保每次运行都从同一位置开始，便于结果对比和调试
+TOWN10_ROUTE_STEP = 4.0
+TOWN10_ROUTE_CLOSE_RADIUS = 8.0
+TOWN10_ROUTE_MIN_POINTS_BEFORE_CLOSE = 80
+TOWN10_ROUTE_SELF_CLOSE_MIN_SEPARATION = 55
+TOWN10_ROUTE_CLOSE_HEADING_DEGREES = 25.0
+TOWN10_SHORT_LOOP_BRANCH_OVERRIDES = {
+    (5, -1): 795,  # 走 Town10 中间连接路，避免继续绕外侧大圈。
+    (13, -2): 934, # 第二个路口转弯后继续直行，跳过转弯后的第一个小路口。
+    (20, -2): 875, # 再次转弯后跳过第一个路口，到第二个路口再右转。
+}
+TOWN10_RIGHT_TURN_PREPARE_LANE_CHANGES = {
+    (1, 1),  # 第一个大弯结束后的直道上，为后续十字路口右转提前进入同向右侧车道。
+}
+TOWN10_RIGHT_TURN_PREPARE_MAX_X = 56.0
+TOWN10_RIGHT_TURN_PREPARE_HEADING_DEGREES = 180.0
+TOWN10_RIGHT_TURN_PREPARE_HEADING_TOLERANCE = 15.0
+ROUTE_COMPLETION_HOLD_SECONDS = 4.0
 LAP_MIN_DISTANCE = 520.0 # 完成一圈的最小行驶距离（米），用于判断是否满足绕场一周的条件，避免过早结束仿真。Town10 的一圈大约 550 米，因此设置为 520 米 留有一定余量。
 LAP_COMPLETION_RADIUS = 70.0 # 判断一圈完成的半径（米），用于确定车辆是否回到了起始位置
 
@@ -662,37 +679,177 @@ class LapTracker:
 
 
 class LoopRoute:
-    """预先生成一条环形路径，供纯追踪控制使用。通过在地图上沿车道连续采样路点，直到回到起始位置附近或达到最大采样数。
-    通过 steer() 方法计算当前的转向控制量，通过 update() 方法跟踪"""
+    """生成 Town10 固定短路线，供纯追踪控制使用。
 
-    def __init__(self, start_waypoint, step_distance=4.0, close_radius=8.0):
+    当前路线保留起点和直道急停避障段，在左侧路口走中间连接路，
+    避免继续绕 Town10 外侧大圈；末段先进入右侧车道，再完成右转并闭合到已经过的北向道路。
+    """
+
+    def __init__(
+        self,
+        start_waypoint,
+        step_distance=TOWN10_ROUTE_STEP,
+        close_radius=TOWN10_ROUTE_CLOSE_RADIUS,
+    ):
         self.step_distance = step_distance
         self.close_radius = close_radius
+        self.waypoints = []
         self.points = []
+        self.turn_events = []
+        self.close_to_index = None
+        self.right_lane_prepare_index = None
         self.completed = False
         self.max_index = 0
         self.last_index = 0
 
-        waypoint = start_waypoint
-        start_location = start_waypoint.transform.location
-        self.points.append(start_location)
-
-        for _ in range(800):
-            next_waypoints = waypoint.next(step_distance)
-            if not next_waypoints:
-                break
-            waypoint = next_waypoints[0]
-            location = waypoint.transform.location
-            self.points.append(location)
-            if len(self.points) > 50 and location.distance(start_location) <= close_radius:
-                break
+        self._build_short_town10_route(start_waypoint)
 
         if len(self.points) < 60:
-            raise RuntimeError("Failed to build a usable Town10 loop route.")
+            raise RuntimeError("Failed to build a usable Town10 short loop route.")
 
         self.length = (len(self.points) - 1) * step_distance
+        self.turn_events = self._detect_turn_events()
+        self.right_turn_count = len([event for event in self.turn_events if event["direction"] == "right"])
+        self.right_lane_before_turn = self.right_lane_prepare_index is not None
 
-    def _nearest_index(self, location):
+    def _select_next_waypoint(self, waypoint, next_waypoints):
+        preferred_road = TOWN10_SHORT_LOOP_BRANCH_OVERRIDES.get((waypoint.road_id, waypoint.lane_id))
+        if preferred_road is not None:
+            for candidate in next_waypoints:
+                if candidate.road_id == preferred_road:
+                    return candidate
+        return next_waypoints[0]
+
+    def _try_prepare_right_lane(self, waypoint):
+        if self.right_lane_prepare_index is not None:
+            return waypoint
+        if (waypoint.road_id, waypoint.lane_id) not in TOWN10_RIGHT_TURN_PREPARE_LANE_CHANGES:
+            return waypoint
+
+        location = waypoint.transform.location
+        heading_error = abs(
+            normalize_angle(
+                math.radians(waypoint.transform.rotation.yaw - TOWN10_RIGHT_TURN_PREPARE_HEADING_DEGREES)
+            )
+        )
+        if (
+            location.x > TOWN10_RIGHT_TURN_PREPARE_MAX_X
+            or heading_error > math.radians(TOWN10_RIGHT_TURN_PREPARE_HEADING_TOLERANCE)
+        ):
+            return waypoint
+
+        right_waypoint = waypoint.get_right_lane()
+        if not same_direction_lane(waypoint, right_waypoint):
+            return waypoint
+
+        self.right_lane_prepare_index = len(self.points)
+        self.waypoints.append(right_waypoint)
+        self.points.append(right_waypoint.transform.location)
+        return right_waypoint
+
+    def _find_self_close_index(self, waypoint):
+        if len(self.points) <= TOWN10_ROUTE_MIN_POINTS_BEFORE_CLOSE:
+            return None
+
+        location = waypoint.transform.location
+        yaw = waypoint.transform.rotation.yaw
+        search_end = len(self.points) - TOWN10_ROUTE_SELF_CLOSE_MIN_SEPARATION
+        for index in range(max(0, search_end)):
+            candidate = self.waypoints[index]
+            yaw_error = abs(normalize_angle(math.radians(yaw - candidate.transform.rotation.yaw)))
+            if (
+                location.distance(candidate.transform.location) <= self.close_radius
+                and yaw_error <= math.radians(TOWN10_ROUTE_CLOSE_HEADING_DEGREES)
+            ):
+                return index
+        return None
+
+    def _build_short_town10_route(self, start_waypoint):
+        waypoint = start_waypoint
+        self.waypoints.append(start_waypoint)
+        self.points.append(start_waypoint.transform.location)
+
+        for _ in range(800):
+            waypoint = self._try_prepare_right_lane(waypoint)
+            next_waypoints = waypoint.next(self.step_distance)
+            if not next_waypoints:
+                break
+
+            waypoint = self._select_next_waypoint(waypoint, next_waypoints)
+            location = waypoint.transform.location
+            self.waypoints.append(waypoint)
+            self.points.append(location)
+
+            self.close_to_index = self._find_self_close_index(waypoint)
+            if self.close_to_index is not None:
+                break
+
+    def _detect_turn_events(self, min_total_degrees=50.0):
+        events = []
+        current_direction = None
+        current_total = 0.0
+        start_index = 0
+        last_turn_index = 0
+        straight_steps = 0
+
+        for index in range(1, len(self.waypoints)):
+            previous_yaw = self.waypoints[index - 1].transform.rotation.yaw
+            current_yaw = self.waypoints[index].transform.rotation.yaw
+            delta = math.degrees(normalize_angle(math.radians(current_yaw - previous_yaw)))
+            if abs(delta) < 2.0:
+                if current_direction is not None:
+                    straight_steps += 1
+                    if straight_steps >= 5:
+                        if abs(current_total) >= min_total_degrees:
+                            events.append(
+                                self._make_turn_event(
+                                    current_direction, current_total, start_index, last_turn_index
+                                )
+                            )
+                        current_direction = None
+                        current_total = 0.0
+                continue
+
+            straight_steps = 0
+            last_turn_index = index
+            # CARLA/Unreal yaw increases clockwise in the XY plane, so positive yaw change is a right turn.
+            direction = "right" if delta > 0.0 else "left"
+            if direction != current_direction:
+                if current_direction is not None and abs(current_total) >= min_total_degrees:
+                    events.append(self._make_turn_event(current_direction, current_total, start_index, index - 1))
+                current_direction = direction
+                current_total = delta
+                start_index = index - 1
+            else:
+                current_total += delta
+
+        if current_direction is not None and abs(current_total) >= min_total_degrees:
+            events.append(self._make_turn_event(current_direction, current_total, start_index, len(self.waypoints) - 1))
+
+        return events
+
+    def _make_turn_event(self, direction, total_degrees, start_index, end_index):
+        start_location = self.points[start_index]
+        end_location = self.points[end_index]
+        return {
+            "direction": direction,
+            "degrees": total_degrees,
+            "start_index": start_index,
+            "end_index": end_index,
+            "start_location": start_location,
+            "end_location": end_location,
+        }
+
+    def _nearest_index(self, location, anchor_index=None, search_back=5, search_ahead=45):
+        if anchor_index is not None:
+            start_index = max(0, anchor_index - search_back)
+            end_index = min(len(self.points), anchor_index + search_ahead)
+            if end_index > start_index:
+                return min(
+                    range(start_index, end_index),
+                    key=lambda index: self.points[index].distance(location),
+                )
+
         return min(
             range(len(self.points)),
             key=lambda index: self.points[index].distance(location),
@@ -700,9 +857,10 @@ class LoopRoute:
 
     def steer(self, vehicle, lookahead=14.0):
         location = vehicle.get_location()
-        nearest = self._nearest_index(location)
+        nearest = self._nearest_index(location, self.last_index)
         lookahead_steps = max(2, int(lookahead / self.step_distance))
-        target = self.points[(nearest + lookahead_steps) % len(self.points)]
+        target_index = min(nearest + lookahead_steps, len(self.points) - 1)
+        target = self.points[target_index]
 
         transform = vehicle.get_transform()
         dx = target.x - transform.location.x
@@ -713,11 +871,11 @@ class LoopRoute:
 
     def update(self, vehicle):
         location = vehicle.get_location()
-        nearest = self._nearest_index(location)
+        nearest = self._nearest_index(location, self.last_index)
         self.last_index = nearest
         self.max_index = max(self.max_index, nearest)
 
-        if self.max_index > len(self.points) * 0.75 and nearest < 8:
+        if self.max_index >= len(self.points) - 8:
             self.completed = True
 
         return self.completed
@@ -758,12 +916,34 @@ def main():
         avoidance_side = None
         start_time = time.time()
         frame = 0
+        route_completion_time = None
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
         print(
             "Loop route: {:.1f}m, {} waypoints.".format(
                 loop_route.length, len(loop_route.points)
+            )
+        )
+        print(
+            "Route turn check: right_turn_count={}, turn_events={}".format(
+                loop_route.right_turn_count,
+                [
+                    "{}:{:.1f}deg@{}-{}".format(
+                        event["direction"],
+                        event["degrees"],
+                        event["start_index"],
+                        event["end_index"],
+                    )
+                    for event in loop_route.turn_events
+                ],
+            )
+        )
+        print(
+            "Route lane check: right_lane_before_turn={}, prepare_index={}, close_to_index={}.".format(
+                loop_route.right_lane_before_turn,
+                loop_route.right_lane_prepare_index,
+                loop_route.close_to_index,
             )
         )
 
@@ -818,7 +998,11 @@ def main():
                         )
                     )
 
-            if state == "AVOID" and trajectory is not None:
+            if route_completion_time is not None:
+                state = "ROUTE_HOLD"
+                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+
+            elif state == "AVOID" and trajectory is not None:
                 target_speed = min(EGO_TARGET_SPEED, max(8.0, ego_speed))
                 ego_control = mpc.control(ego_vehicle, trajectory, target_speed)
                 if brake_needed:
@@ -888,12 +1072,20 @@ def main():
                 print("检测到碰撞，提前终止仿真。")
                 break
 
-            if lap_completed:
+            if lap_completed and route_completion_time is None:
+                route_completion_time = sim_time
                 print(
-                    "完成 Town10 固定路线一圈，行驶距离 {:.1f}m，结束仿真。".format(
-                        loop_route.progress_distance
+                    "完成 Town10 固定路线一圈，行驶距离 {:.1f}m，继续运行 {:.1f}s 后结束。".format(
+                        loop_route.progress_distance,
+                        ROUTE_COMPLETION_HOLD_SECONDS,
                     )
                 )
+
+            if (
+                route_completion_time is not None
+                and sim_time - route_completion_time >= ROUTE_COMPLETION_HOLD_SECONDS
+            ):
+                print("到达路线终点后已继续运行 {:.1f}s，结束仿真。".format(ROUTE_COMPLETION_HOLD_SECONDS))
                 break
 
         elapsed = time.time() - start_time
