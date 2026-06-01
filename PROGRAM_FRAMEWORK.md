@@ -769,9 +769,25 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 新增两个核心工况：直线段前车突然刹停、右转弯避让右侧非机动车。
 - 新增环形路线规划、交通流、右侧非机动车、风险评估、制动灯、评价指标等后续代码设计内容。
 - 保持维护约定：后续文档只更新本文档。
+- 本次目标：重构 pygame 演示显示层，使相机、HUD 和窗口控制职责拆分清楚。
+- 主要改动：将原 `PygameCameraDisplay` 拆分为 `DemoCamera`、`DemoHUD`、`PygameDemoDisplay`，主循环改为通过 `telemetry` 字典传递显示数据；新增 `.gitignore` 忽略 `.claude/` 本地目录。
+- 验证情况：已运行 `py_compile` 语法检查通过；未启动 CARLA 进行窗口运行验证。
+- 未覆盖风险：pygame 窗口实际刷新、退出事件和 CARLA 运行时画面显示仍需后续手动验证。
 
 ### 2026-05-30
 
 - 建立本文档。
 - 记录 `guiji.py` 的初始程序框架、模块职责、主流程和常见问题。
 - 明确后续文档维护只更新本文档。
+
+## 20. PR 提交记录
+
+### 2026-06-01 - 重构 pygame 演示显示层并忽略本地 Claude 配置
+
+- 本次目标：重构 `guiji.py` 中的 pygame 演示显示层，降低显示逻辑和避障算法的耦合，并避免 `.claude/` 本地配置目录被提交。
+- 主要改动：删除旧的 `PygameCameraDisplay` 实现；新增 `DemoCamera`、`DemoHUD`、`PygameDemoDisplay` 三个显示层类；主循环改为传入 `telemetry` 字典；新增 `.gitignore` 忽略 `.claude/`。
+- 为什么这样改：后续还要继续修改环形路线、交通流和避障算法，显示层拆分后可以作为稳定的演示外壳，减少算法迭代时对 pygame 代码的影响。
+- 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile d:\17871\CARLA_0.9.15\WindowsNoEditor\PythonAPI\examples\dazuoye\guiji.py`，语法检查通过。
+- 未覆盖风险：未启动 CARLA 服务端进行 pygame 窗口实际显示验证；未验证摄像头画面刷新、窗口关闭、`Esc`/`Q` 退出等运行时行为。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/.gitignore`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。

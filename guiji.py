@@ -1,7 +1,7 @@
 import math
 import time
-from dataclasses import dataclass
-from threading import Lock
+from dataclasses import dataclass # dataclass 是 Python 3.7 引入的一个装饰器，用于简化类的定义，自动生成 __init__、__repr__ 等方法，适合用于存储数据的类。
+from threading import Lock # Lock 是 Python 标准库 threading 模块中的一个类，用于实现线程间的互斥锁，确保在多线程环境中对共享资源的安全访问。
 
 import carla
 
@@ -374,33 +374,15 @@ class CollisionMonitor:
         print("检测到碰撞，对象 actor id：{}".format(event.other_actor.id))
 
 
-# ===================== Pygame 相机显示模块 =====================
 
-class PygameCameraDisplay:
-    """基于Pygame的实时相机画面显示封装，实现第三人称跟随视角。
-    若未pygame或numpy则静默禁用。
-    """
+class DemoCamera:
+    """基于 CARLA RGB 相机传感器的图像获取与转换封装，提供 get_surface() 方法返回 Pygame Surface 供显示使用。"""
 
-    def __init__(self, world, vehicle, actor_list, width=1280, height=720):
-        self.enabled = pygame is not None and np is not None
-        self.width = width
-        self.height = height
+    def __init__(self, world, vehicle, actor_list, width, height):
         self.surface = None
         self.latest_image = None
         self.latest_size = None
-        self.lock = Lock()  # 线程锁，保护图像数据线程安全
-
-        if not self.enabled:
-            print("pygame or numpy is not installed; running without animation window.")
-            self.sensor = None
-            return
-
-        pygame.init()
-        pygame.font.init()
-        self.display = pygame.display.set_mode((width, height), pygame.HWSURFACE | pygame.DOUBLEBUF)
-        pygame.display.set_caption("CARLA Emergency Avoidance Demo")
-        self.font = pygame.font.SysFont("consolas", 18)
-        self.clock = pygame.time.Clock()
+        self.lock = Lock()
 
         blueprint = world.get_blueprint_library().find("sensor.camera.rgb")
         blueprint.set_attribute("image_size_x", str(width))
@@ -416,13 +398,110 @@ class PygameCameraDisplay:
         actor_list.append(self.sensor)
 
     def _on_image(self, image):
-        """相机回调：将原始图像数据缓存到内存，不在此处解码避免造成仿真延迟"""
         with self.lock:
             self.latest_image = bytes(image.raw_data)
             self.latest_size = (image.width, image.height)
 
+    def get_surface(self):
+        with self.lock:
+            image_bytes = self.latest_image
+            image_size = self.latest_size
+
+        if image_bytes is None or image_size is None:
+            return self.surface
+
+        image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        image_array = np.reshape(image_array, (image_size[1], image_size[0], 4))
+        image_array = image_array[:, :, :3][:, :, ::-1]
+        image_array = np.ascontiguousarray(image_array.swapaxes(0, 1))
+        self.surface = pygame.surfarray.make_surface(image_array)
+        return self.surface
+
+
+class DemoHUD:
+    """基于 Pygame 的 HUD 显示封装，提供 draw() 方法在屏幕上叠加显示仿真状态和车辆信息。
+    通过 _format_number() 方法格式化数值显示，处理 None 和无穷大情况。
+    """
+
+    def __init__(self, width):
+        self.width = width
+        self.font = pygame.font.SysFont("consolas", 18)
+
+    @staticmethod
+    def _format_number(value, precision=2, fallback="--"):
+        if value is None:
+            return fallback
+        if isinstance(value, float) and not math.isfinite(value):
+            return fallback
+        return ("{:.%df}" % precision).format(value)
+
+    def draw(self, display, telemetry):
+        sim_time = telemetry.get("sim_time")
+        state = telemetry.get("state", "--")
+        scenario = telemetry.get("scenario", "--")
+        ego_speed = telemetry.get("ego_speed")
+        lead_speed = telemetry.get("lead_speed")
+        front_distance = telemetry.get("front_distance")
+        front_ttc = telemetry.get("front_ttc")
+        steer = telemetry.get("steer")
+        throttle = telemetry.get("throttle")
+        brake = telemetry.get("brake")
+        collision_count = telemetry.get("collision_count", 0)
+
+        lines = [
+            "t={}s  state={}  scenario={}  collisions={}".format(
+                self._format_number(sim_time),
+                state,
+                scenario,
+                collision_count,
+            ),
+            "ego={}m/s  lead={}m/s  dist={}m  TTC={}s  steer={}  throttle={}  brake={}".format(
+                self._format_number(ego_speed, 1),
+                self._format_number(lead_speed, 1),
+                self._format_number(front_distance, 1),
+                self._format_number(front_ttc, 2),
+                self._format_number(steer, 2),
+                self._format_number(throttle, 2),
+                self._format_number(brake, 2),
+            ),
+        ]
+
+        panel_height = 56
+        background = pygame.Surface((self.width, panel_height))
+        background.set_alpha(165)
+        background.fill((0, 0, 0))
+        display.blit(background, (0, 0))
+
+        for index, line in enumerate(lines):
+            text_surface = self.font.render(line, True, (255, 255, 255))
+            display.blit(text_surface, (12, 8 + index * 24))
+
+
+class PygameDemoDisplay:
+    """综合封装了相机图像获取和 HUD 显示功能，提供 process_events() 和 render() 方法供主循环调用。"""
+
+    def __init__(self, world, vehicle, actor_list, width=1280, height=720):
+        self.enabled = pygame is not None and np is not None
+        self.width = width
+        self.height = height
+        self.display = None
+        self.clock = None
+        self.camera = None
+        self.hud = None
+
+        if not self.enabled:
+            print("pygame or numpy is not installed; running without animation window.")
+            return
+
+        pygame.init()
+        pygame.font.init()
+        self.display = pygame.display.set_mode((width, height), pygame.HWSURFACE | pygame.DOUBLEBUF)
+        pygame.display.set_caption("CARLA Emergency Avoidance Demo")
+        self.clock = pygame.time.Clock()
+        self.camera = DemoCamera(world, vehicle, actor_list, width, height)
+        self.hud = DemoHUD(width)
+
     def process_events(self):
-        """处理Pygame窗口事件，返回 False 则应退出仿真"""
         if not self.enabled:
             return True
 
@@ -433,47 +512,21 @@ class PygameCameraDisplay:
                 return False
         return True
 
-    def render(self, sim_time, state, distance, ttc, ego_speed, lead_speed):
-        """渲染当前帧图像并叠加调试信息 HUD"""
+    def render(self, telemetry):
         if not self.enabled:
             return
 
-        with self.lock:
-            image_bytes = self.latest_image
-            image_size = self.latest_size
+        surface = self.camera.get_surface()
+        if surface is not None:
+            self.display.blit(surface, (0, 0))
+        else:
+            self.display.fill((0, 0, 0))
 
-        if image_bytes is not None and image_size is not None:
-            # 将 BGRA 原始数昶转换为 Pygame Surface
-            image_array = np.frombuffer(image_bytes, dtype=np.uint8)
-            image_array = np.reshape(image_array, (image_size[1], image_size[0], 4))
-            image_array = image_array[:, :, :3][:, :, ::-1]  # BGRA -> RGB
-            image_array = np.ascontiguousarray(image_array.swapaxes(0, 1))  # HWC -> WHC
-            self.surface = pygame.surfarray.make_surface(image_array)
-
-        if self.surface is not None:
-            self.display.blit(self.surface, (0, 0))
-
-        # 构建 HUD 信息字符串
-        info = "t={:05.2f}s  state={}  dist={:05.1f}m  TTC={:05.2f}s  ego={:04.1f}m/s  lead={:04.1f}m/s".format(
-            sim_time,
-            state,
-            distance,
-            ttc if math.isfinite(ttc) else 99.99,
-            ego_speed,
-            lead_speed,
-        )
-        text_surface = self.font.render(info, True, (255, 255, 255))
-        background = pygame.Surface((self.width, 32))
-        background.set_alpha(150)
-        background.fill((0, 0, 0))
-        self.display.blit(background, (0, 0))
-        self.display.blit(text_surface, (12, 7))
-
+        self.hud.draw(self.display, telemetry)
         pygame.display.flip()
-        self.clock.tick(0)  # 非阻塞计时，避免限制CARLA同步亻真的步长
+        self.clock.tick(0)
 
     def close(self):
-        """close 仿真结束时释放 Pygame 资源"""
         if self.enabled:
             pygame.quit()
 
@@ -573,7 +626,7 @@ def main():
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
         sensor = VirtualGroundTruthSensor(world, carla_map, ego_vehicle, lead_vehicle)
         mpc = SamplingMPCTracker()
-        camera_display = PygameCameraDisplay(world, ego_vehicle, actor_list)
+        camera_display = PygameDemoDisplay(world, ego_vehicle, actor_list)
 
         world.tick()
         set_spectator(world, ego_vehicle)
@@ -588,7 +641,7 @@ def main():
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
 
-        while frame * FIXED_DELTA_SECONDS < SIM_SECONDS:
+        while frame * FIXED_DELTA_SECONDS < SIM_SECONDS: # 主循环，持续运行直到达到最大仿真时间
             if camera_display is not None and not camera_display.process_events():
                 print("Animation window closed by user.")
                 break
@@ -686,14 +739,19 @@ def main():
             world.tick()
             set_spectator(world, ego_vehicle)
             if camera_display is not None:
-                camera_display.render(
-                    sim_time,
-                    state,
-                    front.distance,
-                    front.ttc,
-                    ego_speed,
-                    get_speed(lead_vehicle),
-                )
+                camera_display.render({
+                    "sim_time": sim_time,
+                    "state": state,
+                    "scenario": "front_brake_avoidance",
+                    "ego_speed": ego_speed,
+                    "lead_speed": get_speed(lead_vehicle),
+                    "front_distance": front.distance,
+                    "front_ttc": front.ttc,
+                    "steer": ego_control.steer,
+                    "throttle": ego_control.throttle,
+                    "brake": ego_control.brake,
+                    "collision_count": len(collision_monitor.history),
+                })
             frame += 1
 
             # 碰撞发生后立即提前终止仿真
