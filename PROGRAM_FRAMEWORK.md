@@ -773,6 +773,10 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 主要改动：将原 `PygameCameraDisplay` 拆分为 `DemoCamera`、`DemoHUD`、`PygameDemoDisplay`，主循环改为通过 `telemetry` 字典传递显示数据；新增 `.gitignore` 忽略 `.claude/` 本地目录。
 - 验证情况：已运行 `py_compile` 语法检查通过；未启动 CARLA 进行窗口运行验证。
 - 未覆盖风险：pygame 窗口实际刷新、退出事件和 CARLA 运行时画面显示仍需后续手动验证。
+- 本次目标：将演示场景迁移到 `Town10HD_Opt`，保留直道前车急停避障，并让自车避障后沿固定闭环路线完整行驶一圈。
+- 主要改动：新增 Town10 固定起点、预生成闭环路线 `LoopRoute`、一圈完成判断和 HUD 中的一圈进度显示；删除换道成功后 3 秒提前结束的逻辑。
+- 验证情况：已运行 `py_compile` 语法检查通过；已实际运行 `guiji.py`，输出显示前车急停避障完成、Town10 固定路线一圈完成、碰撞次数为 0。
+- 未覆盖风险：只验证了当前固定起点和固定路线；尚未加入右转非机动车、背景交通流和真实传感器。
 
 ### 2026-05-30
 
@@ -791,3 +795,13 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：未启动 CARLA 服务端进行 pygame 窗口实际显示验证；未验证摄像头画面刷新、窗口关闭、`Esc`/`Q` 退出等运行时行为。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/.gitignore`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
+
+### 2026-06-01 - 迁移到 Town10 固定闭环路线
+
+- 本次目标：将当前演示从 Town04 直道场景迁移到 `Town10HD_Opt`，保留直道前车急停避障，并让自车在避障后继续完成固定路线一圈。
+- 主要改动：将 `MAP_NAME` 改为 `Town10HD_Opt`；设置 Town10 固定 spawn 点；新增 `LoopRoute` 生成 744m 闭环 waypoint 路线；主循环改用闭环路线转向；HUD 增加一圈进度；完成一圈后再结束仿真。
+- 为什么这样改：Town10 更适合后续扩展人行横道和非机动车避让场景；先把固定地点、直道急停避障和一圈行驶跑通，可以作为后续复杂场景的基础。
+- 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile d:\17871\CARLA_0.9.15\WindowsNoEditor\PythonAPI\examples\dazuoye\guiji.py`；已运行 `guiji.py`，结果显示 `Avoidance completed`、`完成 Town10 固定路线一圈`、`Collisions: 0`。
+- 未覆盖风险：仅验证当前固定起点和路线；尚未验证其他 Town10 路段、右转非机动车、交通流、制动灯或真实传感器。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- PR/分支信息：准备直接推送到 `origin/main`，未创建独立 PR。

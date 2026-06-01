@@ -19,10 +19,10 @@ except ImportError:
 # ===================== 场景全局配置 =====================
 HOST = "localhost"          # CARLA 服务器地址
 PORT = 2000                 # CARLA 服务器端口
-MAP_NAME = "Town04"         # 使用的地图（多车道直道场景）
+MAP_NAME = "Town10HD_Opt"   # 使用 Town10HD_Opt 城市地图，便于后续加入人行横道/非机动车场景
 CLIENT_TIMEOUT = 120.0      # 客户端连接超时时间（秒）
 FIXED_DELTA_SECONDS = 0.05  # 同步仿真步长（20Hz）
-SIM_SECONDS = 28.0          # 最大仿真时长（秒）
+SIM_SECONDS = 90.0          # 最大仿真时长（秒），Town10 一圈比 Town04 直道场景更长
 
 INITIAL_GAP = 48.0          # 自车与前车的初始纵向间距（米）
 LEAD_BRAKE_TIME = 6.0       # 前车开始紧急制动的仿真时刻（秒）
@@ -39,6 +39,10 @@ LANE_CHANGE_LENGTH = 28.0   # 换道轨迹的纵向长度（米）
 MPC_HORIZON_STEPS = 18      # MPC 预测时域步数
 MPC_DT = 0.10               # MPC 每步时间间隔（秒）
 WHEEL_BASE = 2.85           # 车辆轴距（米，用于自行车模型）
+
+TOWN10_START_SPAWN_INDEX = 141 # Town10HD_Opt 的固定起始点在排序后的生成点列表中的索引位置，确保每次运行都从同一位置开始，便于结果对比和调试
+LAP_MIN_DISTANCE = 520.0 # 完成一圈的最小行驶距离（米），用于判断是否满足绕场一周的条件，避免过早结束仿真。Town10 的一圈大约 550 米，因此设置为 520 米 留有一定余量。
+LAP_COMPLETION_RADIUS = 70.0 # 判断一圈完成的半径（米），用于确定车辆是否回到了起始位置
 
 
 # ===================== 通用工具函数 =====================
@@ -119,11 +123,29 @@ def same_direction_lane(source_wp, target_wp):
 
 
 def find_fixed_scenario_waypoint(carla_map):
-    """为紧急避险场景寻找一个确定性的起始路点，要求：非交叉口、前方至少70米直道、且有至少一条同向邻道。"""
+    """在地图中找到一个满足条件的固定起始路点，确保每次仿真从同一位置开始。"""
     spawn_points = sorted(
         carla_map.get_spawn_points(),
         key=lambda t: (round(t.location.x, 1), round(t.location.y, 1), round(t.rotation.yaw, 1)),
     )
+
+    if "Town10HD_Opt" in carla_map.name:
+        if TOWN10_START_SPAWN_INDEX >= len(spawn_points):
+            raise RuntimeError("Town10 fixed spawn index is out of range.")
+        transform = spawn_points[TOWN10_START_SPAWN_INDEX]
+        waypoint = carla_map.get_waypoint(
+            transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
+        )
+        print(
+            "Town10 fixed loop start: sorted_spawn_index={}, location=({:.1f}, {:.1f}), road={}, lane={}".format(
+                TOWN10_START_SPAWN_INDEX,
+                waypoint.transform.location.x,
+                waypoint.transform.location.y,
+                waypoint.road_id,
+                waypoint.lane_id,
+            )
+        )
+        return waypoint
 
     candidates = []
     for index, transform in enumerate(spawn_points):
@@ -447,6 +469,7 @@ class DemoHUD:
         throttle = telemetry.get("throttle")
         brake = telemetry.get("brake")
         collision_count = telemetry.get("collision_count", 0)
+        lap_distance = telemetry.get("lap_distance")
 
         lines = [
             "t={}s  state={}  scenario={}  collisions={}".format(
@@ -464,9 +487,13 @@ class DemoHUD:
                 self._format_number(throttle, 2),
                 self._format_number(brake, 2),
             ),
+            "lap_distance={}m / target={}m".format(
+                self._format_number(lap_distance, 1),
+                self._format_number(telemetry.get("lap_target_distance", LAP_MIN_DISTANCE), 1),
+            ),
         ]
 
-        panel_height = 56
+        panel_height = 80
         background = pygame.Surface((self.width, panel_height))
         background.set_alpha(165)
         background.fill((0, 0, 0))
@@ -582,7 +609,7 @@ def spawn_scenario(world):
     ego_vehicle = world.spawn_actor(ego_bp, vehicle_transform_from_waypoint(ego_wp))
     lead_vehicle = world.spawn_actor(lead_bp, vehicle_transform_from_waypoint(lead_waypoints[0]))
 
-    return ego_vehicle, lead_vehicle
+    return ego_vehicle, lead_vehicle, ego_wp
 
 
 def set_spectator(world, ego_vehicle):
@@ -606,6 +633,100 @@ def choose_avoidance_side(sensor):
     return None
 
 
+class LapTracker:
+    """跟踪车辆绕场一周的进度，判断是否满足完成条件：行驶距离超过 min_distance 且回到起始位置附近。
+    通过 update() 方法持续更新状态，返回是否完成一圈。"""
+
+    def __init__(self, vehicle, min_distance, completion_radius): # 初始化方法，记录起始位置和完成条件
+        location = vehicle.get_location()
+        self.start_location = carla.Location(location.x, location.y, location.z)
+        self.previous_location = carla.Location(location.x, location.y, location.z)
+        self.min_distance = min_distance
+        self.completion_radius = completion_radius
+        self.distance = 0.0
+        self.completed = False
+
+    def update(self, vehicle): # 更新方法，计算行驶距离并判断是否完成一圈
+        location = vehicle.get_location()
+        current_location = carla.Location(location.x, location.y, location.z)
+        self.distance += current_location.distance(self.previous_location)
+        self.previous_location = current_location
+
+        if (
+            not self.completed
+            and self.distance >= self.min_distance
+            and current_location.distance(self.start_location) <= self.completion_radius
+        ):
+            self.completed = True
+        return self.completed
+
+
+class LoopRoute:
+    """预先生成一条环形路径，供纯追踪控制使用。通过在地图上沿车道连续采样路点，直到回到起始位置附近或达到最大采样数。
+    通过 steer() 方法计算当前的转向控制量，通过 update() 方法跟踪"""
+
+    def __init__(self, start_waypoint, step_distance=4.0, close_radius=8.0):
+        self.step_distance = step_distance
+        self.close_radius = close_radius
+        self.points = []
+        self.completed = False
+        self.max_index = 0
+        self.last_index = 0
+
+        waypoint = start_waypoint
+        start_location = start_waypoint.transform.location
+        self.points.append(start_location)
+
+        for _ in range(800):
+            next_waypoints = waypoint.next(step_distance)
+            if not next_waypoints:
+                break
+            waypoint = next_waypoints[0]
+            location = waypoint.transform.location
+            self.points.append(location)
+            if len(self.points) > 50 and location.distance(start_location) <= close_radius:
+                break
+
+        if len(self.points) < 60:
+            raise RuntimeError("Failed to build a usable Town10 loop route.")
+
+        self.length = (len(self.points) - 1) * step_distance
+
+    def _nearest_index(self, location):
+        return min(
+            range(len(self.points)),
+            key=lambda index: self.points[index].distance(location),
+        )
+
+    def steer(self, vehicle, lookahead=14.0):
+        location = vehicle.get_location()
+        nearest = self._nearest_index(location)
+        lookahead_steps = max(2, int(lookahead / self.step_distance))
+        target = self.points[(nearest + lookahead_steps) % len(self.points)]
+
+        transform = vehicle.get_transform()
+        dx = target.x - transform.location.x
+        dy = target.y - transform.location.y
+        target_yaw = math.atan2(dy, dx)
+        heading_error = normalize_angle(target_yaw - yaw_to_rad(transform.rotation))
+        return clamp(1.8 * heading_error, -0.45, 0.45)
+
+    def update(self, vehicle):
+        location = vehicle.get_location()
+        nearest = self._nearest_index(location)
+        self.last_index = nearest
+        self.max_index = max(self.max_index, nearest)
+
+        if self.max_index > len(self.points) * 0.75 and nearest < 8:
+            self.completed = True
+
+        return self.completed
+
+    @property
+    def progress_distance(self):
+        return min(self.length, self.max_index * self.step_distance)
+
+
 def main():
     actor_list = []
     camera_display = None
@@ -621,7 +742,7 @@ def main():
         world = setup_world(client)
         carla_map = world.get_map()
 
-        ego_vehicle, lead_vehicle = spawn_scenario(world)
+        ego_vehicle, lead_vehicle, ego_start_wp = spawn_scenario(world)
         actor_list.extend([ego_vehicle, lead_vehicle])
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
         sensor = VirtualGroundTruthSensor(world, carla_map, ego_vehicle, lead_vehicle)
@@ -630,16 +751,21 @@ def main():
 
         world.tick()
         set_spectator(world, ego_vehicle)
+        loop_route = LoopRoute(ego_start_wp)
 
         state = "FOLLOW"
         trajectory = None
         avoidance_side = None
         start_time = time.time()
         frame = 0
-        lane_keep_frames = 0  # 记录换道成功后保持LANE_KEEP状态的帧数
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
+        print(
+            "Loop route: {:.1f}m, {} waypoints.".format(
+                loop_route.length, len(loop_route.points)
+            )
+        )
 
         while frame * FIXED_DELTA_SECONDS < SIM_SECONDS: # 主循环，持续运行直到达到最大仿真时间
             if camera_display is not None and not camera_display.process_events():
@@ -716,7 +842,7 @@ def main():
                 ego_control = carla.VehicleControl(
                     throttle=throttle,
                     brake=brake,
-                    steer=waypoint_steer(ego_vehicle, carla_map),
+                    steer=loop_route.steer(ego_vehicle),
                 )
 
             ego_vehicle.apply_control(ego_control)
@@ -738,6 +864,7 @@ def main():
 
             world.tick()
             set_spectator(world, ego_vehicle)
+            lap_completed = loop_route.update(ego_vehicle)
             if camera_display is not None:
                 camera_display.render({
                     "sim_time": sim_time,
@@ -751,6 +878,8 @@ def main():
                     "throttle": ego_control.throttle,
                     "brake": ego_control.brake,
                     "collision_count": len(collision_monitor.history),
+                    "lap_distance": loop_route.progress_distance,
+                    "lap_target_distance": loop_route.length,
                 })
             frame += 1
 
@@ -759,12 +888,13 @@ def main():
                 print("检测到碰撞，提前终止仿真。")
                 break
 
-            # 换道成功后再保持3秒（60帧）即视为任务完成，提前退出
-            if state == "LANE_KEEP":
-                lane_keep_frames += 1
-                if lane_keep_frames >= int(3.0 / FIXED_DELTA_SECONDS):
-                    print("换道避障成功，任务完成，提前结束仿真。")
-                    break
+            if lap_completed:
+                print(
+                    "完成 Town10 固定路线一圈，行驶距离 {:.1f}m，结束仿真。".format(
+                        loop_route.progress_distance
+                    )
+                )
+                break
 
         elapsed = time.time() - start_time
         print(
