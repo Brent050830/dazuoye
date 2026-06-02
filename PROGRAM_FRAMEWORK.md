@@ -873,5 +873,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile dazuoye\guiji.py`，语法检查通过；已运行 `E:\Anaconda_envs\envs\carla_env\python.exe guiji.py`，日志确认 `Right-side bicycle ready`、`anchor_index=91`、`anchor_road=344`、`path=straight_along_r344`、`Right-side bicycle started`、`Right object yield started/completed` 均触发，仿真结束时 `Collisions: 0` 且 `Cleanup finished`；运行后查询 CARLA world，`ego`、`lead`、`right_side_bicycle` 残留列表为空。
 - 未覆盖风险：本次运行环境提示未打开 pygame 动画窗口，视觉效果仍需在用户本机窗口中确认；第一版策略以减速让行为主，还未实现更完整的右转转向避让；尚未加入背景交通流和制动灯控制。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送。
+- 提交代号/Commit ID：a73e870
+- PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
