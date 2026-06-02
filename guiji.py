@@ -1,4 +1,5 @@
 import math
+import random
 import time
 from dataclasses import dataclass # dataclass 是 Python 3.7 引入的一个装饰器，用于简化类的定义，自动生成 __init__、__repr__ 等方法，适合用于存储数据的类。
 from threading import Lock # Lock 是 Python 标准库 threading 模块中的一个类，用于实现线程间的互斥锁，确保在多线程环境中对共享资源的安全访问。
@@ -72,6 +73,16 @@ RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS = 6
 RIGHT_OBJECT_R344_RIGHT_OFFSET = 3.0
 RIGHT_OBJECT_R344_START_FORWARD_OFFSET = -8.0
 RIGHT_OBJECT_R344_END_FORWARD_OFFSET = 22.0
+
+TRAFFIC_RANDOM_SEED = 20260602
+BACKGROUND_VEHICLE_ROUTE_INDICES = (32, 54, 76, 96, 108)
+BACKGROUND_VEHICLE_SPEED_MIN = 7.0
+BACKGROUND_VEHICLE_SPEED_MAX = 8.8
+BACKGROUND_BICYCLE_FORWARD_OFFSETS = (-42.0, -30.0, -18.0)
+BACKGROUND_BICYCLE_RIGHT_OFFSETS = (4.4, 1.8, 5.6)
+BACKGROUND_BICYCLE_END_FORWARD_OFFSET = 36.0
+BACKGROUND_BICYCLE_SPEED_MIN = 2.6
+BACKGROUND_BICYCLE_SPEED_MAX = 4.3
 
 
 # ===================== 通用工具函数 =====================
@@ -202,34 +213,53 @@ class VirtualGroundTruthSensor:
     注意：此传感器无噪声和延迟，仅用于算法验证阶段，后续可替换为雷达/激光雷达感知。
     """
 
-    def __init__(self, world, carla_map, ego_vehicle, lead_vehicle, right_object_scenario=None):
+    def __init__(
+        self,
+        world,
+        carla_map,
+        ego_vehicle,
+        lead_vehicle,
+        right_object_scenario=None,
+        front_extra_vehicles=None,
+        right_object_scenarios=None,
+    ):
         self.world = world
         self.carla_map = carla_map
         self.ego = ego_vehicle
         self.lead = lead_vehicle
-        self.right_object_scenario = right_object_scenario
+        self.front_extra_vehicles = front_extra_vehicles or []
+        self.right_object_scenarios = []
+        if right_object_scenario is not None:
+            self.right_object_scenarios.append(right_object_scenario)
+        self.right_object_scenarios.extend(right_object_scenarios or [])
 
     def front_vehicle(self):
-        """计算前车的纵向距离、横向偏移、接近速度和TTC"""
+        """计算同车道前方最近车辆的纵向距离、横向偏移、接近速度和TTC。"""
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
-        lead_loc = self.lead.get_location()
         forward = ego_tf.get_forward_vector()
         right = ego_tf.get_right_vector()
-        relative = lead_loc - ego_loc
-
-        longitudinal = dot_2d(relative, forward)  # 纵向距离分量
-        lateral = dot_2d(relative, right)          # 横向距离分量
         lane_width = self.carla_map.get_waypoint(ego_loc).lane_width
-
         ego_speed_along = dot_2d(self.ego.get_velocity(), forward)
-        lead_speed_along = dot_2d(self.lead.get_velocity(), forward)
-        closing_speed = ego_speed_along - lead_speed_along  # 接近速度（正值为靠近）
-        ttc = longitudinal / closing_speed if closing_speed > 0.1 and longitudinal > 0.0 else float("inf")
 
-        # 判断前车：在正前方且横向偏移小于车道宽度的65%
-        is_front = longitudinal > 0.0 and abs(lateral) < lane_width * 0.65
-        return FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, is_front)
+        closest = FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
+        for vehicle in [self.lead] + self.front_extra_vehicles:
+            if vehicle is None or not vehicle.is_alive:
+                continue
+
+            relative = vehicle.get_location() - ego_loc
+            longitudinal = dot_2d(relative, forward)
+            lateral = dot_2d(relative, right)
+            if longitudinal <= 0.0 or abs(lateral) >= lane_width * 0.65:
+                continue
+
+            target_speed_along = dot_2d(vehicle.get_velocity(), forward)
+            closing_speed = ego_speed_along - target_speed_along
+            ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
+            if longitudinal < closest.distance:
+                closest = FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, True)
+
+        return closest
 
     def lane_clear(self, side):
         """检测指定侧邻道在前后安全范围内是否无车"""
@@ -263,9 +293,30 @@ class VirtualGroundTruthSensor:
 
     def right_side_object(self, route_index):
         """读取右侧非机动车目标，并判断其是否位于当前右转冲突窗口。"""
-        scenario = self.right_object_scenario
+        best_conflict = None
+        best_nearby = None
+        for scenario in self.right_object_scenarios:
+            reading = self._right_side_object_reading(scenario, route_index)
+            if reading is None:
+                continue
+            if best_nearby is None or reading.distance < best_nearby.distance:
+                best_nearby = reading
+            if reading.is_conflict_object and (
+                best_conflict is None
+                or reading.ttc < best_conflict.ttc
+                or reading.distance < best_conflict.distance
+            ):
+                best_conflict = reading
+
+        if best_conflict is not None:
+            return best_conflict
+        if best_nearby is not None:
+            return best_nearby
+        return RightSideObjectReading(float("inf"), float("inf"), False)
+
+    def _right_side_object_reading(self, scenario, route_index):
         if scenario is None or scenario.actor is None:
-            return RightSideObjectReading(float("inf"), float("inf"), False)
+            return None
 
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
@@ -434,7 +485,14 @@ class CollisionMonitor:
     def _on_collision(self, event):
         """碰撞事件回调：记录并打印碰撞对象信息"""
         self.history.append(event)
-        print("检测到碰撞，对象 actor id：{}".format(event.other_actor.id))
+        role_name = event.other_actor.attributes.get("role_name", "--")
+        print(
+            "检测到碰撞，对象 actor id：{}，role={}，type={}".format(
+                event.other_actor.id,
+                role_name,
+                event.other_actor.type_id,
+            )
+        )
 
 
 class DemoCamera:
@@ -684,6 +742,7 @@ class RightSideBicycleCrossing:
 
     def __init__(self, actor, start_location, end_location, trigger_index, clear_index, speed):
         self.actor = actor
+        self.name = actor.attributes.get("role_name", "right_side_bicycle")
         self.start_location = start_location
         self.end_location = end_location
         self.trigger_index = trigger_index
@@ -711,7 +770,8 @@ class RightSideBicycleCrossing:
         if not self.is_active and route_index >= self.trigger_index:
             self.is_active = True
             print(
-                "Right-side bicycle started: trigger_index={}, clear_index={}.".format(
+                "{} started: trigger_index={}, clear_index={}.".format(
+                    self.name,
                     self.trigger_index, self.clear_index
                 )
             )
@@ -739,10 +799,53 @@ class RightSideBicycleCrossing:
             self.is_finished = True
             self.is_active = False
             self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
-            print("Right-side bicycle finished crossing.")
+            print("{} finished crossing.".format(self.name))
 
     def is_conflict_window(self, route_index):
         return self.trigger_index <= route_index <= self.clear_index and not self.is_finished
+
+
+class BackgroundRouteVehicle:
+    """沿自车同一条固定路线行驶的背景车辆，仅改变初始位置和速度。"""
+
+    def __init__(self, actor, target_speed, start_index, loop_route):
+        self.actor = actor
+        self.target_speed = target_speed
+        self.loop_route = loop_route
+        self.route_span = max(loop_route.step_distance, (len(loop_route.points) - 1) * loop_route.step_distance)
+        self.progress = clamp(start_index, 0, len(loop_route.points) - 2) * loop_route.step_distance
+        self.z_offset = actor.get_location().z - loop_route.points[int(self.progress / loop_route.step_distance)].z
+        self.update(0.0)
+
+    def update(self, dt):
+        self.progress = (self.progress + self.target_speed * dt) % self.route_span
+        route_position = self.progress / self.loop_route.step_distance
+        low_index = min(int(route_position), len(self.loop_route.points) - 2)
+        high_index = low_index + 1
+        ratio = route_position - low_index
+
+        start = self.loop_route.points[low_index]
+        end = self.loop_route.points[high_index]
+        dx = end.x - start.x
+        dy = end.y - start.y
+        dz = end.z - start.z
+
+        location = carla.Location(
+            x=start.x + dx * ratio,
+            y=start.y + dy * ratio,
+            z=start.z + dz * ratio + self.z_offset,
+        )
+        yaw = math.degrees(math.atan2(dy, dx))
+        self.actor.set_transform(carla.Transform(location, carla.Rotation(yaw=yaw)))
+
+        segment_length = math.sqrt(dx * dx + dy * dy)
+        if segment_length > 0.001:
+            velocity = carla.Vector3D(
+                x=dx / segment_length * self.target_speed,
+                y=dy / segment_length * self.target_speed,
+                z=0.0,
+            )
+            self.actor.set_target_velocity(velocity)
 
 
 class LoopRoute:
@@ -983,6 +1086,43 @@ def find_nonmotor_blueprint(blueprint_library):
     return vehicles[0]
 
 
+def get_r344_nonmotor_anchor(loop_route, transition_index):
+    """获取 R344 右转入口附近的非机动车直行锚点。"""
+    anchor_index = max(0, transition_index - RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS)
+    anchor_wp = loop_route.waypoints[anchor_index]
+    if anchor_wp.road_id != RIGHT_OBJECT_TRIGGER_ROAD:
+        return None, anchor_index
+    return anchor_wp, anchor_index
+
+
+def r344_nonmotor_location(anchor_wp, forward_offset, right_offset):
+    """在 R344 连接段右侧按前向/右向偏移生成非机动车位置。"""
+    anchor_location = anchor_wp.transform.location
+    anchor_forward = anchor_wp.transform.get_forward_vector()
+    anchor_right = anchor_wp.transform.get_right_vector()
+    return carla.Location(
+        x=anchor_location.x + anchor_forward.x * forward_offset + anchor_right.x * right_offset,
+        y=anchor_location.y + anchor_forward.y * forward_offset + anchor_right.y * right_offset,
+        z=anchor_location.z + anchor_forward.z * forward_offset + anchor_right.z * right_offset + 0.65,
+    )
+
+
+def spawn_actor_with_z_retry(world, blueprint, transform, z_retry=0.5):
+    """先按原始位置生成 actor，失败后抬高一次重试。"""
+    actor = world.try_spawn_actor(blueprint, transform)
+    if actor is not None:
+        return actor
+    retry_transform = carla.Transform(
+        carla.Location(
+            x=transform.location.x,
+            y=transform.location.y,
+            z=transform.location.z + z_retry,
+        ),
+        transform.rotation,
+    )
+    return world.try_spawn_actor(blueprint, retry_transform)
+
+
 def spawn_right_side_bicycle_crossing(world, loop_route, actor_list):
     """在 R344 -> R20 右转处生成从右侧通过的非机动车目标。"""
     transition_index = find_route_transition_index(
@@ -992,36 +1132,21 @@ def spawn_right_side_bicycle_crossing(world, loop_route, actor_list):
         print("Right-side bicycle skipped: R344 -> R20 transition not found on route.")
         return None
 
-    anchor_index = max(0, transition_index - RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS)
-    anchor_wp = loop_route.waypoints[anchor_index]
-    if anchor_wp.road_id != RIGHT_OBJECT_TRIGGER_ROAD:
+    anchor_wp, anchor_index = get_r344_nonmotor_anchor(loop_route, transition_index)
+    if anchor_wp is None:
         print(
             "Right-side bicycle skipped: R344 crossing anchor mismatch, index={}, road={}.".format(
-                anchor_index, anchor_wp.road_id
+                anchor_index, loop_route.waypoints[anchor_index].road_id
             )
         )
         return None
 
-    anchor_location = anchor_wp.transform.location
-    anchor_forward = anchor_wp.transform.get_forward_vector()
-    anchor_right = anchor_wp.transform.get_right_vector()
-
-    def r344_nonmotor_location(forward_offset):
-        return carla.Location(
-            x=anchor_location.x
-            + anchor_forward.x * forward_offset
-            + anchor_right.x * RIGHT_OBJECT_R344_RIGHT_OFFSET,
-            y=anchor_location.y
-            + anchor_forward.y * forward_offset
-            + anchor_right.y * RIGHT_OBJECT_R344_RIGHT_OFFSET,
-            z=anchor_location.z
-            + anchor_forward.z * forward_offset
-            + anchor_right.z * RIGHT_OBJECT_R344_RIGHT_OFFSET
-            + 0.65,
-        )
-
-    start_location = r344_nonmotor_location(RIGHT_OBJECT_R344_START_FORWARD_OFFSET)
-    end_location = r344_nonmotor_location(RIGHT_OBJECT_R344_END_FORWARD_OFFSET)
+    start_location = r344_nonmotor_location(
+        anchor_wp, RIGHT_OBJECT_R344_START_FORWARD_OFFSET, RIGHT_OBJECT_R344_RIGHT_OFFSET
+    )
+    end_location = r344_nonmotor_location(
+        anchor_wp, RIGHT_OBJECT_R344_END_FORWARD_OFFSET, RIGHT_OBJECT_R344_RIGHT_OFFSET
+    )
     yaw = math.degrees(math.atan2(end_location.y - start_location.y, end_location.x - start_location.x))
     start_transform = carla.Transform(start_location, carla.Rotation(yaw=yaw))
 
@@ -1031,10 +1156,7 @@ def spawn_right_side_bicycle_crossing(world, loop_route, actor_list):
             blueprint.set_attribute("role_name", "right_side_bicycle")
     except AttributeError:
         pass
-    actor = world.try_spawn_actor(blueprint, start_transform)
-    if actor is None:
-        start_transform.location.z += 0.5
-        actor = world.try_spawn_actor(blueprint, start_transform)
+    actor = spawn_actor_with_z_retry(world, blueprint, start_transform)
     if actor is None:
         print("Right-side bicycle skipped: failed to spawn actor near R344 -> R20.")
         return None
@@ -1065,6 +1187,103 @@ def spawn_right_side_bicycle_crossing(world, loop_route, actor_list):
     return scenario
 
 
+def spawn_background_route_vehicles(world, loop_route, actor_list, rng):
+    """在自车固定路线不同路段生成 5 辆较慢的背景车辆。"""
+    blueprint_library = world.get_blueprint_library()
+    preferred_ids = (
+        "vehicle.audi.tt",
+        "vehicle.dodge.charger_2020",
+        "vehicle.mercedes.coupe",
+        "vehicle.mini.cooper_s",
+        "vehicle.nissan.patrol",
+    )
+    vehicles = []
+    for index, blueprint_id in zip(BACKGROUND_VEHICLE_ROUTE_INDICES, preferred_ids):
+        blueprint = blueprint_library.find(blueprint_id)
+        if blueprint.has_attribute("role_name"):
+            blueprint.set_attribute("role_name", "background_vehicle_{}".format(len(vehicles) + 1))
+
+        waypoint_index = min(index, len(loop_route.waypoints) - 1)
+        transform = vehicle_transform_from_waypoint(loop_route.waypoints[waypoint_index])
+        actor = spawn_actor_with_z_retry(world, blueprint, transform)
+        if actor is None:
+            print("Background vehicle skipped: index={}, blueprint={}.".format(waypoint_index, blueprint_id))
+            continue
+
+        actor.set_simulate_physics(False)
+        target_speed = rng.uniform(BACKGROUND_VEHICLE_SPEED_MIN, BACKGROUND_VEHICLE_SPEED_MAX)
+        actor_list.append(actor)
+        vehicles.append(BackgroundRouteVehicle(actor, target_speed, waypoint_index, loop_route))
+        print(
+            "Background vehicle ready: role={}, route_index={}, target_speed={:.1f}m/s.".format(
+                actor.attributes.get("role_name", "--"),
+                waypoint_index,
+                target_speed,
+            )
+        )
+    return vehicles
+
+
+def spawn_background_r344_bicycles(world, loop_route, actor_list, rng):
+    """在 R344 右侧非机动车区域生成额外背景自行车。"""
+    transition_index = find_route_transition_index(
+        loop_route, RIGHT_OBJECT_TRIGGER_ROAD, RIGHT_OBJECT_EXIT_ROAD
+    )
+    if transition_index is None:
+        print("Background bicycles skipped: R344 -> R20 transition not found on route.")
+        return []
+
+    anchor_wp, anchor_index = get_r344_nonmotor_anchor(loop_route, transition_index)
+    if anchor_wp is None:
+        print("Background bicycles skipped: R344 nonmotor anchor not found.")
+        return []
+
+    blueprint = find_nonmotor_blueprint(world.get_blueprint_library())
+    bicycles = []
+    for idx, (forward_offset, right_offset) in enumerate(
+        zip(BACKGROUND_BICYCLE_FORWARD_OFFSETS, BACKGROUND_BICYCLE_RIGHT_OFFSETS),
+        1,
+    ):
+        start_location = r344_nonmotor_location(anchor_wp, forward_offset, right_offset)
+        end_location = r344_nonmotor_location(anchor_wp, BACKGROUND_BICYCLE_END_FORWARD_OFFSET, right_offset)
+        yaw = math.degrees(math.atan2(end_location.y - start_location.y, end_location.x - start_location.x))
+        transform = carla.Transform(start_location, carla.Rotation(yaw=yaw))
+
+        bicycle_bp = blueprint
+        try:
+            if bicycle_bp.has_attribute("role_name"):
+                bicycle_bp.set_attribute("role_name", "background_bicycle_{}".format(idx))
+        except AttributeError:
+            pass
+
+        actor = spawn_actor_with_z_retry(world, bicycle_bp, transform)
+        if actor is None:
+            print("Background bicycle skipped: index={}, start_offset={}.".format(idx, forward_offset))
+            continue
+
+        actor.set_simulate_physics(False)
+        actor_list.append(actor)
+        speed = rng.uniform(BACKGROUND_BICYCLE_SPEED_MIN, BACKGROUND_BICYCLE_SPEED_MAX)
+        scenario = RightSideBicycleCrossing(
+            actor,
+            transform.location,
+            end_location,
+            max(0, transition_index - RIGHT_OBJECT_TRIGGER_ROUTE_STEPS - 10 + idx * 3),
+            min(len(loop_route.waypoints) - 1, transition_index + RIGHT_OBJECT_CLEAR_ROUTE_STEPS + 8),
+            speed,
+        )
+        bicycles.append(scenario)
+        print(
+            "Background bicycle ready: role={}, anchor_index={}, right_offset={:.1f}, speed={:.1f}m/s.".format(
+                actor.attributes.get("role_name", "--"),
+                anchor_index,
+                right_offset,
+                speed,
+            )
+        )
+    return bicycles
+
+
 def main():
     actor_list = []
     camera_display = None
@@ -1089,9 +1308,18 @@ def main():
         world.tick()
         set_spectator(world, ego_vehicle)
         loop_route = LoopRoute(ego_start_wp)
+        traffic_rng = random.Random(TRAFFIC_RANDOM_SEED)
+        background_vehicles = spawn_background_route_vehicles(world, loop_route, actor_list, traffic_rng)
+        background_bicycles = spawn_background_r344_bicycles(world, loop_route, actor_list, traffic_rng)
         right_object_scenario = spawn_right_side_bicycle_crossing(world, loop_route, actor_list)
         sensor = VirtualGroundTruthSensor(
-            world, carla_map, ego_vehicle, lead_vehicle, right_object_scenario
+            world,
+            carla_map,
+            ego_vehicle,
+            lead_vehicle,
+            right_object_scenario,
+            front_extra_vehicles=[controller.actor for controller in background_vehicles],
+            right_object_scenarios=background_bicycles,
         )
 
         state = "FOLLOW"
@@ -1103,6 +1331,12 @@ def main():
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
+        print(
+            "Background traffic: route_vehicles={}, r344_bicycles={}.".format(
+                len(background_vehicles),
+                len(background_bicycles),
+            )
+        )
         print(
             "Loop route: {:.1f}m, {} waypoints.".format(
                 loop_route.length, len(loop_route.points)
@@ -1146,8 +1380,13 @@ def main():
             else:
                 lead_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
 
+            for background_vehicle in background_vehicles:
+                background_vehicle.update(FIXED_DELTA_SECONDS)
+
             if right_object_scenario is not None:
                 right_object_scenario.update(loop_route.last_index, FIXED_DELTA_SECONDS)
+            for background_bicycle in background_bicycles:
+                background_bicycle.update(loop_route.last_index, FIXED_DELTA_SECONDS)
 
             front = sensor.front_vehicle()
             right_object = sensor.right_side_object(loop_route.last_index)
