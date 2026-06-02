@@ -899,4 +899,4 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：当前环境提示 pygame/numpy 不可用，背景交通视觉效果仍需在用户本机窗口中确认；背景车辆使用确定性路线推进，不是完整 Traffic Manager 行为，不具备真实跟车礼让能力，因此背景车速度和初始位置需要继续按演示画面微调；背景自行车会参与右侧让行风险判断，当前验证中让行持续时间变长，后续可按演示节奏继续调参。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：9fb69fa
-- PR/分支信息：本地提交，尚未推送。
+- PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
