@@ -898,5 +898,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile guiji.py`，语法检查通过；已运行 `E:\Anaconda_envs\envs\carla_env\python.exe guiji.py`，日志确认 5 辆 `background_vehicle_*` 以 `route_index=32,54,76,96,108` 和 `7.6~8.6m/s` 生成，3 辆 `background_bicycle_*` 和关键 `right_side_bicycle` 生成成功；前车急停避障和 `RIGHT_OBJECT_YIELD` 均触发，仿真结束时 `Collisions: 0` 且 `Cleanup finished`；运行后查询 CARLA world，`ego`、`lead`、`right_side_bicycle` 和 `background_*` 残留列表为空。
 - 未覆盖风险：当前环境提示 pygame/numpy 不可用，背景交通视觉效果仍需在用户本机窗口中确认；背景车辆使用确定性路线推进，不是完整 Traffic Manager 行为，不具备真实跟车礼让能力，因此背景车速度和初始位置需要继续按演示画面微调；背景自行车会参与右侧让行风险判断，当前验证中让行持续时间变长，后续可按演示节奏继续调参。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送。
+- 提交代号/Commit ID：9fb69fa
+- PR/分支信息：本地提交，尚未推送。
