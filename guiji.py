@@ -59,6 +59,20 @@ TOWN10_RIGHT_TURN_PREPARE_HEADING_DEGREES = 180.0
 TOWN10_RIGHT_TURN_PREPARE_HEADING_TOLERANCE = 15.0
 ROUTE_COMPLETION_HOLD_SECONDS = 4.0
 
+RIGHT_OBJECT_TTC_THRESHOLD = 5.0
+RIGHT_OBJECT_DETECT_DISTANCE = 34.0
+RIGHT_OBJECT_STOP_DISTANCE = 13.0
+RIGHT_OBJECT_YIELD_SPEED = 3.0
+RIGHT_OBJECT_TRIGGER_ROAD = 344
+RIGHT_OBJECT_EXIT_ROAD = 20
+RIGHT_OBJECT_TRIGGER_ROUTE_STEPS = 13
+RIGHT_OBJECT_CLEAR_ROUTE_STEPS = 14
+RIGHT_OBJECT_CROSSING_SPEED = 3.8
+RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS = 6
+RIGHT_OBJECT_R344_RIGHT_OFFSET = 3.0
+RIGHT_OBJECT_R344_START_FORWARD_OFFSET = -8.0
+RIGHT_OBJECT_R344_END_FORWARD_OFFSET = 22.0
+
 
 # ===================== 通用工具函数 =====================
 
@@ -175,16 +189,25 @@ class FrontVehicleReading: # 定义类
     is_front_vehicle: bool  # 是否确认为正前方车辆
 
 
+@dataclass
+class RightSideObjectReading:
+    """右侧非机动车/行人目标的虚拟感知数据。"""
+    distance: float
+    ttc: float
+    is_conflict_object: bool
+
+
 class VirtualGroundTruthSensor:
     """虚拟真值传感器：直接从仿真引擎读取精确状态，供决策与控制使用。
     注意：此传感器无噪声和延迟，仅用于算法验证阶段，后续可替换为雷达/激光雷达感知。
     """
 
-    def __init__(self, world, carla_map, ego_vehicle, lead_vehicle):
+    def __init__(self, world, carla_map, ego_vehicle, lead_vehicle, right_object_scenario=None):
         self.world = world
         self.carla_map = carla_map
         self.ego = ego_vehicle
         self.lead = lead_vehicle
+        self.right_object_scenario = right_object_scenario
 
     def front_vehicle(self):
         """计算前车的纵向距离、横向偏移、接近速度和TTC"""
@@ -237,6 +260,42 @@ class VirtualGroundTruthSensor:
                 return False  # 邻道安全范围内有车，不可换道
 
         return True
+
+    def right_side_object(self, route_index):
+        """读取右侧非机动车目标，并判断其是否位于当前右转冲突窗口。"""
+        scenario = self.right_object_scenario
+        if scenario is None or scenario.actor is None:
+            return RightSideObjectReading(float("inf"), float("inf"), False)
+
+        ego_tf = self.ego.get_transform()
+        ego_loc = ego_tf.location
+        actor_loc = scenario.actor.get_location()
+        forward = ego_tf.get_forward_vector()
+        right = ego_tf.get_right_vector()
+        relative = actor_loc - ego_loc
+
+        longitudinal = dot_2d(relative, forward)
+        lateral = dot_2d(relative, right)
+        distance = vector_length(relative)
+
+        to_object_length = max(distance, 0.1)
+        to_object = carla.Vector3D(relative.x / to_object_length, relative.y / to_object_length, 0.0)
+        ego_velocity = self.ego.get_velocity()
+        relative_speed = carla.Vector3D(
+            ego_velocity.x - scenario.velocity.x,
+            ego_velocity.y - scenario.velocity.y,
+            ego_velocity.z - scenario.velocity.z,
+        )
+        closing_speed = dot_2d(relative_speed, to_object)
+        ttc = distance / closing_speed if closing_speed > 0.1 else float("inf")
+
+        in_geometry_gate = -8.0 <= longitudinal <= 34.0 and -14.0 <= lateral <= 18.0
+        is_conflict = (
+            scenario.is_active
+            and scenario.is_conflict_window(route_index)
+            and in_geometry_gate
+        )
+        return RightSideObjectReading(distance, ttc, is_conflict)
 
 
 # ===================== 换道轨迹规划 =====================
@@ -378,7 +437,6 @@ class CollisionMonitor:
         print("检测到碰撞，对象 actor id：{}".format(event.other_actor.id))
 
 
-
 class DemoCamera:
     """基于 CARLA RGB 相机传感器的图像获取与转换封装，提供 get_surface() 方法返回 Pygame Surface 供显示使用。"""
 
@@ -447,6 +505,8 @@ class DemoHUD:
         lead_speed = telemetry.get("lead_speed")
         front_distance = telemetry.get("front_distance")
         front_ttc = telemetry.get("front_ttc")
+        right_distance = telemetry.get("right_object_distance")
+        right_ttc = telemetry.get("right_object_ttc")
         steer = telemetry.get("steer")
         throttle = telemetry.get("throttle")
         brake = telemetry.get("brake")
@@ -469,13 +529,17 @@ class DemoHUD:
                 self._format_number(throttle, 2),
                 self._format_number(brake, 2),
             ),
+            "right_object_dist={}m  right_object_TTC={}s".format(
+                self._format_number(right_distance, 1),
+                self._format_number(right_ttc, 2),
+            ),
             "lap_distance={}m / target={}m".format(
                 self._format_number(lap_distance, 1),
                 self._format_number(telemetry.get("lap_target_distance"), 1),
             ),
         ]
 
-        panel_height = 80
+        panel_height = 104
         background = pygame.Surface((self.width, panel_height))
         background.set_alpha(165)
         background.fill((0, 0, 0))
@@ -613,6 +677,72 @@ def choose_avoidance_side(sensor):
     if sensor.lane_clear("right"):
         return "right"
     return None
+
+
+class RightSideBicycleCrossing:
+    """R344 -> R20 右转路口的右侧非机动车横穿目标。"""
+
+    def __init__(self, actor, start_location, end_location, trigger_index, clear_index, speed):
+        self.actor = actor
+        self.start_location = start_location
+        self.end_location = end_location
+        self.trigger_index = trigger_index
+        self.clear_index = clear_index
+        self.speed = speed
+        self.progress = 0.0
+        self.is_active = False
+        self.is_finished = False
+
+        dx = end_location.x - start_location.x
+        dy = end_location.y - start_location.y
+        self.length = max(math.sqrt(dx * dx + dy * dy), 0.1)
+        self.yaw = math.degrees(math.atan2(dy, dx))
+        self.velocity = carla.Vector3D(dx / self.length * speed, dy / self.length * speed, 0.0)
+        self._set_location(start_location)
+
+    def _set_location(self, location):
+        self.actor.set_transform(carla.Transform(location, carla.Rotation(yaw=self.yaw)))
+
+    def update(self, route_index, dt):
+        if self.is_finished:
+            self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
+            return
+
+        if not self.is_active and route_index >= self.trigger_index:
+            self.is_active = True
+            print(
+                "Right-side bicycle started: trigger_index={}, clear_index={}.".format(
+                    self.trigger_index, self.clear_index
+                )
+            )
+
+        if not self.is_active:
+            self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
+            self._set_location(self.start_location)
+            return
+
+        self.progress = min(self.length, self.progress + self.speed * dt)
+        ratio = self.progress / self.length
+        current_location = carla.Location(
+            x=self.start_location.x + (self.end_location.x - self.start_location.x) * ratio,
+            y=self.start_location.y + (self.end_location.y - self.start_location.y) * ratio,
+            z=self.start_location.z + (self.end_location.z - self.start_location.z) * ratio,
+        )
+        self.velocity = carla.Vector3D(
+            (self.end_location.x - self.start_location.x) / self.length * self.speed,
+            (self.end_location.y - self.start_location.y) / self.length * self.speed,
+            0.0,
+        )
+        self._set_location(current_location)
+
+        if self.progress >= self.length:
+            self.is_finished = True
+            self.is_active = False
+            self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
+            print("Right-side bicycle finished crossing.")
+
+    def is_conflict_window(self, route_index):
+        return self.trigger_index <= route_index <= self.clear_index and not self.is_finished
 
 
 class LoopRoute:
@@ -818,6 +948,123 @@ class LoopRoute:
         return min(self.length, self.max_index * self.step_distance)
 
 
+def find_route_transition_index(loop_route, from_road, to_road):
+    """在路线中查找从 from_road 进入 to_road 的第一个路点索引。"""
+    for index in range(1, len(loop_route.waypoints)):
+        if (
+            loop_route.waypoints[index - 1].road_id == from_road
+            and loop_route.waypoints[index].road_id == to_road
+        ):
+            return index
+    for index, waypoint in enumerate(loop_route.waypoints):
+        if waypoint.road_id == to_road:
+            return index
+    return None
+
+
+def find_nonmotor_blueprint(blueprint_library):
+    """优先选择自行车蓝图；不可用时使用摩托车或普通车辆替代。"""
+    preferred_ids = (
+        "vehicle.bh.crossbike",
+        "vehicle.diamondback.century",
+        "vehicle.gazelle.omafiets",
+        "vehicle.yamaha.yzf",
+        "vehicle.kawasaki.ninja",
+    )
+    for blueprint_id in preferred_ids:
+        try:
+            return blueprint_library.find(blueprint_id)
+        except (IndexError, RuntimeError):
+            continue
+
+    vehicles = blueprint_library.filter("vehicle.*")
+    if not vehicles:
+        raise RuntimeError("No vehicle blueprint is available for the right-side object scenario.")
+    return vehicles[0]
+
+
+def spawn_right_side_bicycle_crossing(world, loop_route, actor_list):
+    """在 R344 -> R20 右转处生成从右侧通过的非机动车目标。"""
+    transition_index = find_route_transition_index(
+        loop_route, RIGHT_OBJECT_TRIGGER_ROAD, RIGHT_OBJECT_EXIT_ROAD
+    )
+    if transition_index is None:
+        print("Right-side bicycle skipped: R344 -> R20 transition not found on route.")
+        return None
+
+    anchor_index = max(0, transition_index - RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS)
+    anchor_wp = loop_route.waypoints[anchor_index]
+    if anchor_wp.road_id != RIGHT_OBJECT_TRIGGER_ROAD:
+        print(
+            "Right-side bicycle skipped: R344 crossing anchor mismatch, index={}, road={}.".format(
+                anchor_index, anchor_wp.road_id
+            )
+        )
+        return None
+
+    anchor_location = anchor_wp.transform.location
+    anchor_forward = anchor_wp.transform.get_forward_vector()
+    anchor_right = anchor_wp.transform.get_right_vector()
+
+    def r344_nonmotor_location(forward_offset):
+        return carla.Location(
+            x=anchor_location.x
+            + anchor_forward.x * forward_offset
+            + anchor_right.x * RIGHT_OBJECT_R344_RIGHT_OFFSET,
+            y=anchor_location.y
+            + anchor_forward.y * forward_offset
+            + anchor_right.y * RIGHT_OBJECT_R344_RIGHT_OFFSET,
+            z=anchor_location.z
+            + anchor_forward.z * forward_offset
+            + anchor_right.z * RIGHT_OBJECT_R344_RIGHT_OFFSET
+            + 0.65,
+        )
+
+    start_location = r344_nonmotor_location(RIGHT_OBJECT_R344_START_FORWARD_OFFSET)
+    end_location = r344_nonmotor_location(RIGHT_OBJECT_R344_END_FORWARD_OFFSET)
+    yaw = math.degrees(math.atan2(end_location.y - start_location.y, end_location.x - start_location.x))
+    start_transform = carla.Transform(start_location, carla.Rotation(yaw=yaw))
+
+    blueprint = find_nonmotor_blueprint(world.get_blueprint_library())
+    try:
+        if blueprint.has_attribute("role_name"):
+            blueprint.set_attribute("role_name", "right_side_bicycle")
+    except AttributeError:
+        pass
+    actor = world.try_spawn_actor(blueprint, start_transform)
+    if actor is None:
+        start_transform.location.z += 0.5
+        actor = world.try_spawn_actor(blueprint, start_transform)
+    if actor is None:
+        print("Right-side bicycle skipped: failed to spawn actor near R344 -> R20.")
+        return None
+
+    actor.set_simulate_physics(False)
+    actor_list.append(actor)
+
+    scenario = RightSideBicycleCrossing(
+        actor,
+        start_transform.location,
+        end_location,
+        max(0, transition_index - RIGHT_OBJECT_TRIGGER_ROUTE_STEPS),
+        min(len(loop_route.waypoints) - 1, transition_index + RIGHT_OBJECT_CLEAR_ROUTE_STEPS),
+        RIGHT_OBJECT_CROSSING_SPEED,
+    )
+    print(
+        "Right-side bicycle ready: blueprint={}, transition_index={}, anchor_index={}, anchor_road={}, path=straight_along_r344, start=({:.1f}, {:.1f}), end=({:.1f}, {:.1f}).".format(
+            blueprint.id,
+            transition_index,
+            anchor_index,
+            anchor_wp.road_id,
+            start_location.x,
+            start_location.y,
+            end_location.x,
+            end_location.y,
+        )
+    )
+    return scenario
+
+
 def main():
     actor_list = []
     camera_display = None
@@ -836,19 +1083,23 @@ def main():
         ego_vehicle, lead_vehicle, ego_start_wp = spawn_scenario(world)
         actor_list.extend([ego_vehicle, lead_vehicle])
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
-        sensor = VirtualGroundTruthSensor(world, carla_map, ego_vehicle, lead_vehicle)
         mpc = SamplingMPCTracker()
         camera_display = PygameDemoDisplay(world, ego_vehicle, actor_list)
 
         world.tick()
         set_spectator(world, ego_vehicle)
         loop_route = LoopRoute(ego_start_wp)
+        right_object_scenario = spawn_right_side_bicycle_crossing(world, loop_route, actor_list)
+        sensor = VirtualGroundTruthSensor(
+            world, carla_map, ego_vehicle, lead_vehicle, right_object_scenario
+        )
 
         state = "FOLLOW"
         trajectory = None
         start_time = time.time()
         frame = 0
         route_completion_time = None
+        right_object_yield_done = False
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
@@ -895,7 +1146,11 @@ def main():
             else:
                 lead_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
 
+            if right_object_scenario is not None:
+                right_object_scenario.update(loop_route.last_index, FIXED_DELTA_SECONDS)
+
             front = sensor.front_vehicle()
+            right_object = sensor.right_side_object(loop_route.last_index)
             ego_speed = get_speed(ego_vehicle)
 
             emergency_needed = (
@@ -906,6 +1161,13 @@ def main():
             brake_needed = (
                 front.is_front_vehicle
                 and front.ttc < TTC_BRAKE_THRESHOLD
+            )
+            right_object_risk = (
+                right_object.is_conflict_object
+                and (
+                    right_object.ttc < RIGHT_OBJECT_TTC_THRESHOLD
+                    or right_object.distance < RIGHT_OBJECT_DETECT_DISTANCE
+                )
             )
 
             if state == "FOLLOW" and emergency_needed:
@@ -930,6 +1192,17 @@ def main():
                         )
                     )
 
+            if state in ("FOLLOW", "LANE_KEEP") and right_object_risk and not right_object_yield_done:
+                state = "RIGHT_OBJECT_YIELD"
+                print(
+                    "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
+                        sim_time,
+                        right_object.distance,
+                        right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
+                        loop_route.last_index,
+                    )
+                )
+
             if route_completion_time is not None:
                 state = "ROUTE_HOLD"
                 ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
@@ -949,6 +1222,22 @@ def main():
             elif state == "EMERGENCY_BRAKE":
                 ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
 
+            elif state == "RIGHT_OBJECT_YIELD":
+                target_speed = RIGHT_OBJECT_YIELD_SPEED
+                throttle, brake = speed_control(ego_speed, target_speed)
+                if right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
+                    throttle = 0.0
+                    brake = max(brake, 0.85)
+                ego_control = carla.VehicleControl(
+                    throttle=throttle,
+                    brake=brake,
+                    steer=loop_route.steer(ego_vehicle),
+                )
+                if not right_object_risk:
+                    state = "LANE_KEEP"
+                    right_object_yield_done = True
+                    print("Right object yield completed at {:.2f}s.".format(sim_time))
+
             else:
                 if brake_needed:
                     target_speed = min(EGO_TARGET_SPEED, max(0.0, ego_speed - 5.0))
@@ -965,12 +1254,14 @@ def main():
 
             if frame % int(1.0 / FIXED_DELTA_SECONDS) == 0:
                 print(
-                    "t={:05.2f}s state={:<15} dist={:05.1f}m ttc={:05.2f}s "
-                    "ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
+                    "t={:05.2f}s state={:<18} dist={:05.1f}m ttc={:05.2f}s "
+                    "right={:05.1f}m r_ttc={:05.2f}s ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
                         sim_time,
                         state,
                         front.distance,
                         front.ttc if math.isfinite(front.ttc) else 99.99,
+                        right_object.distance if math.isfinite(right_object.distance) else 99.9,
+                        right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
                         ego_speed,
                         get_speed(lead_vehicle),
                         ego_control.steer,
@@ -985,11 +1276,13 @@ def main():
                 camera_display.render({
                     "sim_time": sim_time,
                     "state": state,
-                    "scenario": "front_brake_avoidance",
+                    "scenario": "front_brake_and_right_object",
                     "ego_speed": ego_speed,
                     "lead_speed": get_speed(lead_vehicle),
                     "front_distance": front.distance,
                     "front_ttc": front.ttc,
+                    "right_object_distance": right_object.distance,
+                    "right_object_ttc": right_object.ttc,
                     "steer": ego_control.steer,
                     "throttle": ego_control.throttle,
                     "brake": ego_control.brake,
@@ -1030,11 +1323,17 @@ def main():
     finally:
         if world is not None and original_settings is not None:
             restore_world(world, original_settings)
-        if camera_display is not None:
-            camera_display.close()
-        for actor in actor_list:
+        for actor in reversed(actor_list):
             if actor is not None:
-                actor.destroy()
+                try:
+                    actor.destroy()
+                except RuntimeError as exc:
+                    print("Cleanup warning: failed to destroy actor {}: {}".format(actor.id, exc))
+        if camera_display is not None:
+            try:
+                camera_display.close()
+            except RuntimeError as exc:
+                print("Cleanup warning: failed to close pygame display: {}".format(exc))
         print("Cleanup finished.")
 
 

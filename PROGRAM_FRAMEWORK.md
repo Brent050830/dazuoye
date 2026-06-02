@@ -156,6 +156,8 @@ dazuoye/guiji.py
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
 - 右转路线事件检测与右转前靠右准备。
+- `R344 -> R20` 右转处右侧非机动车横穿目标。
+- 右侧非机动车虚拟感知和 `RIGHT_OBJECT_YIELD` 减速让行。
 - 路线完成后的 `ROUTE_HOLD` 停车保持。
 - pygame 摄像头显示。
 - 碰撞监测。
@@ -163,9 +165,9 @@ dazuoye/guiji.py
 后续代码需要重点补充：
 
 - 城市交通流生成。
-- 右侧非机动车目标生成。
-- 右转弯区域识别与冲突判断。
-- 右转弯冲突检测与避让策略。
+- 右侧非机动车目标的运行时效果验证和参数微调。
+- 右转弯区域识别与冲突判断的稳定性优化。
+- 右转弯避让策略从第一版减速让行扩展为更完整的制动/转向组合。
 - 紧急制动灯或车辆灯光状态控制。
 
 ## 5. 场景配置层
@@ -184,21 +186,26 @@ SIM_SECONDS = 90.0
 TOWN10_START_SPAWN_INDEX = 141
 TOWN10_ROUTE_STEP = 4.0
 ROUTE_COMPLETION_HOLD_SECONDS = 4.0
+RIGHT_OBJECT_TTC_THRESHOLD = 5.0
+RIGHT_OBJECT_DETECT_DISTANCE = 34.0
+RIGHT_OBJECT_YIELD_SPEED = 3.0
+RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS = 6
+RIGHT_OBJECT_R344_RIGHT_OFFSET = 3.0
+RIGHT_OBJECT_R344_START_FORWARD_OFFSET = -8.0
+RIGHT_OBJECT_R344_END_FORWARD_OFFSET = 22.0
 ```
 
-后续加入交通流和右侧非机动车时，可以再增加：
+后续加入背景交通流或场景开关时，可以再增加：
 
 ```python
 TRAFFIC_VEHICLE_COUNT = 10
 ENABLE_TRAFFIC_FLOW = True
-ENABLE_BICYCLE_SCENARIO = True
 ```
 
 含义：
 
 - `TRAFFIC_VEHICLE_COUNT`：背景交通车辆数量。
 - `ENABLE_TRAFFIC_FLOW`：是否启用城市交通流。
-- `ENABLE_BICYCLE_SCENARIO`：是否启用右转弯非机动车避让工况。
 
 安全阈值建议分为两类：
 
@@ -340,11 +347,11 @@ vehicle.gazelle.omafiets
 
 ```python
 VirtualGroundTruthSensor
+FrontVehicleReading
+RightSideObjectReading
 ```
 
-后续需要从“只感知前车”扩展为“多目标虚拟感知”。
-
-建议输出两类目标：
+当前虚拟感知已输出两类目标：
 
 ```python
 FrontVehicleReading
@@ -363,14 +370,12 @@ RightSideObjectReading
 
 ### 8.2 右侧非机动车感知
 
-建议新增：
+当前第一版字段：
 
 ```python
 @dataclass
 class RightSideObjectReading:
     distance: float
-    lateral_offset: float
-    relative_speed: float
     ttc: float
     is_conflict_object: bool
 ```
@@ -381,7 +386,7 @@ class RightSideObjectReading:
 - 是否将与自车未来轨迹产生冲突。
 - 是否处于自车右前方危险区域。
 
-第一版可以用几何规则：
+当前第一版使用几何规则：
 
 ```text
 目标在自车右侧
@@ -389,7 +394,7 @@ class RightSideObjectReading:
 目标位置接近右转目标路径
 ```
 
-后续再升级为轨迹预测。
+后续再升级为更稳定的轨迹预测和路口区域判定。
 
 ## 9. 风险评估层
 
@@ -440,7 +445,18 @@ recommended_action
 
 行为决策层负责根据风险选择驾驶行为。
 
-建议状态机更新为：
+当前代码中的状态机已经包含前车避障和右侧非机动车第一版让行状态：
+
+```text
+FOLLOW
+AVOID
+LANE_KEEP
+EMERGENCY_BRAKE
+RIGHT_OBJECT_YIELD
+ROUTE_HOLD
+```
+
+后续如果继续细化右转避障，可以扩展为：
 
 ```text
 ROUTE_FOLLOW
@@ -614,10 +630,12 @@ carla.VehicleLightState.Brake
 当前已有：
 
 ```python
-PygameCameraDisplay
+DemoCamera
+DemoHUD
+PygameDemoDisplay
 ```
 
-后续可视化建议显示：
+当前 pygame/HUD 显示：
 
 ```text
 当前状态
@@ -674,25 +692,26 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 5. 生成自车和前车
 6. 挂载碰撞传感器和 pygame 摄像头
 7. 构建 `LoopRoute` Town10 固定短路线
-8. 进入同步仿真循环
-9. 前车在 `LEAD_BRAKE_TIME` 后急停
-10. 自车检测前车距离、TTC 和邻道净空
-11. 自车在风险触发后执行紧急制动和转向避障
-12. 避障完成后继续跟踪 `LoopRoute`
-13. 到达路线终点后进入 `ROUTE_HOLD`
-14. 自车方向盘回正、油门为 0、刹车为 1，停车保持 4 秒
-15. 输出运行日志和碰撞次数
-16. 恢复 world settings 并销毁 actor
+8. 在 `R344 -> R20` 右转处生成右侧非机动车横穿目标
+9. 进入同步仿真循环
+10. 前车在 `LEAD_BRAKE_TIME` 后急停
+11. 自车检测前车距离、TTC、邻道净空和右侧非机动车风险
+12. 自车在前车风险触发后执行紧急制动和转向避障
+13. 自车在右侧非机动车风险触发后进入 `RIGHT_OBJECT_YIELD` 减速让行
+14. 避障/让行完成后继续跟踪 `LoopRoute`
+15. 到达路线终点后进入 `ROUTE_HOLD`
+16. 自车方向盘回正、油门为 0、刹车为 1，停车保持 4 秒
+17. 输出运行日志和碰撞次数
+18. 恢复 world settings 并销毁 actor
 ```
 
-后续扩展右侧非机动车工况时，再补充：
+后续扩展右侧非机动车工况时，再补充或优化：
 
 ```text
-1. 在右转路口附近生成右侧行人/非机动车目标
-2. 在虚拟感知层增加右侧目标读取
-3. 判断自车右转轨迹与目标是否冲突
-4. 根据风险选择减速让行或转向避让
-5. 记录右侧目标最小距离、TTC 和是否碰撞
+1. 更精确地绑定非机动车道或人行横道位置
+2. 将右侧目标冲突判断升级为轨迹预测
+3. 根据风险选择减速让行或转向避让
+4. 记录右侧目标最小距离、TTC 和是否碰撞
 ```
 
 ## 16. 当前代码与新选题的关系
@@ -712,13 +731,15 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 - Town10 固定短路线。
 - 路线进度与完成判断。
 - 右转路线段检测输出。
+- `R344 -> R20` 右转处右侧非机动车横穿目标。
+- `RIGHT_OBJECT_YIELD` 减速让行状态。
 
 尚未完成：
 
 - 交通流背景车辆。
-- 右转弯区域识别。
-- 右侧非机动车生成。
-- 右转弯非机动车避让。
+- 右转弯区域识别的精细化。
+- 右侧非机动车运行效果验证和参数微调。
+- 右转弯非机动车转向避让策略。
 - 紧急制动灯显示控制。
 - 完整评价指标记录。
 
@@ -734,14 +755,15 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 3. 将现有前车急停避障工况嵌入直线段
 4. 在后续十字路口右转前提前靠右
 5. 路线完成后停车保持并输出碰撞结果
+6. 在 `R344 -> R20` 右转处加入右侧非机动车横穿目标和减速让行状态
 ```
 
 下一步建议按以下顺序推进：
 
 ```text
-第一步：加入右转弯区域识别
-第二步：生成右侧非机动车并设计冲突触发
-第三步：实现右转弯制动和转向避让
+第一步：运行验证 R344 -> R20 右转非机动车避让效果并微调触发参数
+第二步：将右转弯冲突判断从几何规则升级为更稳定的区域/轨迹预测
+第三步：实现右转弯转向避让策略
 第四步：加入背景交通流
 第五步：加入制动灯和演示状态显示
 第六步：记录评价指标并输出结果
@@ -840,5 +862,16 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：基于当前 `guiji.py` 和 `git log` 做文档一致性检查；本次只修改 Markdown 文档，未运行 CARLA 仿真。
 - 未覆盖风险：本次没有改变程序代码；历史 PR 记录中的早期实验细节仍保留为历史上下文，没有重新验证早期版本运行结果。
 - 需要 reviewer 重点看的文件：`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
+- 提交代号/Commit ID：6e14fc6
 - PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
+
+### 2026-06-02 - 接入 R344-R20 右转非机动车让行工况
+
+- 本次目标：在 Town10 固定路线的 `R344 -> R20` 大十字路口右转处加入右侧非机动车直行目标，并让自车在右转冲突窗口内减速让行。
+- 主要改动：新增右侧非机动车风险阈值；新增精简后的 `RightSideObjectReading`、`RightSideBicycleCrossing` 和 `spawn_right_side_bicycle_crossing`；虚拟感知层增加右侧目标读取；主循环新增 `RIGHT_OBJECT_YIELD` 状态；pygame HUD 和终端日志增加右侧目标距离/TTC；根据实际运行结果调整非机动车生成偏移和触发时机；将非机动车轨迹改为锚定 `R344` 连接段右侧并沿 R344 方向直行，自车右转进入 `R20` 时让行；回退不稳定的视频录制实验；修正 `finally` 清理顺序，避免显示关闭异常阻断 actor 销毁；同步更新本文档主体框架。
+- 为什么这样改：该路口是当前路线中的明确右转点，适合作为“右转避让右侧非机动车”的第一版落地工况。先用虚拟真值和减速让行跑通冲突触发链路，可以为后续转向避让、轨迹预测和评价指标打基础。
+- 如何验证：已运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile dazuoye\guiji.py`，语法检查通过；已运行 `E:\Anaconda_envs\envs\carla_env\python.exe guiji.py`，日志确认 `Right-side bicycle ready`、`anchor_index=91`、`anchor_road=344`、`path=straight_along_r344`、`Right-side bicycle started`、`Right object yield started/completed` 均触发，仿真结束时 `Collisions: 0` 且 `Cleanup finished`；运行后查询 CARLA world，`ego`、`lead`、`right_side_bicycle` 残留列表为空。
+- 未覆盖风险：本次运行环境提示未打开 pygame 动画窗口，视觉效果仍需在用户本机窗口中确认；第一版策略以减速让行为主，还未实现更完整的右转转向避让；尚未加入背景交通流和制动灯控制。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交
+- PR/分支信息：尚未推送。
