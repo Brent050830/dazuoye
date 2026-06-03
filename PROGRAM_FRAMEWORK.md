@@ -19,10 +19,22 @@
 - 在右转弯时，右侧出现或行进非机动车辆，自车需要及时避让，可以通过制动、转向或二者结合完成。
 - 整个过程中不发生碰撞，尽量不冲出车道，不出现明显失控。
 
-当前主程序文件：
+当前程序入口文件：
 
 ```text
 dazuoye/guiji.py
+```
+
+当前模块文件：
+
+```text
+dazuoye/config.py
+dazuoye/utils.py
+dazuoye/perception.py
+dazuoye/control.py
+dazuoye/route.py
+dazuoye/actors.py
+dazuoye/display.py
 ```
 
 本文档是该程序后续唯一维护文档。
@@ -143,7 +155,7 @@ dazuoye/guiji.py
 可视化与评估层
 ```
 
-当前 `guiji.py` 已经具备的基础能力：
+当前程序已经具备的基础能力：
 
 - CARLA 连接和地图加载。
 - 自车与前车生成。
@@ -164,6 +176,21 @@ dazuoye/guiji.py
 - 路线完成后的 `ROUTE_HOLD` 停车保持。
 - pygame 摄像头显示。
 - 碰撞监测。
+
+### 4.1 当前模块职责
+
+```text
+config.py       场景、路线、风险阈值和控制参数
+utils.py        通用数学、车辆速度和道路辅助函数
+perception.py   虚拟真值感知、前车与右侧目标风险读取
+control.py      五次多项式换道轨迹和采样式 MPC 跟踪
+route.py        Town10 固定短路线、路线进度和转弯事件检测
+actors.py       自车、前车、背景车辆和非机动车生成与运动
+display.py      碰撞监测、CARLA 摄像头、pygame HUD 和显示窗口
+guiji.py        CARLA 世界初始化、行为状态机、主循环和清理流程
+```
+
+模块依赖保持单向：配置与工具模块位于底层，业务模块依赖底层模块，`guiji.py` 只负责组装，避免模块之间循环导入。
 
 后续代码需要重点补充：
 
@@ -692,7 +719,7 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 
 ## 15. 主程序执行流程
 
-当前 `main()` 已实现的执行流程：
+当前入口文件 `guiji.py` 中的 `main()` 已实现以下执行流程：
 
 ```text
 1. 连接 CARLA 服务端
@@ -729,7 +756,7 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 
 ## 16. 当前代码与新选题的关系
 
-当前 `guiji.py` 可以视为新选题的第一阶段原型。
+当前模块化程序可以视为新选题的第一阶段原型。
 
 已经具备：
 
@@ -771,6 +798,7 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 5. 路线完成后停车保持并输出碰撞结果
 6. 在 `R344 -> R20` 右转处加入右侧非机动车直行目标和减速让行状态
 7. 加入 5 辆路线背景车辆和 3 辆 R344 背景自行车
+8. 将单文件 `guiji.py` 按配置、工具、感知、控制、路线、参与者和显示职责拆分为独立模块
 ```
 
 下一步建议按以下顺序推进：
@@ -900,3 +928,14 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：9fb69fa
 - PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
+
+### 2026-06-03 - 分阶段拆分 CARLA 避障程序模块
+
+- 本次目标：将已经跑通的单文件 `guiji.py` 按职责拆分为可供多人协作的独立模块，并保证拆分过程不改变现有路线、交通流、感知、避障和显示行为。
+- 主要改动：新增 `config.py`、`utils.py`、`perception.py`、`control.py`、`route.py`、`actors.py` 和 `display.py`；将配置常量、通用工具、虚拟感知、轨迹与 MPC、固定路线、交通参与者、pygame 显示和碰撞监测分别迁移到对应模块；将 `guiji.py` 收敛为 CARLA 世界初始化、行为状态机、主循环和清理入口；使用显式导入并保持单向模块依赖；`display.py` 在 Windows 下自动补充当前 Conda 环境的 `Library\bin` DLL 搜索路径，并在显示依赖导入失败时输出具体原因；剪枝时将关键右侧非机动车与背景自行车统一为一个场景列表，删除两套更新和感知接口；删除拆分过程中使用的临时机械脚本和生成缓存。
+- 为什么这样改：后续需要 3 至 4 人并行协作，继续集中修改一个大文件会增加冲突和审核难度。按职责拆分后，不同成员可以分别负责场景、感知、控制和显示验证，同时降低互相干扰。
+- 如何验证：在拆出 `config.py/utils.py`、`perception.py/control.py`、`route.py/actors.py` 和 `display.py` 后分别运行完整 CARLA 场景；最终运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile guiji.py config.py utils.py perception.py control.py route.py actors.py display.py` 和 `E:\Anaconda_envs\envs\carla_env\python.exe guiji.py`，日志确认前车急停避障、背景交通生成、`RIGHT_OBJECT_YIELD`、路线一圈完成和 `Cleanup finished` 均正常，最终 `Collisions: 0`；运行后查询 CARLA world，相关 actor 残留列表为空；未手动补充终端 `PATH` 时再次直接运行 `python.exe guiji.py`，pygame 动画渲染路径正常启用，未出现无窗口降级提示。
+- 未覆盖风险：不同机器上的 Conda/Numpy 安装状态仍可能影响动画依赖加载；本次只重构文件组织，没有新增自动化单元测试；多人协作时若同时修改 `guiji.py` 状态机，仍需要通过分支和 PR 审核协调。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/utils.py`、`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/route.py`、`dazuoye/actors.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交
+- PR/分支信息：尚未推送。
