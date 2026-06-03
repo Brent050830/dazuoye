@@ -4,13 +4,14 @@ import time
 
 import carla
 
-from actors import (
+from actors import ( # 场景中涉及的各种演员生成函数，包括自车、前车、背景车辆、背景自行车和右侧过街自行车
     spawn_background_r344_bicycles,
     spawn_background_route_vehicles,
     spawn_right_side_bicycle_crossing,
     spawn_scenario,
 )
-from config import (
+
+from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
     CLIENT_TIMEOUT,
     EGO_TARGET_SPEED,
     FIXED_DELTA_SECONDS,
@@ -31,11 +32,11 @@ from config import (
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
-from control import QuinticLaneChangeTrajectory, SamplingMPCTracker
-from display import CollisionMonitor, PygameDemoDisplay
-from perception import VirtualGroundTruthSensor
-from route import LoopRoute
-from utils import get_speed, speed_control, waypoint_steer
+from control import QuinticLaneChangeTrajectory, SamplingMPCTracker # 换道轨迹规划和 MPC 控制器实现
+from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
+from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
+from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
+from utils import get_speed, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
 
 # ===================== 仿真世界初始化 =====================
 
@@ -83,8 +84,8 @@ def set_spectator(world, ego_vehicle):
 
 
 def choose_avoidance_side(sensor):
-    """根据邻道净空状况选择换道方向：优先左转，其次右转，无道则返回 None"""
-    if sensor.lane_clear("left"):
+    """根据邻道净空状况选择避障换道方向：优先左转，其次右转，无道则返回 None"""
+    if sensor.lane_clear("left"): # 调用传感器的 lane_clear 方法检查左侧邻道是否在前后安全范围内无车，如果左侧邻道清空，则选择左换道避障
         return "left"
     if sensor.lane_clear("right"):
         return "right"
@@ -92,28 +93,29 @@ def choose_avoidance_side(sensor):
 
 
 def main():
-    actor_list = []
-    camera_display = None
-    world = None
-    original_settings = None
+    """主函数：设置仿真环境，生成演员，执行主循环进行控制，并在结束后清理资源"""
+    actor_list = [] # 用于跟踪所有生成的演员，以便在仿真结束后统一销毁
+    camera_display = None # 用于显示仿真画面，如果创建失败则保持为 None
+    world = None # 仿真世界对象，初始化为 None，在 setup_world 成功后赋值，最后在 finally 块中恢复设置
+    original_settings = None # 用于保存仿真世界的原始设置，以便在仿真结束后恢复，避免影响其他程序使用 CARLA
 
     try:
         client = carla.Client(HOST, PORT)
         client.set_timeout(CLIENT_TIMEOUT)
 
-        world = client.get_world()
+        world = client.get_world() # 获取当前世界对象
         original_settings = world.get_settings()
-        world = setup_world(client)
+        world = setup_world(client) # 加载指定地图并启用同步模式，返回配置好的世界对象
         carla_map = world.get_map()
 
-        ego_vehicle, lead_vehicle, ego_start_wp = spawn_scenario(world)
-        actor_list.extend([ego_vehicle, lead_vehicle])
+        ego_vehicle, lead_vehicle, ego_start_wp = spawn_scenario(world) # 生成自车和前车，并返回自车的起始路点
+        actor_list.extend([ego_vehicle, lead_vehicle]) # 将生成的自车和前车添加到演员列表中，以便后续管理和清理
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
-        mpc = SamplingMPCTracker()
-        camera_display = PygameDemoDisplay(world, ego_vehicle, actor_list)
+        mpc = SamplingMPCTracker() # 创建 MPC 控制器实例，用于后续的轨迹跟踪控制
+        camera_display = PygameDemoDisplay(world, ego_vehicle, actor_list) # 创建仿真显示实例，提供实时画面显示和信息渲染，如果创建失败则保持为 None
 
-        world.tick()
-        set_spectator(world, ego_vehicle)
+        world.tick() # 仿真世界进行一次更新，确保所有演员都已生成并准备就绪
+        set_spectator(world, ego_vehicle) # 将观察者视角定位到自车正上方，提供上帝视角观察仿真过程
         loop_route = LoopRoute(ego_start_wp)
         traffic_rng = random.Random(TRAFFIC_RANDOM_SEED)
         background_vehicles = spawn_background_route_vehicles(world, loop_route, actor_list, traffic_rng)
