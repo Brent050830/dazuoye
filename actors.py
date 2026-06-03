@@ -41,10 +41,10 @@ def spawn_scenario(world):
     if not lead_waypoints:
         raise RuntimeError("无法在自车前方放置前车。")
 
-    ego_vehicle = world.spawn_actor(ego_bp, vehicle_transform_from_waypoint(ego_wp))
+    ego_vehicle = world.spawn_actor(ego_bp, vehicle_transform_from_waypoint(ego_wp)) # 在自车起始路点生成自车
     lead_vehicle = world.spawn_actor(lead_bp, vehicle_transform_from_waypoint(lead_waypoints[0]))
 
-    return ego_vehicle, lead_vehicle, ego_wp
+    return ego_vehicle, lead_vehicle, ego_wp # 返回生成的自车、前车和自车的起始路点
 
 
 

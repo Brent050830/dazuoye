@@ -42,9 +42,9 @@ class CollisionMonitor:
 
     def __init__(self, world, vehicle, actor_list):
         self.history = []  # 碰撞事件历史列表
-        blueprint = world.get_blueprint_library().find("sensor.other.collision")
+        blueprint = world.get_blueprint_library().find("sensor.other.collision") # 从 CARLA 蓝图库中找到碰撞传感器的蓝图
         self.sensor = world.spawn_actor(blueprint, carla.Transform(), attach_to=vehicle)
-        self.sensor.listen(self._on_collision)
+        self.sensor.listen(self._on_collision) # 注册碰撞事件回调函数，当发生碰撞时会调用 _on_collision 方法记录事件信息
         actor_list.append(self.sensor)
 
     def _on_collision(self, event):
