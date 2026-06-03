@@ -937,5 +937,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：在拆出 `config.py/utils.py`、`perception.py/control.py`、`route.py/actors.py` 和 `display.py` 后分别运行完整 CARLA 场景；最终运行 `E:\Anaconda_envs\envs\carla_env\python.exe -m py_compile guiji.py config.py utils.py perception.py control.py route.py actors.py display.py` 和 `E:\Anaconda_envs\envs\carla_env\python.exe guiji.py`，日志确认前车急停避障、背景交通生成、`RIGHT_OBJECT_YIELD`、路线一圈完成和 `Cleanup finished` 均正常，最终 `Collisions: 0`；运行后查询 CARLA world，相关 actor 残留列表为空；未手动补充终端 `PATH` 时再次直接运行 `python.exe guiji.py`，pygame 动画渲染路径正常启用，未出现无窗口降级提示。
 - 未覆盖风险：不同机器上的 Conda/Numpy 安装状态仍可能影响动画依赖加载；本次只重构文件组织，没有新增自动化单元测试；多人协作时若同时修改 `guiji.py` 状态机，仍需要通过分支和 PR 审核协调。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/utils.py`、`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/route.py`、`dazuoye/actors.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送。
+- 提交代号/Commit ID：f7f91c1
+- PR/分支信息：直接推送到 `origin/main`，未创建独立 PR。
