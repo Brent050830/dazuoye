@@ -21,9 +21,23 @@ from config import (
     RIGHT_OBJECT_R344_START_FORWARD_OFFSET,
     RIGHT_OBJECT_TRIGGER_ROAD,
     RIGHT_OBJECT_TRIGGER_ROUTE_STEPS,
+    RIGHT_PEDESTRIAN_END_FORWARD_OFFSET,
+    RIGHT_PEDESTRIAN_FORWARD_OFFSETS,
+    RIGHT_PEDESTRIAN_RIGHT_OFFSETS,
+    RIGHT_PEDESTRIAN_SPEEDS,
+    SLOW_RIGHT_LANE_DISTANCE,
+    SLOW_RIGHT_LANE_ROLE_NAME,
+    SLOW_RIGHT_LANE_SPEED,
 )
 from route import find_route_transition_index
-from utils import clamp, get_town10_start_waypoint, vehicle_transform_from_waypoint
+from utils import (
+    clamp,
+    get_speed,
+    get_town10_start_waypoint,
+    speed_control,
+    vehicle_transform_from_waypoint,
+    waypoint_steer,
+)
 
 
 def spawn_scenario(world):
@@ -50,11 +64,11 @@ def spawn_scenario(world):
 
 
 class RightSideBicycleCrossing:
-    """R344 -> R20 右转路口的右侧非机动车横穿目标。"""
+    """右转路口横穿目标：二轮车和行人共用，保持原有感知接口不变。"""
 
     def __init__(self, actor, start_location, end_location, trigger_index, clear_index, speed):
         self.actor = actor
-        self.name = actor.attributes.get("role_name", "right_side_bicycle")
+        self.name = actor.attributes.get("role_name", actor.type_id)
         self.start_location = start_location
         self.end_location = end_location
         self.trigger_index = trigger_index
@@ -63,34 +77,40 @@ class RightSideBicycleCrossing:
         self.progress = 0.0
         self.is_active = False
         self.is_finished = False
+        self.is_walker = actor.type_id.startswith("walker.")
 
         dx = end_location.x - start_location.x
         dy = end_location.y - start_location.y
         self.length = max(math.sqrt(dx * dx + dy * dy), 0.1)
         self.yaw = math.degrees(math.atan2(dy, dx))
-        self.velocity = carla.Vector3D(dx / self.length * speed, dy / self.length * speed, 0.0)
+        self.direction = carla.Vector3D(dx / self.length, dy / self.length, 0.0)
+        self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
         self._set_location(start_location)
+        self._stop_if_walker()
 
     def _set_location(self, location):
         self.actor.set_transform(carla.Transform(location, carla.Rotation(yaw=self.yaw)))
 
+    def _stop_if_walker(self):
+        if self.is_walker:
+            self.actor.apply_control(carla.WalkerControl(speed=0.0))  # 行人初始等待
+
     def update(self, route_index, dt):
         if self.is_finished:
             self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
+            self._stop_if_walker()
             return
 
         if not self.is_active and route_index >= self.trigger_index:
             self.is_active = True
-            print(
-                "{} started: trigger_index={}, clear_index={}.".format(
-                    self.name,
-                    self.trigger_index, self.clear_index
-                )
-            )
+            print("{} started: trigger_index={}, clear_index={}.".format(
+                self.name, self.trigger_index, self.clear_index
+            ))
 
         if not self.is_active:
             self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
             self._set_location(self.start_location)
+            self._stop_if_walker()
             return
 
         self.progress = min(self.length, self.progress + self.speed * dt)
@@ -101,21 +121,21 @@ class RightSideBicycleCrossing:
             z=self.start_location.z + (self.end_location.z - self.start_location.z) * ratio,
         )
         self.velocity = carla.Vector3D(
-            (self.end_location.x - self.start_location.x) / self.length * self.speed,
-            (self.end_location.y - self.start_location.y) / self.length * self.speed,
-            0.0,
+            self.direction.x * self.speed, self.direction.y * self.speed, 0.0
         )
-        self._set_location(current_location)
+        self._set_location(current_location)  # 仍按预设路径移动，保证右转冲突稳定
+        if self.is_walker:
+            self.actor.apply_control(carla.WalkerControl(self.direction, self.speed, False))  # 尽量显示步行动作
 
         if self.progress >= self.length:
             self.is_finished = True
             self.is_active = False
             self.velocity = carla.Vector3D(0.0, 0.0, 0.0)
+            self._stop_if_walker()
             print("{} finished crossing.".format(self.name))
 
     def is_conflict_window(self, route_index):
         return self.trigger_index <= route_index <= self.clear_index and not self.is_finished
-
 
 class BackgroundRouteVehicle:
     """沿自车同一条固定路线行驶的背景车辆，仅改变初始位置和速度。"""
@@ -162,6 +182,44 @@ class BackgroundRouteVehicle:
 
 
 
+
+class SlowRightLaneVehicle:
+    """第二辆慢车：物理车辆，用与前车相同的速度控制方式慢速行驶。"""
+
+    def __init__(self, actor, carla_map, target_speed):
+        self.actor = actor
+        self.carla_map = carla_map
+        self.target_speed = target_speed
+
+    def update(self, dt):
+        throttle, brake = speed_control(get_speed(self.actor), self.target_speed)
+        steer = waypoint_steer(self.actor, self.carla_map, lookahead=8.0)
+        self.actor.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))  # 复用前车控制，避免原地不动
+
+
+
+def spawn_slow_right_lane_vehicle(world, loop_route, actor_list):
+    """在主车路线前方生成第二辆慢车，复用现有前车感知入口。"""
+    blueprint = world.get_blueprint_library().find("vehicle.nissan.patrol")
+    if blueprint.has_attribute("role_name"):
+        blueprint.set_attribute("role_name", SLOW_RIGHT_LANE_ROLE_NAME)
+
+    route_index = min(
+        int(SLOW_RIGHT_LANE_DISTANCE / loop_route.step_distance),
+        len(loop_route.waypoints) - 1,
+    )
+    spawn_wp = loop_route.waypoints[route_index]  # 直接放在主车既定路线车道上
+    actor = spawn_actor_with_z_retry(world, blueprint, vehicle_transform_from_waypoint(spawn_wp))
+    if actor is None:
+        print("Slow right-lane vehicle skipped: failed to spawn.")
+        return None
+
+    actor_list.append(actor)  # 保持物理车辆，不用 set_transform 拖动
+    print("Slow route vehicle ready: route_index={}, road={}, lane={}, speed={:.1f}m/s.".format(
+        route_index, spawn_wp.road_id, spawn_wp.lane_id, SLOW_RIGHT_LANE_SPEED
+    ))
+    return SlowRightLaneVehicle(actor, world.get_map(), SLOW_RIGHT_LANE_SPEED)
+
 def find_nonmotor_blueprint(blueprint_library):
     """优先选择自行车蓝图；不可用时使用摩托车或普通车辆替代。"""
     preferred_ids = (
@@ -182,6 +240,14 @@ def find_nonmotor_blueprint(blueprint_library):
         raise RuntimeError("No vehicle blueprint is available for the right-side object scenario.")
     return vehicles[0]
 
+
+
+def find_pedestrian_blueprint(blueprint_library, index=0):
+    """选择行人蓝图，用于右转口步行目标。"""
+    pedestrians = blueprint_library.filter("walker.pedestrian.*")
+    if not pedestrians:
+        raise RuntimeError("No pedestrian blueprint is available.")
+    return pedestrians[index % len(pedestrians)]
 
 def get_r344_nonmotor_anchor(loop_route, transition_index):
     """获取 R344 右转入口附近的非机动车直行锚点。"""
@@ -365,7 +431,7 @@ def spawn_background_r344_bicycles(world, loop_route, actor_list, rng):
             actor,
             transform.location,
             end_location,
-            max(0, transition_index - RIGHT_OBJECT_TRIGGER_ROUTE_STEPS - 10 + idx * 3),
+            max(0, transition_index - RIGHT_OBJECT_TRIGGER_ROUTE_STEPS + idx - 1),  # 与主目标接近时间启动
             min(len(loop_route.waypoints) - 1, transition_index + RIGHT_OBJECT_CLEAR_ROUTE_STEPS + 8),
             speed,
         )
@@ -381,3 +447,44 @@ def spawn_background_r344_bicycles(world, loop_route, actor_list, rng):
     return bicycles
 
 
+def spawn_right_side_pedestrians(world, loop_route, actor_list):
+    """在右转口生成 2 个行人，位置在二轮车后方。"""
+    transition_index = find_route_transition_index(
+        loop_route, RIGHT_OBJECT_TRIGGER_ROAD, RIGHT_OBJECT_EXIT_ROAD
+    )
+    if transition_index is None:
+        print("Right-side pedestrians skipped: R344 -> R20 transition not found on route.")
+        return []
+
+    anchor_wp, anchor_index = get_r344_nonmotor_anchor(loop_route, transition_index)
+    if anchor_wp is None:
+        print("Right-side pedestrians skipped: R344 nonmotor anchor not found.")
+        return []
+
+    scenarios = []
+    for idx, (fwd, right, speed) in enumerate(
+        zip(RIGHT_PEDESTRIAN_FORWARD_OFFSETS, RIGHT_PEDESTRIAN_RIGHT_OFFSETS, RIGHT_PEDESTRIAN_SPEEDS), 1
+    ):
+        start = r344_nonmotor_location(anchor_wp, fwd, right)
+        end = r344_nonmotor_location(anchor_wp, RIGHT_PEDESTRIAN_END_FORWARD_OFFSET, right)
+        yaw = math.degrees(math.atan2(end.y - start.y, end.x - start.x))
+        blueprint = find_pedestrian_blueprint(world.get_blueprint_library(), idx)
+        if blueprint.has_attribute("role_name"):
+            blueprint.set_attribute("role_name", "right_side_pedestrian_{}".format(idx))
+
+        actor = spawn_actor_with_z_retry(world, blueprint, carla.Transform(start, carla.Rotation(yaw=yaw)), z_retry=0.2)
+        if actor is None:
+            print("Right-side pedestrian skipped: index={}.".format(idx))
+            continue
+
+        actor_list.append(actor)
+        scenarios.append(RightSideBicycleCrossing(
+            actor, start, end,
+            max(0, transition_index - RIGHT_OBJECT_TRIGGER_ROUTE_STEPS + idx - 1),
+            min(len(loop_route.waypoints) - 1, transition_index + RIGHT_OBJECT_CLEAR_ROUTE_STEPS + 8),
+            speed,
+        ))
+        print("Right-side pedestrian ready: role={}, anchor_index={}, speed={:.1f}m/s.".format(
+            actor.attributes.get("role_name", "right_side_pedestrian_{}".format(idx)), anchor_index, speed
+        ))
+    return scenarios

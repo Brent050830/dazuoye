@@ -8,7 +8,9 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
     spawn_background_r344_bicycles,
     spawn_background_route_vehicles,
     spawn_right_side_bicycle_crossing,
+    spawn_right_side_pedestrians,
     spawn_scenario,
+    spawn_slow_right_lane_vehicle,
 )
 
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
@@ -119,9 +121,15 @@ def main():
         loop_route = LoopRoute(ego_start_wp)
         traffic_rng = random.Random(TRAFFIC_RANDOM_SEED)
         background_vehicles = spawn_background_route_vehicles(world, loop_route, actor_list, traffic_rng)
+        slow_vehicle = spawn_slow_right_lane_vehicle(world, loop_route, actor_list)
+        if slow_vehicle:
+            background_vehicles.append(slow_vehicle)  # 复用现有前车感知列表，不改感知逻辑
         background_bicycles = spawn_background_r344_bicycles(world, loop_route, actor_list, traffic_rng)
         right_object_scenario = spawn_right_side_bicycle_crossing(world, loop_route, actor_list)
-        right_object_scenarios = [scenario for scenario in [right_object_scenario] + background_bicycles if scenario]
+        right_pedestrians = spawn_right_side_pedestrians(world, loop_route, actor_list)
+        right_object_scenarios = [
+            scenario for scenario in [right_object_scenario] + background_bicycles + right_pedestrians if scenario
+        ]
         sensor = VirtualGroundTruthSensor(
             world,
             carla_map,
