@@ -8,7 +8,9 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
     spawn_background_r344_bicycles,
     spawn_background_route_vehicles,
     spawn_right_side_bicycle_crossing,
+    spawn_right_side_pedestrians,
     spawn_scenario,
+    spawn_slow_right_lane_vehicle,
 )
 
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
@@ -119,9 +121,15 @@ def main():
         loop_route = LoopRoute(ego_start_wp) # 创建固定路线实例，基于自车的起始路点生成一圈环形路线，提供路线点、航向和转弯信息
         traffic_rng = random.Random(TRAFFIC_RANDOM_SEED) # 创建随机数生成器实例，使用固定种子确保背景交通的可重复性
         background_vehicles = spawn_background_route_vehicles(world, loop_route, actor_list, traffic_rng) # 生成背景交通车辆，基于固定路线和随机数生成器创建多个车辆，并添加到演员列表中
+        slow_vehicle = spawn_slow_right_lane_vehicle(world, loop_route, actor_list)
+        if slow_vehicle:
+            background_vehicles.append(slow_vehicle)  # 复用现有前车感知列表，不改感知逻辑
         background_bicycles = spawn_background_r344_bicycles(world, loop_route, actor_list, traffic_rng)
         right_object_scenario = spawn_right_side_bicycle_crossing(world, loop_route, actor_list)
-        right_object_scenarios = [scenario for scenario in [right_object_scenario] + background_bicycles if scenario] # 将右侧过街自行车场景和背景自行车场景合并成一个列表，供后续统一处理
+        right_pedestrians = spawn_right_side_pedestrians(world, loop_route, actor_list)
+        right_object_scenarios = [
+            scenario for scenario in [right_object_scenario] + background_bicycles + right_pedestrians if scenario
+        ] # 将右侧过街自行车、背景自行车和右侧行人场景合并成一个列表，供后续统一处理
         sensor = VirtualGroundTruthSensor( # 创建虚拟传感器实例，提供前车和右侧过街物体的距离、TTC 等信息，供控制决策使用
             world,
             carla_map,
