@@ -58,22 +58,22 @@ class VirtualGroundTruthSensor:
 
         closest = FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
         for vehicle in [self.lead] + self.front_extra_vehicles:
-            if vehicle is None or not vehicle.is_alive:
+            if vehicle is None or not vehicle.is_alive: # 如果车辆不存在或已销毁，跳过该车辆的计算
                 continue
 
             relative = vehicle.get_location() - ego_loc
-            longitudinal = dot_2d(relative, forward)
-            lateral = dot_2d(relative, right)
-            if longitudinal <= 0.0 or abs(lateral) >= lane_width * 0.65:
+            longitudinal = dot_2d(relative, forward) # 计算该车辆相对于自车在前后方向上的距离，正值表示在前方，负值表示在后方
+            lateral = dot_2d(relative, right) # 计算该车辆相对于自车在左右方向上的距离，正值表示在右侧，负值表示在左侧
+            if longitudinal <= 0.0 or abs(lateral) >= lane_width * 0.65: # 只考虑前方同车道车辆，纵向必须在前方，横向必须在车道范围内（这里取0.65倍车道宽作为安全边界）
                 continue
 
             target_speed_along = dot_2d(vehicle.get_velocity(), forward)
             closing_speed = ego_speed_along - target_speed_along
             ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
-            if longitudinal < closest.distance:
+            if longitudinal < closest.distance: # 如果该车辆比当前最近的车辆更近，则更新最近车辆的信息
                 closest = FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, True)
 
-        return closest
+        return closest # 返回最近的前方同车道车辆的感知信息，包括距离、接近速度、TTC、横向偏移和是否确认为正前方车辆（没有正前方的话就是初始值）
 
     def lane_clear(self, side):
         """检测指定侧邻道在前后安全范围内是否无车"""
