@@ -16,10 +16,6 @@ class FrontVehicleReading:
     ttc: float            # 碰撞时间（秒）
     lateral_offset: float # 横向偏移（米）
     is_front_vehicle: bool  # 是否确认为正前方车辆
-<<<<<<< Updated upstream
-=======
-    actor_role: str = ""   # 前方目标的角色名，供场景状态机区分慢车/急刹车
->>>>>>> Stashed changes
 
 
 @dataclass
@@ -60,11 +56,7 @@ class VirtualGroundTruthSensor:
         lane_width = self.carla_map.get_waypoint(ego_loc).lane_width
         ego_speed_along = dot_2d(self.ego.get_velocity(), forward)
 
-<<<<<<< Updated upstream
         closest = FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
-=======
-        closest = FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False, "")
->>>>>>> Stashed changes
         for vehicle in [self.lead] + self.front_extra_vehicles:
             if vehicle is None or not vehicle.is_alive:
                 continue
@@ -79,12 +71,7 @@ class VirtualGroundTruthSensor:
             closing_speed = ego_speed_along - target_speed_along
             ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
             if longitudinal < closest.distance:
-<<<<<<< Updated upstream
                 closest = FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, True)
-=======
-                role_name = vehicle.attributes.get("role_name", "front_vehicle")
-                closest = FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, True, role_name)
->>>>>>> Stashed changes
 
         return closest
 
