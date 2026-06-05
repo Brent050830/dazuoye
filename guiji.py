@@ -8,9 +8,9 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
     spawn_background_r344_bicycles,
     spawn_background_route_vehicles,
     spawn_right_side_bicycle_crossing,
-    spawn_right_side_pedestrians,
-    spawn_scenario,
-    spawn_slow_right_lane_vehicle,
+    spawn_right_side_pedestrians, # 生成右侧过街行人，增加右侧物体避让的复杂性
+    spawn_scenario, # 生成自车和前车，并返回自车的起始路点
+    spawn_slow_right_lane_vehicle, # 生成右侧慢速车辆，增加右侧物体避让的复杂性
 )
 
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
@@ -34,11 +34,15 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
+from control import RouteOffsetLaneChangeTrajectory
 from control import QuinticLaneChangeTrajectory, SamplingMPCTracker # 换道轨迹规划和 MPC 控制器实现
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
+from utils import clamp, dot_2d
 from utils import get_speed, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
+
+POST_AVOID_LANE_HOLD_SECONDS = 1.0
 
 # ===================== 仿真世界初始化 =====================
 
@@ -94,6 +98,50 @@ def choose_avoidance_side(sensor):
     return None
 
 
+def lane_label(waypoint):
+    """格式化路点的道路和车道编号，供避障诊断日志使用。"""
+    if waypoint is None:
+        return "None"
+    return "road={}, lane={}, yaw={:.1f}".format(
+        waypoint.road_id,
+        waypoint.lane_id,
+        waypoint.transform.rotation.yaw,
+    )
+
+
+def print_avoidance_lane_choice(carla_map, ego_vehicle, avoidance_side, sim_time):
+    """打印本次避障选择的当前车道和目标邻道，便于判断弯道避障是否选错方向。"""
+    current_wp = carla_map.get_waypoint(
+        ego_vehicle.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
+    )
+    target_wp = current_wp.get_left_lane() if avoidance_side == "left" else current_wp.get_right_lane()
+    print(
+        "Avoidance lane choice at {:.2f}s: side={}, current=[{}], target=[{}]".format(
+            sim_time,
+            avoidance_side,
+            lane_label(current_wp),
+            lane_label(target_wp),
+        )
+    )
+    return current_wp, target_wp
+
+
+def make_route_relative_avoidance(loop_route, ego_vehicle, target_wp, length):
+    route_index = loop_route.last_index
+    start_transform = ego_vehicle.get_transform()
+    route_right = loop_route.waypoints[route_index].transform.get_right_vector()
+    route_location = loop_route.points[route_index]
+    start_offset = dot_2d(start_transform.location - route_location, route_right)
+    target_offset = dot_2d(target_wp.transform.location - route_location, route_right)
+    return (
+        RouteOffsetLaneChangeTrajectory(
+            loop_route, route_index, start_transform, target_offset, length, start_offset
+        ),
+        start_offset,
+        target_offset,
+    )
+
+
 def main():
     """主函数：设置仿真环境，生成演员，执行主循环进行控制，并在结束后清理资源"""
     actor_list = [] # 用于跟踪所有生成的演员，以便在仿真结束后统一销毁
@@ -139,12 +187,13 @@ def main():
             right_object_scenarios=right_object_scenarios,
         )
 
-        state = "FOLLOW" # 定义初始状态为跟车，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
+        state = "ROUTE_FOLLOW" # 定义初始状态为路线跟踪，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
         trajectory = None # 定义当前避障换道轨迹，初始为 None，在需要避障时生成具体的换道轨迹供 MPC 跟踪使用
         start_time = time.time() # 记录仿真开始的墙钟时间，用于计算总仿真耗时，最后在仿真结束后输出结果
         frame = 0 # 定义仿真帧计数器，初始为 0，在主循环中每次迭代增加 1，用于计算当前仿真时间和控制逻辑的时间判断
         route_completion_time = None # 定义路线完成时间，初始为 None，在完成固定路线一圈时记录仿真时间，供后续判断是否继续运行一定时间后结束仿真
         right_object_yield_done = False # 定义右侧物体避让完成标志，初始为 False，在进行右侧物体避让时设置为 True，避免重复进入避让状态
+        post_avoid_lane_hold_until = None
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
@@ -217,6 +266,11 @@ def main():
                 front.is_front_vehicle
                 and front.ttc < TTC_BRAKE_THRESHOLD
             )
+            emergency_recovered = ( # 紧急制动恢复条件：前方目标消失、距离重新拉开，或 TTC 恢复到制动阈值以上，避免 EMERGENCY_BRAKE 成为永久状态
+                not front.is_front_vehicle
+                or front.distance > SAFE_DISTANCE + 8.0
+                or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
+            )
             right_object_risk = ( # 定义右侧物体是否构成风险的条件，基于右侧过街物体的感知信息进行判断，如果右侧物体确认为冲突对象，并且 TTC 小于右侧物体风险阈值或者距离小于右侧物体检测距离，则认为构成风险
                 right_object.is_conflict_object
                 and (
@@ -225,15 +279,24 @@ def main():
                 )
             )
 
-            if state == "FOLLOW" and emergency_needed:
-                """从跟车状态切换到避障状态，调用 choose_avoidance_side 函数根据邻道净空状况选择避障换道方向，如果有可用的换道方向则生成对应的换道轨迹，并设置状态为 AVOID；如果没有可用的换道方向则直接设置状态为 EMERGENCY_BRAKE 进行紧急制动"""
+            """以下的if语句为状态切换逻辑，根据当前状态和感知信息判断是否需要切换到避障状态、紧急制动状态或右侧物体避让状态，并设置相应的状态变量和输出相关信息"""
+
+            if state == "ROUTE_FOLLOW" and emergency_needed:
+                """从路线跟踪状态切换到避障状态，调用 choose_avoidance_side 函数根据邻道净空状况选择避障换道方向；避障/让行完成后仍回到 ROUTE_FOLLOW，允许再次触发前方避障。"""
                 avoidance_side = choose_avoidance_side(sensor)
                 if avoidance_side is not None:
                     """生成避障换道轨迹，创建一个 QuinticLaneChangeTrajectory 实例，传入自车当前的变换信息、选择的横向偏移（基于车道宽度确定是左偏还是右偏）和预设的换道长度，生成对应的换道轨迹供 MPC 跟踪使用，并设置状态为 AVOID 进行避障换道"""
-                    lane_width = carla_map.get_waypoint(ego_vehicle.get_location()).lane_width
-                    lateral_offset = -lane_width if avoidance_side == "left" else lane_width
-                    trajectory = QuinticLaneChangeTrajectory(
-                        ego_vehicle.get_transform(), lateral_offset, LANE_CHANGE_LENGTH
+                    current_wp, target_wp = print_avoidance_lane_choice(
+                        carla_map, ego_vehicle, avoidance_side, sim_time
+                    )
+                    avoidance_length = max(14.0, min(LANE_CHANGE_LENGTH, front.distance + 4.0))
+                    trajectory, start_offset, target_offset = make_route_relative_avoidance(
+                        loop_route, ego_vehicle, target_wp, avoidance_length
+                    )
+                    print(
+                        "Route-relative avoidance trajectory: start_index={}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m".format(
+                            loop_route.last_index, avoidance_length, start_offset, target_offset
+                        )
                     )
                     state = "AVOID" # 设置状态为 AVOID 进行避障换道
                     print(
@@ -248,8 +311,39 @@ def main():
                             sim_time, front.ttc
                         )
                     )
+            elif state == "EMERGENCY_BRAKE":
+                if emergency_recovered:
+                    state = "ROUTE_FOLLOW"
+                    print(
+                        "Emergency brake recovered at {:.2f}s: distance={:.1f}m, TTC={:.2f}s".format(
+                            sim_time,
+                            front.distance,
+                            front.ttc if math.isfinite(front.ttc) else 99.99,
+                        )
+                    )
+                elif emergency_needed:
+                    avoidance_side = choose_avoidance_side(sensor)
+                    if avoidance_side is not None:
+                        current_wp, target_wp = print_avoidance_lane_choice(
+                            carla_map, ego_vehicle, avoidance_side, sim_time
+                        )
+                        avoidance_length = max(14.0, min(LANE_CHANGE_LENGTH, front.distance + 4.0))
+                        trajectory, start_offset, target_offset = make_route_relative_avoidance(
+                            loop_route, ego_vehicle, target_wp, avoidance_length
+                        )
+                        print(
+                            "Route-relative avoidance trajectory: start_index={}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m".format(
+                                loop_route.last_index, avoidance_length, start_offset, target_offset
+                            )
+                        )
+                        state = "AVOID"
+                        print(
+                            "Emergency brake switched to avoidance at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
+                                sim_time, avoidance_side, front.distance, front.ttc
+                            )
+                        )
 
-            if state in ("FOLLOW", "LANE_KEEP") and right_object_risk and not right_object_yield_done: # 从跟车或车道保持状态切换到右侧物体避让状态，判断当前状态为 FOLLOW 或 LANE_KEEP，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
+            if state == "ROUTE_FOLLOW" and right_object_risk and not right_object_yield_done: # 从路线跟踪状态切换到右侧物体避让状态，判断当前状态为 ROUTE_FOLLOW，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
                 state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
                 print(
                     "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
@@ -275,8 +369,9 @@ def main():
                     ego_control.throttle = 0.0
 
                 progress, lateral = trajectory.to_local(ego_vehicle.get_location())
-                if progress > LANE_CHANGE_LENGTH + 8.0 and abs(lateral - trajectory.lateral_offset) < 0.65: # 如果当前轨迹点已经完成并且接近目标车道，则切换回车道保持状态，基于轨迹坐标系中的进度和横向误差判断是否已经完成避障换道，如果进度超过预设的换道长度加上一个安全边界，并且横向误差在允许范围内，则认为已经完成换道，切换回车道保持状态
-                    state = "LANE_KEEP"
+                if progress > trajectory.length + 2.0 and abs(lateral - trajectory.lateral_offset) < 0.65: # 如果当前轨迹点已经完成并且接近目标车道，则切换回路线跟踪状态
+                    state = "ROUTE_FOLLOW"
+                    post_avoid_lane_hold_until = sim_time + POST_AVOID_LANE_HOLD_SECONDS
                     print("Avoidance completed at {:.2f}s.".format(sim_time))
 
             elif state == "EMERGENCY_BRAKE":
@@ -298,20 +393,25 @@ def main():
                 )
                 if not right_object_risk:
                     """如果右侧物体风险已经解除，则切换回车道保持状态，并设置避让完成标志避免重复进入避让状态"""
-                    state = "LANE_KEEP"
+                    state = "ROUTE_FOLLOW"
                     right_object_yield_done = True
                     print("Right object yield completed at {:.2f}s.".format(sim_time))
 
-            else: # 在其他状态下（包括 FOLLOW、LANE_KEEP 和 ROUTE_HOLD），保持车道跟踪控制，如果需要制动则增加制动值
+            else: # 在 ROUTE_FOLLOW 状态下保持路线跟踪控制，如果需要制动则降低目标速度
                 if brake_needed:
                     target_speed = min(EGO_TARGET_SPEED, max(0.0, ego_speed - 5.0))
                 else:
                     target_speed = EGO_TARGET_SPEED
                 throttle, brake = speed_control(ego_speed, target_speed)
+                if post_avoid_lane_hold_until is not None and sim_time < post_avoid_lane_hold_until:
+                    route_steer = clamp(waypoint_steer(ego_vehicle, carla_map), -0.25, 0.25)
+                else:
+                    post_avoid_lane_hold_until = None
+                    route_steer = loop_route.steer(ego_vehicle)
                 ego_control = carla.VehicleControl(
                     throttle=throttle,
                     brake=brake,
-                    steer=loop_route.steer(ego_vehicle),
+                    steer=route_steer,
                 )
 
             ego_vehicle.apply_control(ego_control) # 应用控制命令，控制自车的油门、制动和转向，根据当前状态和感知信息计算得到的控制命令进行应用，实现跟车、避障、右侧物体避让等行为
