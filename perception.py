@@ -16,6 +16,8 @@ class FrontVehicleReading:
     ttc: float            # 碰撞时间（秒）
     lateral_offset: float # 横向偏移（米）
     is_front_vehicle: bool  # 是否确认为正前方车辆
+    actor_id: int = None
+    actor_role: str = ""
 
 
 @dataclass
@@ -71,7 +73,15 @@ class VirtualGroundTruthSensor:
             closing_speed = ego_speed_along - target_speed_along
             ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
             if longitudinal < closest.distance: # 如果该车辆比当前最近的车辆更近，则更新最近车辆的信息
-                closest = FrontVehicleReading(longitudinal, closing_speed, ttc, lateral, True)
+                closest = FrontVehicleReading(
+                    longitudinal,
+                    closing_speed,
+                    ttc,
+                    lateral,
+                    True,
+                    vehicle.id,
+                    vehicle.attributes.get("role_name", vehicle.type_id),
+                )
 
         return closest # 返回最近的前方同车道车辆的感知信息，包括距离、接近速度、TTC、横向偏移和是否确认为正前方车辆（没有正前方的话就是初始值）
 
