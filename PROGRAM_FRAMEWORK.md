@@ -1788,5 +1788,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `git -C dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；本次未重新运行完整 CARLA 场景。
 - 未覆盖风险：本次是死代码删除，未做完整实景回归；如果后续需要旧的固定直角坐标系直线换道对比实现，需要从 Git 历史恢复。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`9ee9d5d`。
+- PR/分支信息：推送到 `origin/feature/decision-control`，尚未创建新 PR。
