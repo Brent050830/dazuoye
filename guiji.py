@@ -35,7 +35,7 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     TTC_BRAKE_THRESHOLD,
 )
 from control import RouteOffsetLaneChangeTrajectory
-from control import QuinticLaneChangeTrajectory, SamplingMPCTracker # 换道轨迹规划和 MPC 控制器实现
+from control import SamplingMPCTracker # MPC 控制器实现
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
@@ -285,7 +285,7 @@ def main():
                 """从路线跟踪状态切换到避障状态，调用 choose_avoidance_side 函数根据邻道净空状况选择避障换道方向；避障/让行完成后仍回到 ROUTE_FOLLOW，允许再次触发前方避障。"""
                 avoidance_side = choose_avoidance_side(sensor)
                 if avoidance_side is not None:
-                    """生成避障换道轨迹，创建一个 QuinticLaneChangeTrajectory 实例，传入自车当前的变换信息、选择的横向偏移（基于车道宽度确定是左偏还是右偏）和预设的换道长度，生成对应的换道轨迹供 MPC 跟踪使用，并设置状态为 AVOID 进行避障换道"""
+                    """生成路线相对避障轨迹，供 MPC 跟踪使用，并设置状态为 AVOID 进行避障换道。"""
                     current_wp, target_wp = print_avoidance_lane_choice(
                         carla_map, ego_vehicle, avoidance_side, sim_time
                     )

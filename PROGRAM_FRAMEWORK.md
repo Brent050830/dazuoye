@@ -169,7 +169,7 @@ dazuoye/display.py
 - 虚拟传感器。
 - TTC 计算。
 - 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的避障轨迹。
-- 采样式 MPC 跟踪，支持直线局部轨迹和路线相对轨迹两种代价计算。
+- 采样式 MPC 跟踪，当前主流程使用路线相对轨迹代价计算。
 - Town10 固定起点。
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
@@ -189,7 +189,7 @@ dazuoye/display.py
 config.py       场景、路线、风险阈值和控制参数
 utils.py        通用数学、车辆速度和道路辅助函数
 perception.py   虚拟真值感知、前车与右侧目标风险读取
-control.py      真实路线叠加局部五次偏移避障轨迹、旧直线换道轨迹和采样式 MPC 跟踪
+control.py      真实路线叠加局部五次偏移避障轨迹和采样式 MPC 跟踪
 route.py        Town10 固定短路线、路线进度和转弯事件检测
 actors.py       自车、前车、背景车辆和非机动车生成与运动
 display.py      碰撞监测、CARLA 摄像头、pygame HUD 和显示窗口
@@ -995,7 +995,7 @@ FINISHED
 当前已有：
 
 ```python
-QuinticLaneChangeTrajectory
+RouteOffsetLaneChangeTrajectory
 SamplingMPCTracker
 ```
 
@@ -1150,7 +1150,7 @@ $$
 
 因此换道起点和终点的横向速度、横向加速度都为 0，轨迹相对平滑。
 
-旧直线轨迹使用五次曲线斜率生成参考航向：
+路线相对轨迹的五次横向偏移斜率为：
 
 $$
 b'(t) = 30t^2 - 60t^3 + 30t^4
@@ -1158,7 +1158,7 @@ $$
 
 $$
 \frac{d d_{\mathrm{avoid}}}{ds}
-= \frac{d_1 b'(t)}{L}
+= \frac{(d_1-d_0)b'(t)}{L}
 $$
 
 $$
@@ -1182,7 +1182,7 @@ $$
 \Delta s_d = \max(0.5,\ 0.25\Delta s)
 $$
 
-`QuinticLaneChangeTrajectory` 旧直线局部轨迹类仍保留在 `control.py` 中，作为回退和对比实现；当前 `guiji.py` 的 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都生成 `RouteOffsetLaneChangeTrajectory`。
+旧的 `QuinticLaneChangeTrajectory` 直线局部轨迹类已从 `control.py` 删除；当前 `guiji.py` 的 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都生成 `RouteOffsetLaneChangeTrajectory`。后续如果需要旧直线局部轨迹，可从 Git 历史恢复。
 
 ### 11.3 弯道避障轨迹
 
@@ -1232,7 +1232,9 @@ $$
 N = \texttt{MPC\_HORIZON\_STEPS} = 18
 $$
 
-对于保留的旧直线局部轨迹，车辆模型使用简化运动学自行车模型，在换道轨迹局部坐标中积分：
+采样式 MPC 使用简化运动学自行车模型。历史上的直线局部轨迹分支已删除；当前主流程使用后文的 `RouteOffsetLaneChangeTrajectory` 全局坐标预测分支。
+
+直线局部轨迹版本曾使用如下局部坐标积分形式，当前仅作为公式背景保留：
 
 $$
 v_{k+1} = \max(0,\ v_k + a\Delta t)
@@ -1742,8 +1744,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：基于当前 `route.py`、`perception.py`、`control.py`、`utils.py` 和 `guiji.py` 做代码阅读与公式对应检查；本次只修改 Markdown 文档，未运行 CARLA 仿真。
 - 未覆盖风险：未对公式进行独立数值单元测试；未运行仿真验证文档描述之外的控制效果；当前公式说明对应现有代码，后续如果控制算法改为 PID/LQR/纵向 MPC 或右转轨迹预测，需要再次同步更新。
 - 需要 reviewer 重点看的文件：`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 合并路线跟踪状态并保留多次避障
 
@@ -1753,8 +1755,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py`，语法检查通过；尚未运行 CARLA 场景仿真。
 - 未覆盖风险：未验证连续多次实际避障的动态效果；未处理同时出现前方风险和右侧目标风险时更复杂的优先级仲裁；HUD 中显示的状态名会从 `FOLLOW/LANE_KEEP` 变为 `ROUTE_FOLLOW`；`EMERGENCY_BRAKE` 恢复逻辑由后续记录补充。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 增加紧急制动恢复出口
 
@@ -1764,8 +1766,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py`，本次实景运行触发了两次 `AVOID`，但没有进入 `EMERGENCY_BRAKE`，因此恢复出口未被实景覆盖；运行最终在第二次 `AVOID` 后碰撞 `static.pole`，`Collisions: 1`。
 - 未覆盖风险：`EMERGENCY_BRAKE -> ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE -> AVOID` 只完成代码路径添加，尚未在实景中触发验证；弯道/右转附近继续使用直线五次换道轨迹仍可能导致靠边或撞静态杆，需后续单独处理弯道避障限制。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 将弯道避障改为真实路线叠加局部偏移轨迹
 
@@ -1775,5 +1777,16 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py`，日志显示第一次直道避障完成；第二辆慢车避障在 `17.85s` 触发，`start_offset=1.31m`、`target_offset=3.50m`，`20.70s` 退出 `AVOID`，随后保持 `ROUTE_FOLLOW` 且未在 `AVOID` 中原地停住；右侧非机动车/行人让行、路线终点保持均完成，最终 `Collisions: 0`。
 - 未覆盖风险：本次验证基于一次 CARLA 实景运行，未做多随机种子或不同慢车位置回归；新增的 `actor_id/actor_role` 目前仅用于诊断，尚未接入不同目标角色的差异化决策；右侧目标让行策略仍是低速/停车让行，尚未实现横向绕行。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
+
+### 2026-06-05 - 删除未使用的旧直线局部轨迹类
+
+- 本次目标：确认 `QuinticLaneChangeTrajectory` 是否仍被当前控制流程使用；如果未使用，则删除旧实现，降低控制模块维护成本。
+- 主要改动：从 `control.py` 删除未被调用的 `QuinticLaneChangeTrajectory`；从 `guiji.py` 删除对应导入，并把避障轨迹生成注释改为当前实际使用的路线相对避障轨迹；同步更新本文档主体中的控制模块职责、轨迹生成说明和 PR 记录。
+- 为什么这样改：当前 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都使用 `RouteOffsetLaneChangeTrajectory`，旧直线局部轨迹只会增加阅读成本，并可能让后续维护者误以为主流程仍存在两套路由。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `git -C dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；本次未重新运行完整 CARLA 场景。
+- 未覆盖风险：本次是死代码删除，未做完整实景回归；如果后续需要旧的固定直角坐标系直线换道对比实现，需要从 Git 历史恢复。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
 - PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。

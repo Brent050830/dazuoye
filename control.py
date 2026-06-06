@@ -6,52 +6,7 @@ from config import MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间
 from utils import clamp, dot_2d, get_speed, normalize_angle, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
 
 
-# ===================== 换道轨迹规划 =====================
-
-class QuinticLaneChangeTrajectory:
-    """五次多项式换道轨迹：d(s) = D * (10t³ - 15t⁴ + 6t⁵)，t=s/L。
-    保证起止点的位移、速度、加速度均为零，轨迹平滑。
-    """
-
-    def __init__(self, start_transform, lateral_offset, length):
-        """初始化换道轨迹
-        参数：
-            start_transform: 换道起点的车辆坐标变换
-            lateral_offset:  目标侧向偏移量（负值为左换道），现在为车道宽度的正负值
-            length:          换道纵向总长度（米）,现在是个定值
-        """
-        self.origin = start_transform.location # 换道起点的全局坐标
-        self.start_yaw = yaw_to_rad(start_transform.rotation) # 换道起点的航向角（弧度）
-        self.forward = start_transform.get_forward_vector() # 换道起点的前向单位向量
-        self.right = start_transform.get_right_vector() # 换道起点的右向单位向量
-        self.lateral_offset = lateral_offset # 目标侧向偏移量
-        self.length = length # 换道纵向总长度
-
-    def to_local(self, location):
-        """将全局坐标转换为以起点为原点的局部纵横坐标 (s, d)"""
-        relative = location - self.origin # 计算相对于起点的坐标差向量
-        return dot_2d(relative, self.forward), dot_2d(relative, self.right) # 通过点积计算纵向位置 s 和横向位置 d
-
-    def lateral_at(self, s):
-        """计算纵向位置 s 处的目标横向偏移量"""
-        if s <= 0.0: # 如果 s 小于等于0，说明在起点之前，横向偏移为0
-            return 0.0
-        if s >= self.length: # 如果 s 大于等于换道长度，说明在终点之后，横向偏移为目标值
-            return self.lateral_offset
-        tau = s / self.length # 归一化的纵向位置，范围 [0, 1]
-        blend = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5 # 五次多项式的值，表示横向偏移随纵向位置的变化比例
-        return self.lateral_offset * blend
-
-    def lateral_slope_at(self, s):
-        """计算纵向位置 s 处的轨迹横向斜率（用于计算参考航向角）"""
-        if s <= 0.0 or s >= self.length:
-            return 0.0
-        tau = s / self.length # 归一化的纵向位置，范围 [0, 1]
-        blend_dot = 30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4 # 五次多项式的导数，表示横向偏移随纵向位置的变化率
-        return self.lateral_offset * blend_dot / self.length
-
-
-# ===================== MPC 轨迹跟踪控制器 =====================
+# ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
 
 class RouteOffsetLaneChangeTrajectory:
     """基于全局路径的换道轨迹：在给定的全局路径上生成一个带有侧向偏移的轨迹。
