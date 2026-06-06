@@ -191,6 +191,7 @@ def main():
         frame = 0 # 定义仿真帧计数器，初始为 0，在主循环中每次迭代增加 1，用于计算当前仿真时间和控制逻辑的时间判断
         route_completion_time = None # 定义路线完成时间，初始为 None，在完成固定路线一圈时记录仿真时间，供后续判断是否继续运行一定时间后结束仿真
         right_object_yield_done = False # 定义右侧物体避让完成标志，初始为 False，在进行右侧物体避让时设置为 True，避免重复进入避让状态
+        _last_right_yield_time = -999.0 # 记录上次右侧物体让行完成的时间，用于判断是否允许再次触发
         post_avoid_lane_hold_until = None
 
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
@@ -325,17 +326,23 @@ def main():
                             )
                         )
 
-            if state == "ROUTE_FOLLOW" and right_object_risk and not right_object_yield_done: # 从路线跟踪状态切换到右侧物体避让状态，判断当前状态为 ROUTE_FOLLOW，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
-                state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
-                print(
-                    "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}, obj_type={}.".format(
-                        sim_time,
-                        right_object.distance,
-                        right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
-                        loop_route.last_index,
-                        right_object.object_type,
+                                    # 右侧物体避让完成后的防重复锁：在 ROUTE_FOLLOW 中如果检测到新的右侧目标风险，
+            # 允许再次触发让行（不再永久锁定）；但连续帧内不对同一目标反复触发
+            if state == "ROUTE_FOLLOW" and right_object_risk:
+                if right_object_yield_done and sim_time - _last_right_yield_time > 1.0:
+                    # 上次让行完成已超过 1 秒，重置标志允许再次触发
+                    right_object_yield_done = False
+                if not right_object_yield_done: # 从路线跟踪状态切换到右侧物体避让状态，判断当前状态为 ROUTE_FOLLOW，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
+                    state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
+                    print(
+                        "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}, obj_type={}.".format(
+                            sim_time,
+                            right_object.distance,
+                            right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
+                            loop_route.last_index,
+                            right_object.object_type,
+                        )
                     )
-                )
 
             if route_completion_time is not None:
                 """如果已经完成固定路线一圈，并且继续运行的时间超过预设的保持时间，则提前终止仿真"""
@@ -378,6 +385,7 @@ def main():
                     """如果右侧物体风险已经解除，则切换回车道保持状态，并设置避让完成标志避免重复进入避让状态"""
                     state = "ROUTE_FOLLOW"
                     right_object_yield_done = True
+                    _last_right_yield_time = sim_time
                     print("Right object yield completed at {:.2f}s.".format(sim_time))
 
             else: # 在 ROUTE_FOLLOW 状态下保持路线跟踪控制，如果需要制动则降低目标速度

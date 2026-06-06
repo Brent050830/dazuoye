@@ -22,6 +22,7 @@ from config import (
     RIGHT_CONFLICT_MAX_DISTANCE,
     RIGHT_CONFLICT_MIN_LATERAL,
     RIGHT_CONFLICT_MAX_LATERAL,
+    RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_PREDICTION_SECONDS,
     SAFE_DISTANCE,
     TTC_AVOID_THRESHOLD,
@@ -410,15 +411,21 @@ class VirtualGroundTruthSensor:
             or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
         )
 
-        # === 右侧目标风险 ===
+                # === 右侧目标风险 ===
+        # 放宽条件：恢复到与原来等效的"TTC < 阈值 或 距离 < 阈值"逻辑
+        # 同时保留 risk_level >= 3（危险）的硬触发
         right_yield_needed = (
             right_reading.is_conflict_object
-            and right_reading.risk_level >= 2
+            and (
+                right_reading.risk_level >= 3
+                or (right_reading.risk_level >= 1 and right_reading.distance < 34.0)
+                or right_reading.ttc < 5.0
+            )
         )
         right_stop_needed = (
             right_reading.is_conflict_object
             and right_reading.risk_level >= 2
-            and right_reading.distance < 13.0
+            and right_reading.distance < RIGHT_OBJECT_STOP_DISTANCE
         )
 
         # === 优先级仲裁 ===
