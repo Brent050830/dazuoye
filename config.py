@@ -87,3 +87,14 @@ SLOW_RIGHT_LANE_DISTANCE = 105.0  # 第二辆慢车出生点
 SLOW_RIGHT_LANE_SPEED = 7.0 #第二辆慢车速度
 SLOW_RIGHT_LANE_ROLE_NAME = "slow_right_lane_vehicle"
 
+# ========= 传感器模拟参数（阶段一：噪声叠加） =========
+SENSOR_NOISE_ENABLED = True           # 是否启用传感器噪声模拟
+FRONT_DETECTION_RANGE = 80.0          # 前向雷达最大检测距离 (米)
+SIDE_DETECTION_RANGE = 30.0           # 侧向检测最大距离 (米)
+FRONT_FOV_HALF_ANGLE_DEG = 60.0       # 前向 FOV 半角 (度)，±60° 即 120° 总视野
+SIDE_FOV_HALF_ANGLE_DEG = 75.0        # 侧向 FOV 半角 (度)
+DISTANCE_STD = 0.5                    # 距离测量噪声标准差 (米)
+SPEED_STD = 0.3                       # 速度测量噪声标准差 (m/s)
+MISS_DETECTION_PROB = 0.05            # 漏检概率 (0~1)，仅对超出 50m 的目标生效
+# ====================================================
+

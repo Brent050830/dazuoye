@@ -8,15 +8,20 @@
 
 from dataclasses import dataclass, field
 import math
+import random
 
 import carla
 
 from config import (
+    DISTANCE_STD,
+    FRONT_DETECTION_RANGE,
+    FRONT_FOV_HALF_ANGLE_DEG,
     FRONT_LANE_ADJACENT_THRESHOLD,
     FRONT_LANE_SAME_THRESHOLD,
     FRONT_TOP_K,
     LANE_CLEAR_FRONT,
     LANE_CLEAR_REAR,
+    MISS_DETECTION_PROB,
     RIGHT_CONFIRM_FRAMES,
     RIGHT_CONFLICT_FRONT_ANGLE_DEG,
     RIGHT_CONFLICT_MAX_DISTANCE,
@@ -25,6 +30,10 @@ from config import (
     RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_PREDICTION_SECONDS,
     SAFE_DISTANCE,
+    SENSOR_NOISE_ENABLED,
+    SIDE_DETECTION_RANGE,
+    SIDE_FOV_HALF_ANGLE_DEG,
+    SPEED_STD,
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
@@ -105,9 +114,71 @@ class VirtualGroundTruthSensor:
         self.front_extra_vehicles = front_extra_vehicles or []
         self.right_object_scenarios = right_object_scenarios or []
 
-        # 右侧目标连续确认计数器
+                # 右侧目标连续确认计数器
         self._right_confirm_count = 0
         self._right_confirm_frames = RIGHT_CONFIRM_FRAMES
+
+        # 噪声随机数生成器（固定种子确保可重复）
+        self._noise_rng = random.Random(20260606)
+
+    # ========= 传感器模拟辅助方法 =========
+
+    def _add_noise(self, value, std):
+        """给测量值叠加高斯噪声。
+        
+        用 Box-Muller 方法生成高斯随机数，避免依赖 numpy。
+        """
+        if not SENSOR_NOISE_ENABLED or std <= 0.0:
+            return value
+        u1 = self._noise_rng.random()
+        u2 = self._noise_rng.random()
+        # 避免 log(0)
+        if u1 <= 0.0:
+            u1 = 1e-10
+        z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+        return value + z * std
+
+    def _check_front_fov(self, longitudinal, lateral):
+        """检查目标是否在前向传感器 FOV 内。
+        
+        返回 True 表示可检测。
+        """
+        if not SENSOR_NOISE_ENABLED:
+            return True
+        if longitudinal <= 0.0:
+            return False
+        if longitudinal > FRONT_DETECTION_RANGE:
+            return False
+        angle = abs(math.degrees(math.atan2(abs(lateral), longitudinal)))
+        return angle <= FRONT_FOV_HALF_ANGLE_DEG
+
+    def _check_side_fov(self, longitudinal, lateral):
+        """检查目标是否在侧向传感器 FOV 内。
+        
+        侧向 FOV 定义：目标在自车右侧（lateral > 0）且在角度范围内。
+        """
+        if not SENSOR_NOISE_ENABLED:
+            return True
+        distance = math.sqrt(longitudinal**2 + lateral**2)
+        if distance > SIDE_DETECTION_RANGE:
+            return False
+        if lateral <= 0.0:
+            return False
+        angle = abs(math.degrees(math.atan2(longitudinal, lateral)))
+        return angle <= SIDE_FOV_HALF_ANGLE_DEG
+
+    def _should_miss_detect(self, distance):
+        """根据距离决定是否模拟漏检。
+        
+        仅对超出 50m 的目标有概率漏检。
+        """
+        if not SENSOR_NOISE_ENABLED:
+            return False
+        if distance <= 50.0:
+            return False
+        return self._noise_rng.random() < MISS_DETECTION_PROB
+
+    # ==========================================
 
     def front_vehicles(self):
         """返回前方同车道和邻车道的前 FRONT_TOP_K 个最近车辆。
@@ -135,30 +206,42 @@ class VirtualGroundTruthSensor:
             lateral = dot_2d(relative, right)
             lane_relative = lateral / lane_width
 
-            # 只考虑前方且在邻车道范围内的车辆
+                        # 只考虑前方且在邻车道范围内的车辆
             if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
                 continue
 
-            target_speed_along = dot_2d(vehicle.get_velocity(), forward)
-            closing_speed = ego_speed_along - target_speed_along
-            ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
+            # === 传感器模拟：前向 FOV 和漏检 ===
+            if not self._check_front_fov(longitudinal, lateral):
+                continue
+            raw_distance = math.sqrt(longitudinal**2 + lateral**2)
+            if self._should_miss_detect(raw_distance):
+                continue
 
-            # 判断车道归属
+            target_speed_along = dot_2d(vehicle.get_velocity(), forward)
+            raw_closing_speed = ego_speed_along - target_speed_along
+
+            # 叠加噪声
+            noisy_longitudinal = max(0.1, self._add_noise(longitudinal, DISTANCE_STD))
+            noisy_closing_speed = self._add_noise(raw_closing_speed, SPEED_STD)
+
+            ttc = noisy_longitudinal / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
+
+            # 判断车道归属（用去噪后的 longitudinal 但保留 noisy 距离用于风险评估）
             is_same_lane = abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD
 
-            # 风险等级
+            # 风险等级（基于噪声后的距离和 TTC）
             risk_level = 0
-            if is_same_lane and longitudinal < SAFE_DISTANCE:
+            if is_same_lane and noisy_longitudinal < SAFE_DISTANCE:
                 if ttc < TTC_AVOID_THRESHOLD:
                     risk_level = 3  # 危险
                 elif ttc < TTC_BRAKE_THRESHOLD:
                     risk_level = 2  # 警告
-                elif longitudinal < SAFE_DISTANCE * 0.6:
+                elif noisy_longitudinal < SAFE_DISTANCE * 0.6:
                     risk_level = 1  # 注意
 
             candidates.append(FrontVehicleReading(
-                distance=longitudinal,
-                closing_speed=closing_speed,
+                distance=noisy_longitudinal,
+                closing_speed=noisy_closing_speed,
                 ttc=ttc,
                 lateral_offset=lateral,
                 lane_relative_lateral=lane_relative,
@@ -298,21 +381,33 @@ class VirtualGroundTruthSensor:
 
         longitudinal = dot_2d(relative, forward)
         lateral = dot_2d(relative, right)
-        distance = vector_length(relative)
+        raw_distance = vector_length(relative)
 
-        # 径向接近速度与 TTC
-        to_object_len = max(distance, 0.1)
+        # === 传感器模拟：侧向 FOV 和漏检 ===
+        if not self._check_side_fov(longitudinal, lateral):
+            return None
+        if self._should_miss_detect(raw_distance):
+            return None
+
+        # 叠加噪声
+        noisy_distance = max(0.1, self._add_noise(raw_distance, DISTANCE_STD))
+        noisy_longitudinal = self._add_noise(longitudinal, DISTANCE_STD)
+        noisy_lateral = self._add_noise(lateral, DISTANCE_STD)
+
+        # 径向接近速度与 TTC（基于噪声距离）
+        to_object_len = max(noisy_distance, 0.1)
         to_object = carla.Vector3D(
             relative.x / to_object_len, relative.y / to_object_len, 0.0
         )
         ego_velocity = self.ego.get_velocity()
-        relative_vel = carla.Vector3D(
+        raw_relative_vel = carla.Vector3D(
             ego_velocity.x - scenario.velocity.x,
             ego_velocity.y - scenario.velocity.y,
             ego_velocity.z - scenario.velocity.z,
         )
-        closing_speed = dot_2d(relative_vel, to_object)
-        ttc = distance / closing_speed if closing_speed > 0.1 else float("inf")
+        raw_closing_speed = dot_2d(raw_relative_vel, to_object)
+        noisy_closing_speed = self._add_noise(raw_closing_speed, SPEED_STD)
+        ttc = noisy_distance / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
 
         # 判断目标类型
         obj_type = ""
@@ -323,7 +418,7 @@ class VirtualGroundTruthSensor:
         elif scenario.actor.type_id.startswith("vehicle."):
             obj_type = "bicycle"
 
-        # 基础几何门限
+                # 基础几何门限（使用去噪的原始位置判断，不受噪声影响）
         in_geometry_gate = (
             -8.0 <= longitudinal <= RIGHT_CONFLICT_MAX_DISTANCE
             and RIGHT_CONFLICT_MIN_LATERAL <= lateral <= RIGHT_CONFLICT_MAX_LATERAL
@@ -341,37 +436,36 @@ class VirtualGroundTruthSensor:
         in_window = scenario.is_active and scenario.is_conflict_window(route_index)
         is_conflict = in_window and in_dynamic_gate
 
-        # 预测判断：目标是否朝冲突区域移动
+        # 预测判断：目标是否朝冲突区域移动（使用去噪原始位置和速度）
         is_moving_toward = False
         predicted_ttc = float("inf")
         if is_conflict:
-            # 使用目标速度在自车 forward 方向上的投影
             obj_forward_speed = dot_2d(scenario.velocity, forward)
-            # 相对纵向速度
             relative_long_speed = (ego_speed * 1.0) - obj_forward_speed
             if relative_long_speed > 0.5 and longitudinal > 0:
                 is_moving_toward = True
                 closing_long = relative_long_speed
-                predicted_ttc = longitudinal / closing_long if closing_long > 0.1 else float("inf")
+                # predicted_ttc 叠加噪声
+                raw_predicted_ttc = longitudinal / closing_long if closing_long > 0.1 else float("inf")
+                predicted_ttc = self._add_noise(raw_predicted_ttc, 0.3) if raw_predicted_ttc != float("inf") else float("inf")
             elif lateral > RIGHT_CONFLICT_MIN_LATERAL and lateral < 10.0:
-                # 目标在右侧附近，即使纵向远离也需要注意
                 is_moving_toward = True
 
-        # 风险等级
+        # 风险等级（基于噪声后的距离和 TTC）
         risk_level = 0
         if is_conflict:
             if ttc < TTC_AVOID_THRESHOLD or (predicted_ttc < TTC_AVOID_THRESHOLD and is_moving_toward):
                 risk_level = 3  # 危险
             elif ttc < TTC_BRAKE_THRESHOLD:
                 risk_level = 2  # 警告
-            elif distance < SAFE_DISTANCE:
+            elif noisy_distance < SAFE_DISTANCE:
                 risk_level = 1  # 注意
 
         return RightSideObjectReading(
-            distance=distance,
+            distance=noisy_distance,
             ttc=ttc,
-            relative_longitudinal=longitudinal,
-            relative_lateral=lateral,
+            relative_longitudinal=noisy_longitudinal,
+            relative_lateral=noisy_lateral,
             is_conflict_object=is_conflict,
             risk_level=risk_level,
             is_moving_toward_conflict=is_moving_toward,
