@@ -23,6 +23,9 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     LEAD_TARGET_SPEED,
     MAP_NAME,
     PORT,
+    RADAR_ENABLED,
+    RADAR_FOV_HORIZONTAL_DEG,
+    RADAR_RANGE,
     RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_OBJECT_YIELD_SPEED,
     ROUTE_COMPLETION_HOLD_SECONDS,
@@ -184,6 +187,31 @@ def main():
             front_extra_vehicles=[controller.actor for controller in background_vehicles],
             right_object_scenarios=right_object_scenarios,
         )
+
+                # === CARLA 前向毫米波雷达挂载（阶段二） ===
+        front_radar = None
+        if RADAR_ENABLED:
+            radar_bp = world.get_blueprint_library().find("sensor.other.radar")
+            radar_bp.set_attribute("horizontal_fov", str(RADAR_FOV_HORIZONTAL_DEG))
+            radar_bp.set_attribute("vertical_fov", "15.0")
+            radar_bp.set_attribute("range", str(RADAR_RANGE))
+            radar_bp.set_attribute("points_per_second", "1500")
+            # 挂载到自车前保险杠
+            radar_tf = carla.Transform(
+                carla.Location(x=2.0, z=0.5),
+                carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
+            )
+            front_radar = world.spawn_actor(radar_bp, radar_tf, attach_to=ego_vehicle)
+            actor_list.append(front_radar)
+
+            def radar_callback(data):
+                """CARLA 雷达原始点云回调，每帧将检测点写入 sensor。"""
+                sensor.set_radar_detections(data)
+
+            front_radar.listen(radar_callback)
+            print("Front radar sensor mounted: range={:.0f}m, fov={:.0f}deg".format(
+                RADAR_RANGE, RADAR_FOV_HORIZONTAL_DEG))
+        # ======================================
 
         state = "ROUTE_FOLLOW" # 定义初始状态为路线跟踪，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
         trajectory = None # 定义当前避障换道轨迹，初始为 None，在需要避障时生成具体的换道轨迹供 MPC 跟踪使用

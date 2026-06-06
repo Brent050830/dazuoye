@@ -22,6 +22,11 @@ from config import (
     LANE_CLEAR_FRONT,
     LANE_CLEAR_REAR,
     MISS_DETECTION_PROB,
+    RADAR_CLUSTER_RADIUS,
+    RADAR_ENABLED,
+    RADAR_FOV_HORIZONTAL_DEG,
+    RADAR_MIN_POINTS_PER_CLUSTER,
+    RADAR_RANGE,
     RIGHT_CONFIRM_FRAMES,
     RIGHT_CONFLICT_FRONT_ANGLE_DEG,
     RIGHT_CONFLICT_MAX_DISTANCE,
@@ -114,12 +119,15 @@ class VirtualGroundTruthSensor:
         self.front_extra_vehicles = front_extra_vehicles or []
         self.right_object_scenarios = right_object_scenarios or []
 
-                # 右侧目标连续确认计数器
+                        # 右侧目标连续确认计数器
         self._right_confirm_count = 0
         self._right_confirm_frames = RIGHT_CONFIRM_FRAMES
 
         # 噪声随机数生成器（固定种子确保可重复）
         self._noise_rng = random.Random(20260606)
+
+        # 前向雷达缓冲区（由 guiji.py 中的 radar callback 填充）
+        self._radar_detections = []  # list of carla.RadarDetection
 
     # ========= 传感器模拟辅助方法 =========
 
@@ -178,16 +186,152 @@ class VirtualGroundTruthSensor:
             return False
         return self._noise_rng.random() < MISS_DETECTION_PROB
 
-    # ==========================================
+        # ========= 雷达传感器方法 =========
+
+    def set_radar_detections(self, detections):
+        """接收来自 CARLA 雷达传感器的原始检测点云。
+
+        由 guiji.py 中的 radar callback 调用，每帧填充一次。
+
+        Args:
+            detections: list of carla.RadarDetection
+        """
+        self._radar_detections = detections
+
+    def _process_radar_detections(self, ego_tf, ego_velocity):
+        """将 CARLA 雷达原始点云聚类为目标列表。
+
+        简单欧氏距离聚类（无需 numpy）：
+        1. 按距离升序排序检测点
+        2. 对每个点，找最近的聚类中心，若距离 < RADAR_CLUSTER_RADIUS 则合并
+        3. 每个聚类取中心位置和平均速度
+        4. 过滤点数不足 RADAR_MIN_POINTS_PER_CLUSTER 的聚类
+
+        Returns:
+            list of FrontVehicleReading，按距离排序
+        """
+        if not self._radar_detections:
+            return []
+
+        forward = ego_tf.get_forward_vector()
+        right = ego_tf.get_right_vector()
+
+        # 步骤 1: 将每个检测点转换为自车坐标系 (longitudinal, lateral, speed)
+        points = []
+        for det in self._radar_detections:
+            # det.depth 是径向距离，det.azimuth 是水平角 (rad)
+            depth = det.depth
+            azimuth = det.azimuth
+            # 转换为自车坐标系
+            longitudinal = depth * math.cos(azimuth)
+            lateral = depth * math.sin(azimuth)
+            # 径向速度（正值远离，负值接近）
+            radial_velocity = det.velocity
+            points.append({
+                "longitudinal": longitudinal,
+                "lateral": lateral,
+                "radial_velocity": radial_velocity,
+            })
+
+        # 步骤 2: 按纵向距离排序
+        points.sort(key=lambda p: p["longitudinal"])
+
+        # 步骤 3: 聚类
+        clusters = []  # 每个聚类: list of point dicts
+        for point in points:
+            # 找最近的聚类
+            best_cluster = None
+            best_dist = float("inf")
+            for cluster in clusters:
+                # 用聚类中心点距离作为代表
+                center = cluster[0]
+                dist = math.sqrt(
+                    (point["longitudinal"] - center["longitudinal"])**2
+                    + (point["lateral"] - center["lateral"])**2
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_cluster = cluster
+
+            if best_dist < RADAR_CLUSTER_RADIUS and best_cluster is not None:
+                best_cluster.append(point)
+            else:
+                clusters.append([point])
+
+        # 步骤 4: 过滤点数不足的聚类
+        min_points = RADAR_MIN_POINTS_PER_CLUSTER if RADAR_ENABLED else 1
+        clusters = [c for c in clusters if len(c) >= min_points]
+
+        # 步骤 5: 每个聚类生成 FrontVehicleReading
+        ego_wp = self.carla_map.get_waypoint(ego_tf.location)
+        lane_width = max(ego_wp.lane_width, 2.5)
+        ego_speed_along = dot_2d(ego_velocity, forward)
+
+        results = []
+        for cluster in clusters:
+            # 聚类中心
+            avg_long = sum(p["longitudinal"] for p in cluster) / len(cluster)
+            avg_lat = sum(p["lateral"] for p in cluster) / len(cluster)
+            avg_radial_vel = sum(p["radial_velocity"] for p in cluster) / len(cluster)
+
+            # 只保留前方的聚类
+            if avg_long <= 0.0:
+                continue
+
+            lane_relative = avg_lat / lane_width
+
+            # 只考虑同车道或邻车道的聚类
+            if abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
+                continue
+
+            # 接近速度：径向速度正值表示远离，所以 closing = -radial_velocity
+            # 再加上自车速度补偿（雷达测的是相对速度）
+            closing_speed = -avg_radial_vel
+            ttc = avg_long / closing_speed if closing_speed > 0.1 else float("inf")
+
+            is_same_lane = abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD
+
+            # 风险等级
+            risk_level = 0
+            if is_same_lane and avg_long < SAFE_DISTANCE:
+                if ttc < TTC_AVOID_THRESHOLD:
+                    risk_level = 3
+                elif ttc < TTC_BRAKE_THRESHOLD:
+                    risk_level = 2
+                elif avg_long < SAFE_DISTANCE * 0.6:
+                    risk_level = 1
+
+            results.append(FrontVehicleReading(
+                distance=avg_long,
+                closing_speed=closing_speed,
+                ttc=ttc,
+                lateral_offset=avg_lat,
+                lane_relative_lateral=lane_relative,
+                is_front_vehicle=True,
+                is_same_lane=is_same_lane,
+                risk_level=risk_level,
+                actor_id=None,
+                actor_role="radar_target",
+            ))
+
+        # 按距离排序，取前 FRONT_TOP_K 个
+        results.sort(key=lambda r: r.distance)
+        return results[:FRONT_TOP_K]
+
+        # ==================================
 
     def front_vehicles(self):
         """返回前方同车道和邻车道的前 FRONT_TOP_K 个最近车辆。
-        增强说明：
-        - 新增 lane_relative_lateral 归一化横向偏移
-        - 区分 is_same_lane / is_adjacent_lane
-        - 计算 risk_level：距离、TTC、横向位置综合
-        - 返回按距离排序的前 Top-K 车辆
+
+        当 RADAR_ENABLED=True 时，使用 CARLA 毫米波雷达点云作为数据源；
+        否则使用虚拟真值 + 噪声模拟。
         """
+        # === 雷达模式 ===
+        if RADAR_ENABLED and self._radar_detections:
+            ego_tf = self.ego.get_transform()
+            return self._process_radar_detections(ego_tf, self.ego.get_velocity())
+
+        # === 虚拟真值模式（带回退） ===
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
         forward = ego_tf.get_forward_vector()

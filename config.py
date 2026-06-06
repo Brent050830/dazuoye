@@ -96,5 +96,14 @@ SIDE_FOV_HALF_ANGLE_DEG = 75.0        # 侧向 FOV 半角 (度)
 DISTANCE_STD = 0.5                    # 距离测量噪声标准差 (米)
 SPEED_STD = 0.3                       # 速度测量噪声标准差 (m/s)
 MISS_DETECTION_PROB = 0.05            # 漏检概率 (0~1)，仅对超出 50m 的目标生效
+
+# ========= 传感器模拟参数（阶段二：CARLA 毫米波雷达） =========
+RADAR_ENABLED = True                  # 是否启用 CARLA 前向毫米波雷达（False 时回退到虚拟真值+噪声）
+RADAR_RANGE = 80.0                    # 雷达最大检测距离 (米)
+RADAR_FOV_HORIZONTAL_DEG = 60.0       # 雷达水平 FOV (度)，±30° 即 60° 总视野
+RADAR_FOV_VERTICAL_DEG = 15.0         # 雷达垂直 FOV (度)
+RADAR_POINTS_PER_SECOND = 1500        # 雷达每秒输出点云数量
+RADAR_CLUSTER_RADIUS = 1.8            # 点云聚类半径 (米)，低于此距离的点归为同一目标
+RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数，低于此数目忽略
 # ====================================================
 
