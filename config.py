@@ -18,6 +18,18 @@ SAFE_DISTANCE = 34.0
 LANE_CLEAR_FRONT = 45.0
 LANE_CLEAR_REAR = 18.0
 
+# ========= 感知增强参数 =========
+FRONT_LANE_SAME_THRESHOLD = 0.4       # 同车道：|横向偏移| < 0.4 * 车道宽
+FRONT_LANE_ADJACENT_THRESHOLD = 1.2   # 邻车道：|横向偏移| < 1.2 * 车道宽
+FRONT_TOP_K = 2                       # 前方车辆最多返回数量
+RIGHT_CONFIRM_FRAMES = 3              # 右侧目标冲突连续确认帧数
+RIGHT_PREDICTION_SECONDS = 2.0        # 右侧目标位置预测时间（秒）
+RIGHT_CONFLICT_FRONT_ANGLE_DEG = 60.0 # 右侧冲突扇形区域半角（度）
+RIGHT_CONFLICT_MAX_DISTANCE = 30.0    # 右侧冲突最大检测距离（米）
+RIGHT_CONFLICT_MIN_LATERAL = 1.0      # 右侧冲突最小横向偏移（米）
+RIGHT_CONFLICT_MAX_LATERAL = 14.0     # 右侧冲突最大横向偏移（米）
+# ================================
+
 LANE_CHANGE_LENGTH = 28.0
 MPC_HORIZON_STEPS = 18
 MPC_DT = 0.10
@@ -74,3 +86,4 @@ RIGHT_PEDESTRIAN_SPEEDS = (2.0, 1.5)
 SLOW_RIGHT_LANE_DISTANCE = 105.0  # 第二辆慢车出生点
 SLOW_RIGHT_LANE_SPEED = 7.0 #第二辆慢车速度
 SLOW_RIGHT_LANE_ROLE_NAME = "slow_right_lane_vehicle"
+

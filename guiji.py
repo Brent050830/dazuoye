@@ -23,9 +23,7 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     LEAD_TARGET_SPEED,
     MAP_NAME,
     PORT,
-    RIGHT_OBJECT_DETECT_DISTANCE,
     RIGHT_OBJECT_STOP_DISTANCE,
-    RIGHT_OBJECT_TTC_THRESHOLD,
     RIGHT_OBJECT_YIELD_SPEED,
     ROUTE_COMPLETION_HOLD_SECONDS,
     SAFE_DISTANCE,
@@ -35,7 +33,7 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     TTC_BRAKE_THRESHOLD,
 )
 from control import RouteOffsetLaneChangeTrajectory
-from control import QuinticLaneChangeTrajectory, SamplingMPCTracker # 换道轨迹规划和 MPC 控制器实现
+from control import SamplingMPCTracker # 换道轨迹规划和 MPC 控制器实现
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
@@ -253,31 +251,15 @@ def main():
             for right_object in right_object_scenarios: # 更新右侧过街物体的状态，调用每个右侧过街物体场景的 update 方法，传入当前路线索引和固定步长，执行预设的过街行为
                 right_object.update(loop_route.last_index, FIXED_DELTA_SECONDS)
 
-            front = sensor.front_vehicle() # 获取前车的感知信息，调用传感器的 front_vehicle 方法获取当前前车的距离、TTC 等信息，供控制决策使用
-            right_object = sensor.right_side_object(loop_route.last_index) # 获取右侧过街物体的感知信息，调用传感器的 right_side_object 方法获取当前右侧过街物体的距离、TTC 等信息，供控制决策使用
+            risk = sensor.assess_risk(loop_route.last_index) # 统一风险评估：调用传感器的 assess_risk 方法综合前车和右侧目标信息，返回 RiskAssessment 结构供决策使用
+            front = risk.front_reading # 获取评估结果中的前车感知信息
+            right_object = risk.right_reading # 获取评估结果中的右侧目标感知信息
             ego_speed = get_speed(ego_vehicle)
 
-            emergency_needed = ( # 判断是否需要进行紧急避障，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于避障阈值，则认为需要进行紧急避障
-                front.is_front_vehicle # 从感知信息中获取前车是否确认为正前方车辆的布尔值（也就是返回是否存在一个正前方车辆）
-                and front.distance < SAFE_DISTANCE # 存在正前方车辆的话，这里是最近的一个，判断其距离是否小于安全距离
-                and front.ttc < TTC_AVOID_THRESHOLD
-            )
-            brake_needed = ( # 定义是否需要制动的条件，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于制动阈值，则认为需要进行制动
-                front.is_front_vehicle
-                and front.ttc < TTC_BRAKE_THRESHOLD
-            )
-            emergency_recovered = ( # 紧急制动恢复条件：前方目标消失、距离重新拉开，或 TTC 恢复到制动阈值以上，避免 EMERGENCY_BRAKE 成为永久状态
-                not front.is_front_vehicle
-                or front.distance > SAFE_DISTANCE + 8.0
-                or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
-            )
-            right_object_risk = ( # 定义右侧物体是否构成风险的条件，基于右侧过街物体的感知信息进行判断，如果右侧物体确认为冲突对象，并且 TTC 小于右侧物体风险阈值或者距离小于右侧物体检测距离，则认为构成风险
-                right_object.is_conflict_object
-                and (
-                    right_object.ttc < RIGHT_OBJECT_TTC_THRESHOLD
-                    or right_object.distance < RIGHT_OBJECT_DETECT_DISTANCE
-                )
-            )
+            emergency_needed = risk.front_emergency_needed
+            brake_needed = risk.front_brake_needed
+            emergency_recovered = risk.front_emergency_recovered
+            right_object_risk = risk.right_object_yield_needed
 
             """以下的if语句为状态切换逻辑，根据当前状态和感知信息判断是否需要切换到避障状态、紧急制动状态或右侧物体避让状态，并设置相应的状态变量和输出相关信息"""
 
@@ -346,11 +328,12 @@ def main():
             if state == "ROUTE_FOLLOW" and right_object_risk and not right_object_yield_done: # 从路线跟踪状态切换到右侧物体避让状态，判断当前状态为 ROUTE_FOLLOW，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
                 state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
                 print(
-                    "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
+                    "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}, obj_type={}.".format(
                         sim_time,
                         right_object.distance,
                         right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
                         loop_route.last_index,
+                        right_object.object_type,
                     )
                 )
 
@@ -418,15 +401,22 @@ def main():
 
             if frame % int(1.0 / FIXED_DELTA_SECONDS) == 0:
                 """每秒输出一次当前状态和关键信息，包括仿真时间、当前状态、前车距离和TTC、右侧物体距离和TTC、自车速度、前车速度、控制命令等，供调试和分析使用"""
+                right_extra = ""
+                if right_object.object_type:
+                    right_extra = " type={} p_ttc={:.1f}s".format(
+                        right_object.object_type,
+                        right_object.predicted_ttc if math.isfinite(right_object.predicted_ttc) else 99.99,
+                    )
                 print(
                     "t={:05.2f}s state={:<18} dist={:05.1f}m ttc={:05.2f}s "
-                    "right={:05.1f}m r_ttc={:05.2f}s ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
+                    "right={:05.1f}m r_ttc={:05.2f}s{} ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
                         sim_time,
                         state,
                         front.distance,
                         front.ttc if math.isfinite(front.ttc) else 99.99,
                         right_object.distance if math.isfinite(right_object.distance) else 99.9,
                         right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
+                        right_extra,
                         ego_speed,
                         get_speed(lead_vehicle),
                         ego_control.steer,
