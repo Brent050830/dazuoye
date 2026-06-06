@@ -1841,6 +1841,17 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 提交代号/Commit ID：待提交
 - PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
 
+### 2026-06-06 - 增强感知数据结构与迁移风险评估至感知层
+
+- 本次目标：增强感知数据结构，将分散在 guiji.py 的风险判断逻辑迁移到 perception.py 的 assess_risk() 方法中，并在终端日志输出新感知字段。
+- 主要改动：FrontVehicleReading 新增 lane_relative_lateral、is_same_lane、risk_level 字段；RightSideObjectReading 新增 relative_longitudinal、relative_lateral、risk_level、predicted_ttc、object_type 等字段；新增 RiskAssessment 数据类，整合前车和右侧目标风险判断；VirtualGroundTruthSensor.front_vehicles() 返回 Top-K 前方车辆并区分车道归属；VirtualGroundTruthSensor.right_side_object() 增加连续帧确认、自车速度自适应检测距离、运动预测和目标类型区分；VirtualGroundTruthSensor.lane_clear() 放宽路口车道匹配并加入相对速度判断；新增 VirtualGroundTruthSensor.assess_risk() 统一风险评估入口；guiji.py 移除散落的风险布尔量计算，统一调用 sensor.assess_risk()；guiji.py 日志输出增加 object_type 和 predicted_ttc；移除对 RIGHT_OBJECT_DETECT_DISTANCE、RIGHT_OBJECT_TTC_THRESHOLD 的导入（已迁移至感知层）；移除 QuinticLaneChangeTrajectory 未使用导入；config.py 新增 8 个感知增强参数。
+- 为什么这样改：原 guiji.py 状态机中散落多处相同的风险计算逻辑，不利于维护。将这些逻辑集中到 assess_risk() 方法后，行为决策层只需读取 RiskAssessment 字段，新增目标角色或调整阈值时不影响主循环。感知数据增强也为后续更精细的决策（如同车道 vs 邻车道差异化制动、右转转向避让）提供信息基础。
+- 如何验证：已运行 python -m py_compile perception.py guiji.py config.py，语法检查通过。
+- 未覆盖风险：本次增强改变了感知层输出结构，但 front_vehicle() 保留旧接口兼容；RIGHT_OBJECT_YIELD 状态在 guiji.py 中仍使用 RIGHT_OBJECT_STOP_DISTANCE 和 RIGHT_OBJECT_YIELD_SPEED（未迁移）；RiskAssessment 中的 primary_risk_type/primary_risk_level 已定义但当前 guiji.py 尚未使用（保留给后续多风险优先级仲裁）。
+- 需要 reviewer 重点看的文件：dazuoye/perception.py、dazuoye/guiji.py、dazuoye/config.py、dazuoye/PROGRAM_FRAMEWORK.md。
+- 提交代号/Commit ID：c58c569
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+
 ### 2026-06-06 - 虚拟传感器叠加噪声模拟层（阶段一）
 
 - 本次目标：在虚拟真值传感器 VirtualGroundTruthSensor 上叠加 FOV 限制、高斯距离/速度噪声和漏检概率模拟，使感知输出更接近真实传感器特性，同时保留零开销回退到虚拟真值的能力。
