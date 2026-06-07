@@ -2154,7 +2154,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：当前是轻量候选路径选择，不是完整论文级分布式驱动车动力学规划；PDF 文本未在当前环境中成功抽取，第一版主要依据笔记和现有代码实现；本次只做了一次固定场景实景运行，未覆盖多随机种子、不同速度/距离组合或更多交通流密度；候选代价权重仍需要根据 pygame/CARLA 效果继续调参；1x 播放只保证同步仿真循环按墙钟等待，若 CARLA 服务端本身低于实时速度，画面仍会受机器性能限制。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/.gitignore`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-06 - 收敛右转让行硬刹与背景车追尾保护
 
@@ -2165,7 +2165,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：本次只验证固定 Town10 起点、固定随机种子和 `--free-run` 运行；1x 实时播放视觉效果尚未重新人工确认；右转让行仍是低速/停车让行，没有实现右转横向绕行；目标切换日志用于诊断，尚未把不同角色接入差异化决策。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/perception.py`、`dazuoye/actors.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 调整右转冲突几何门限为右后方优先
 
@@ -2176,7 +2176,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：几何门限调整后的 pygame 画面观感仍需人工确认；如果目标生成位置或自车姿态变化较大，仍可能需要继续微调门限。
 - 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 增加前视目标与候选避障轨迹可视化
 
@@ -2187,7 +2187,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：红色标记和绿色候选轨迹的画面效果仍需在 pygame/CARLA 窗口中人工确认；`world.debug` 绘制是调试可视化，不是真正的车辆灯光；如果调试线段过多，可能轻微影响画面性能。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 平滑弯道避障参考线显示
 
@@ -2198,7 +2198,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：本次没有改变“弯道只有一条有效候选轨迹”的筛选问题，也没有拉长弯道避障长度；第二次弯道避障仍为 `valid=1/12`，后续需要继续检查候选拒绝原因和前车距离约束；绿色轨迹是否真正更顺仍建议在 pygame/CARLA 画面中人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 降低避障轨迹调试绘制开销
 
@@ -2209,7 +2209,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：如果机器渲染压力或 MPC 计算本身仍超过单帧预算，1x 仍可能在避障段短暂变慢；必要时可继续减少绘制内容，例如只画选中轨迹或关闭 `DEBUG_DRAW_TRAJECTORY`。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 使用路线弧线参考修正弯道前车识别
 
@@ -2220,7 +2220,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：本次仍使用虚拟路线参考线，等价于车道线/导航参考线真值，尚未加入噪声和延迟；路线参考模式下远距离前车日志偶尔会显示较大弧长距离，但当前触发仍受 `SAFE_DISTANCE` 和避障窗口约束；弯道轨迹视觉顺滑程度仍建议在 pygame/CARLA 窗口中人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-07 - 加入慢车位移预测与避障后制动收敛
 
@@ -2231,4 +2231,4 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：当前只是基于路线方向速度的一阶预测，不是完整时空 Lattice/动态障碍物规划；目标速度、路线投影仍来自虚拟真值感知，尚未加入传感器噪声和延迟；只做了一次固定场景 `--free-run` 验证，pygame 画面观感和不同速度组合仍需人工继续观察。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
