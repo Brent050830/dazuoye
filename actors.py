@@ -8,6 +8,7 @@ from config import (
     BACKGROUND_BICYCLE_RIGHT_OFFSETS,
     BACKGROUND_BICYCLE_SPEED_MAX,
     BACKGROUND_BICYCLE_SPEED_MIN,
+    BACKGROUND_VEHICLE_EGO_CLEARANCE,
     BACKGROUND_VEHICLE_ROUTE_INDICES,
     BACKGROUND_VEHICLE_SPEED_MAX,
     BACKGROUND_VEHICLE_SPEED_MIN,
@@ -149,7 +150,12 @@ class BackgroundRouteVehicle:
         self.z_offset = actor.get_location().z - loop_route.points[int(self.progress / loop_route.step_distance)].z
         self.update(0.0)
 
-    def update(self, dt):
+    def update(self, dt, ego_vehicle=None):
+        actual_speed = self.target_speed
+        if ego_vehicle is not None and self._is_too_close_behind_ego(ego_vehicle):
+            dt = 0.0
+            actual_speed = 0.0
+
         self.progress = (self.progress + self.target_speed * dt) % self.route_span
         route_position = self.progress / self.loop_route.step_distance
         low_index = min(int(route_position), len(self.loop_route.points) - 2)
@@ -173,11 +179,18 @@ class BackgroundRouteVehicle:
         segment_length = math.sqrt(dx * dx + dy * dy)
         if segment_length > 0.001:
             velocity = carla.Vector3D(
-                x=dx / segment_length * self.target_speed,
-                y=dy / segment_length * self.target_speed,
+                x=dx / segment_length * actual_speed,
+                y=dy / segment_length * actual_speed,
                 z=0.0,
             )
             self.actor.set_target_velocity(velocity)
+
+    def _is_too_close_behind_ego(self, ego_vehicle):
+        ego_index = self.loop_route._nearest_index(ego_vehicle.get_location())
+        ego_progress = ego_index * self.loop_route.step_distance
+        ahead_gap = (self.progress - ego_progress) % self.route_span
+        behind_gap = self.route_span - ahead_gap
+        return ahead_gap > self.route_span * 0.5 and behind_gap < BACKGROUND_VEHICLE_EGO_CLEARANCE
 
 
 
@@ -191,7 +204,7 @@ class SlowRightLaneVehicle:
         self.carla_map = carla_map
         self.target_speed = target_speed
 
-    def update(self, dt):
+    def update(self, dt, ego_vehicle=None):
         throttle, brake = speed_control(get_speed(self.actor), self.target_speed)
         steer = waypoint_steer(self.actor, self.carla_map, lookahead=8.0)
         self.actor.apply_control(carla.VehicleControl(throttle=throttle, brake=brake, steer=steer))  # 复用前车控制，避免原地不动
