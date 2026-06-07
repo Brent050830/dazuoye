@@ -1,3 +1,4 @@
+import argparse
 import math
 import random
 import time
@@ -15,6 +16,11 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
 
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
     CLIENT_TIMEOUT,
+    DEBUG_DRAW_INTERVAL_FRAMES,
+    DEBUG_DRAW_LIFETIME,
+    DEBUG_DRAW_LOOKAHEAD_DISTANCE,
+    DEBUG_DRAW_TRAJECTORY,
+    DEBUG_DRAW_TRAJECTORY_STEP,
     EGO_TARGET_SPEED,
     FIXED_DELTA_SECONDS,
     HOST,
@@ -24,6 +30,7 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     MAP_NAME,
     PORT,
     RIGHT_OBJECT_DETECT_DISTANCE,
+    RIGHT_OBJECT_STOP_RELEASE_DISTANCE,
     RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_OBJECT_TTC_THRESHOLD,
     RIGHT_OBJECT_YIELD_SPEED,
@@ -34,17 +41,43 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
-from control import RouteOffsetLaneChangeTrajectory
 from control import SamplingMPCTracker # MPC 控制器实现
+from control import select_best_route_offset_trajectory
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
-from utils import clamp, dot_2d
+from utils import clamp
 from utils import get_speed, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
 
 POST_AVOID_LANE_HOLD_SECONDS = 1.0
 
 # ===================== 仿真世界初始化 =====================
+
+def parse_args():
+    """读取演示运行参数。默认按 1x 实时速度播放，便于观察 pygame 动画。"""
+    parser = argparse.ArgumentParser(description="CARLA Town10 emergency avoidance demo")
+    parser.add_argument(
+        "--playback-speed",
+        type=float,
+        default=1.0,
+        help="仿真播放倍率，1.0 表示按真实时间 1x 播放。",
+    )
+    parser.add_argument(
+        "--free-run",
+        action="store_true",
+        help="不按真实时间等待，尽可能快地推进仿真。",
+    )
+    return parser.parse_args()
+
+
+def pace_realtime_playback(start_wall_time, sim_elapsed, playback_speed, free_run):
+    """将同步仿真节奏限制为固定播放倍率，避免 pygame 画面忽快忽慢。"""
+    if free_run or playback_speed <= 0.0:
+        return
+    target_wall_elapsed = sim_elapsed / playback_speed
+    wait_time = start_wall_time + target_wall_elapsed - time.time()
+    if wait_time > 0.0:
+        time.sleep(wait_time)
 
 def setup_world(client):
     """加载指定地图并启用同步模式，返回配置好的世界对象"""
@@ -126,24 +159,119 @@ def print_avoidance_lane_choice(carla_map, ego_vehicle, avoidance_side, sim_time
     return current_wp, target_wp
 
 
-def make_route_relative_avoidance(loop_route, ego_vehicle, target_wp, length):
-    route_index = loop_route.last_index
-    start_transform = ego_vehicle.get_transform()
-    route_right = loop_route.waypoints[route_index].transform.get_right_vector()
-    route_location = loop_route.points[route_index]
-    start_offset = dot_2d(start_transform.location - route_location, route_right)
-    target_offset = dot_2d(target_wp.transform.location - route_location, route_right)
-    return (
-        RouteOffsetLaneChangeTrajectory(
-            loop_route, route_index, start_transform, target_offset, length, start_offset
-        ),
-        start_offset,
-        target_offset,
+def plan_route_relative_avoidance(carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time):
+    """打印邻道选择、生成多候选路线相对避障轨迹，并返回最佳候选轨迹。"""
+    current_wp, target_wp = print_avoidance_lane_choice(
+        carla_map, ego_vehicle, avoidance_side, sim_time
+    )
+    target_speed = 0.0 if front.actor_role == "lead" else max(0.0, getattr(front, "target_speed_along", 0.0))
+    predicted_motion = target_speed * min(3.0, max(1.0, front.distance / max(front.closing_speed, 0.1)))
+    base_length = max(14.0, min(52.0, LANE_CHANGE_LENGTH + predicted_motion))
+    best_candidate, candidates = select_best_route_offset_trajectory(
+        loop_route, ego_vehicle, target_wp, front, base_length
+    )
+    print_avoidance_candidate_summary(best_candidate, candidates)
+    selected_trajectory = best_candidate.trajectory if best_candidate is not None else None
+    return selected_trajectory, candidates
+
+
+def print_avoidance_candidate_summary(best_candidate, candidates):
+    """打印候选路径数量、筛选结果和最终选中的关键参数。"""
+    valid_count = sum(1 for candidate in candidates if candidate.is_valid)
+    if best_candidate is None:
+        reasons = {}
+        for candidate in candidates:
+            reasons[candidate.reject_reason] = reasons.get(candidate.reject_reason, 0) + 1
+        print("Avoidance candidates rejected: total={}, reasons={}.".format(len(candidates), reasons))
+        return
+
+    print(
+        "Best avoidance candidate: valid={}/{}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m, ay={:.2f}m/s^2, cost={:.2f}.".format(
+            valid_count,
+            len(candidates),
+            best_candidate.length,
+            best_candidate.start_offset,
+            best_candidate.target_offset,
+            best_candidate.lateral_accel,
+            best_candidate.total_cost,
+        )
     )
 
 
-def main():
+def avoidance_laterally_separated(trajectory, lateral):
+    """判断避障过程中自车是否已经横向脱离原车道风险区。"""
+    lateral_shift = abs(trajectory.lateral_offset - trajectory.start_offset)
+    if lateral_shift < 0.1:
+        return False
+    completed_shift = abs(lateral - trajectory.start_offset)
+    return completed_shift > min(1.4, lateral_shift * 0.55)
+
+
+def right_object_label(reading):
+    """格式化右侧避让目标，便于判断是否发生目标切换。"""
+    if reading.actor_id is None:
+        return "none"
+    return "{}#{}".format(reading.actor_role or "actor", reading.actor_id)
+
+
+def draw_debug_marker(world, location, color, life_time=DEBUG_DRAW_LIFETIME):
+    """在 CARLA 世界中画一个醒目的短生命周期目标点。"""
+    marker_base = carla.Location(location.x, location.y, location.z + 0.35)
+    marker_top = carla.Location(location.x, location.y, location.z + 2.0)
+    world.debug.draw_point(marker_base, size=0.18, color=color, life_time=life_time)
+    world.debug.draw_line(marker_base, marker_top, thickness=0.08, color=color, life_time=life_time)
+
+
+def draw_route_lookahead_marker(world, loop_route, lookahead_distance=DEBUG_DRAW_LOOKAHEAD_DISTANCE):
+    """在正常路线前方约 lookahead_distance 处画红色目标标记。"""
+    lookahead_steps = max(1, int(lookahead_distance / loop_route.step_distance))
+    target_index = min(loop_route.last_index + lookahead_steps, len(loop_route.points) - 1)
+    draw_debug_marker(world, loop_route.points[target_index], carla.Color(255, 0, 0))
+
+
+def draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory, lookahead_distance=DEBUG_DRAW_LOOKAHEAD_DISTANCE):
+    """在当前避障轨迹前方约 lookahead_distance 处画红色目标标记。"""
+    progress, _ = trajectory.to_local(ego_vehicle.get_location())
+    target_s = min(trajectory.length + lookahead_distance, progress + lookahead_distance)
+    draw_debug_marker(world, trajectory.location_at(target_s), carla.Color(255, 0, 0))
+
+
+def draw_avoidance_candidates(world, candidates, selected_trajectory):
+    """用绿色线显示有效候选避障轨迹，选中轨迹使用更亮更粗的线。"""
+    if not candidates:
+        return
+    for candidate in candidates:
+        if not candidate.is_valid:
+            continue
+        trajectory = candidate.trajectory
+        is_selected = trajectory is selected_trajectory
+        color = carla.Color(0, 255, 40) if is_selected else carla.Color(0, 170, 0)
+        thickness = 0.08 if is_selected else 0.04
+        s = 0.0
+        previous = trajectory.location_at(s) + carla.Location(z=0.18)
+        while s < trajectory.length:
+            s = min(trajectory.length, s + DEBUG_DRAW_TRAJECTORY_STEP)
+            current = trajectory.location_at(s) + carla.Location(z=0.18)
+            world.debug.draw_line(previous, current, thickness=thickness, color=color, life_time=DEBUG_DRAW_LIFETIME)
+            previous = current
+
+
+def draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, candidates, frame):
+    """统一绘制路线/避障前视点和避障候选轨迹。"""
+    if not DEBUG_DRAW_TRAJECTORY:
+        return
+    if frame % max(1, DEBUG_DRAW_INTERVAL_FRAMES) != 0:
+        return
+    if state == "AVOID" and trajectory is not None:
+        draw_avoidance_candidates(world, candidates, trajectory)
+        draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory)
+    elif state == "ROUTE_FOLLOW":
+        draw_route_lookahead_marker(world, loop_route)
+
+
+def main(args=None):
     """主函数：设置仿真环境，生成演员，执行主循环进行控制，并在结束后清理资源"""
+    args = args or parse_args()
     actor_list = [] # 用于跟踪所有生成的演员，以便在仿真结束后统一销毁
     camera_display = None # 用于显示仿真画面，如果创建失败则保持为 None
     world = None # 仿真世界对象，初始化为 None，在 setup_world 成功后赋值，最后在 finally 块中恢复设置
@@ -185,6 +313,7 @@ def main():
             lead_vehicle,
             front_extra_vehicles=[controller.actor for controller in background_vehicles],
             right_object_scenarios=right_object_scenarios,
+            loop_route=loop_route,
         )
 
         state = "ROUTE_FOLLOW" # 定义初始状态为路线跟踪，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
@@ -193,8 +322,16 @@ def main():
         frame = 0 # 定义仿真帧计数器，初始为 0，在主循环中每次迭代增加 1，用于计算当前仿真时间和控制逻辑的时间判断
         route_completion_time = None # 定义路线完成时间，初始为 None，在完成固定路线一圈时记录仿真时间，供后续判断是否继续运行一定时间后结束仿真
         right_object_yield_done = False # 定义右侧物体避让完成标志，初始为 False，在进行右侧物体避让时设置为 True，避免重复进入避让状态
+        right_object_stop_active = False
+        last_right_object_actor_id = None
         post_avoid_lane_hold_until = None
 
+        avoidance_candidates = []
+
+        if args.free_run:
+            print("Playback mode: free-run.")
+        else:
+            print("Playback mode: {:.1f}x realtime.".format(args.playback_speed))
         print("Scenario started: map={}, ego=Tesla Model3, lead=Lincoln MKZ 2020".format(MAP_NAME))
         print("Lead car will brake hard at {:.1f}s.".format(LEAD_BRAKE_TIME))
         print(
@@ -248,19 +385,24 @@ def main():
                 lead_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
 
             for background_vehicle in background_vehicles: # 更新背景车辆的状态，调用每个背景车辆控制器的 update 方法，传入当前仿真时间和固定步长，执行预设的背景交通行为
-                background_vehicle.update(FIXED_DELTA_SECONDS)
+                background_vehicle.update(FIXED_DELTA_SECONDS, ego_vehicle)
 
             for right_object in right_object_scenarios: # 更新右侧过街物体的状态，调用每个右侧过街物体场景的 update 方法，传入当前路线索引和固定步长，执行预设的过街行为
                 right_object.update(loop_route.last_index, FIXED_DELTA_SECONDS)
 
-            front = sensor.front_vehicle() # 获取前车的感知信息，调用传感器的 front_vehicle 方法获取当前前车的距离、TTC 等信息，供控制决策使用
+            front = sensor.front_vehicle(use_route_reference=(state != "AVOID")) # 获取前车的感知信息；正常跟踪时使用路线弧线参考，避障过程中使用自车坐标兜底，避免已绕开的目标继续触发制动
             right_object = sensor.right_side_object(loop_route.last_index) # 获取右侧过街物体的感知信息，调用传感器的 right_side_object 方法获取当前右侧过街物体的距离、TTC 等信息，供控制决策使用
             ego_speed = get_speed(ego_vehicle)
 
+            close_slow_front_vehicle = (
+                front.is_front_vehicle
+                and front.distance < LANE_CHANGE_LENGTH + 6.0
+                and front.closing_speed > 2.0
+            )
             emergency_needed = ( # 判断是否需要进行紧急避障，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于避障阈值，则认为需要进行紧急避障
                 front.is_front_vehicle # 从感知信息中获取前车是否确认为正前方车辆的布尔值（也就是返回是否存在一个正前方车辆）
                 and front.distance < SAFE_DISTANCE # 存在正前方车辆的话，这里是最近的一个，判断其距离是否小于安全距离
-                and front.ttc < TTC_AVOID_THRESHOLD
+                and (front.ttc < TTC_AVOID_THRESHOLD or close_slow_front_vehicle)
             )
             brake_needed = ( # 定义是否需要制动的条件，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于制动阈值，则认为需要进行制动
                 front.is_front_vehicle
@@ -286,24 +428,24 @@ def main():
                 avoidance_side = choose_avoidance_side(sensor)
                 if avoidance_side is not None:
                     """生成路线相对避障轨迹，供 MPC 跟踪使用，并设置状态为 AVOID 进行避障换道。"""
-                    current_wp, target_wp = print_avoidance_lane_choice(
-                        carla_map, ego_vehicle, avoidance_side, sim_time
+                    selected_trajectory, avoidance_candidates = plan_route_relative_avoidance(
+                        carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time
                     )
-                    avoidance_length = max(14.0, min(LANE_CHANGE_LENGTH, front.distance + 4.0))
-                    trajectory, start_offset, target_offset = make_route_relative_avoidance(
-                        loop_route, ego_vehicle, target_wp, avoidance_length
-                    )
-                    print(
-                        "Route-relative avoidance trajectory: start_index={}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m".format(
-                            loop_route.last_index, avoidance_length, start_offset, target_offset
+                    if selected_trajectory is None:
+                        state = "EMERGENCY_BRAKE"
+                        print(
+                            "Emergency brake only at {:.2f}s: no valid avoidance path, TTC={:.2f}s".format(
+                                sim_time, front.ttc
+                            )
                         )
-                    )
-                    state = "AVOID" # 设置状态为 AVOID 进行避障换道
-                    print(
-                        "Avoidance started at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
-                            sim_time, avoidance_side, front.distance, front.ttc
+                    else:
+                        trajectory = selected_trajectory
+                        state = "AVOID" # 设置状态为 AVOID 进行避障换道
+                        print(
+                            "Avoidance started at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
+                                sim_time, avoidance_side, front.distance, front.ttc
+                            )
                         )
-                    )
                 else: # 没有可用的换道方向，直接设置状态为 EMERGENCY_BRAKE 进行紧急制动
                     state = "EMERGENCY_BRAKE"
                     print(
@@ -324,30 +466,26 @@ def main():
                 elif emergency_needed:
                     avoidance_side = choose_avoidance_side(sensor)
                     if avoidance_side is not None:
-                        current_wp, target_wp = print_avoidance_lane_choice(
-                            carla_map, ego_vehicle, avoidance_side, sim_time
+                        selected_trajectory, avoidance_candidates = plan_route_relative_avoidance(
+                            carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time
                         )
-                        avoidance_length = max(14.0, min(LANE_CHANGE_LENGTH, front.distance + 4.0))
-                        trajectory, start_offset, target_offset = make_route_relative_avoidance(
-                            loop_route, ego_vehicle, target_wp, avoidance_length
-                        )
-                        print(
-                            "Route-relative avoidance trajectory: start_index={}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m".format(
-                                loop_route.last_index, avoidance_length, start_offset, target_offset
+                        if selected_trajectory is not None:
+                            trajectory = selected_trajectory
+                            state = "AVOID"
+                            print(
+                                "Emergency brake switched to avoidance at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
+                                    sim_time, avoidance_side, front.distance, front.ttc
+                                )
                             )
-                        )
-                        state = "AVOID"
-                        print(
-                            "Emergency brake switched to avoidance at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
-                                sim_time, avoidance_side, front.distance, front.ttc
-                            )
-                        )
 
             if state == "ROUTE_FOLLOW" and right_object_risk and not right_object_yield_done: # 从路线跟踪状态切换到右侧物体避让状态，判断当前状态为 ROUTE_FOLLOW，并且右侧物体构成风险，并且还没有完成过右侧物体避让（避免重复进入避让状态），则设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让，并输出相关信息
                 state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
+                right_object_stop_active = False
+                last_right_object_actor_id = right_object.actor_id
                 print(
-                    "Right object yield started at {:.2f}s: distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
+                    "Right object yield started at {:.2f}s: target={}, distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
                         sim_time,
+                        right_object_label(right_object),
                         right_object.distance,
                         right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
                         loop_route.last_index,
@@ -362,15 +500,19 @@ def main():
             elif state == "AVOID" and trajectory is not None:
                 """在避障状态下，使用 MPC 控制器跟踪避障换道轨迹，计算所需的控制命令，并应用控制；如果需要制动则增加制动值；如果当前轨迹点已经完成并且接近目标车道，则切换回车道保持状态"""
                 target_speed = min(EGO_TARGET_SPEED, max(8.0, ego_speed))
+                progress, lateral = trajectory.to_local(ego_vehicle.get_location())
+                lateral_separated = avoidance_laterally_separated(trajectory, lateral)
                 ego_control = mpc.control(ego_vehicle, trajectory, target_speed) # 在避障状态下，使用 MPC 控制器跟踪避障换道轨迹，计算所需的控制命令，基于当前自车状态、预生成的换道轨迹和目标速度进行计算，供后续应用控制命令使用
-                if brake_needed:
+                if brake_needed and not lateral_separated:
                     """如果需要制动则增加制动值，基于前车的感知信息判断是否需要增加制动值，如果需要则将油门设置为0，并且将制动值增加到至少0.20，以增强避障时的安全性"""
                     ego_control.brake = max(ego_control.brake, 0.20)
                     ego_control.throttle = 0.0
+                elif lateral_separated and not front.is_front_vehicle:
+                    ego_control.brake = min(ego_control.brake, 0.15)
 
-                progress, lateral = trajectory.to_local(ego_vehicle.get_location())
                 if progress > trajectory.length + 2.0 and abs(lateral - trajectory.lateral_offset) < 0.65: # 如果当前轨迹点已经完成并且接近目标车道，则切换回路线跟踪状态
                     state = "ROUTE_FOLLOW"
+                    avoidance_candidates = []
                     post_avoid_lane_hold_until = sim_time + POST_AVOID_LANE_HOLD_SECONDS
                     print("Avoidance completed at {:.2f}s.".format(sim_time))
 
@@ -379,10 +521,37 @@ def main():
                 ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
 
             elif state == "RIGHT_OBJECT_YIELD":
+                if right_object.actor_id != last_right_object_actor_id:
+                    print(
+                        "Right yield target changed at {:.2f}s: {} -> {}, distance={:.1f}m, TTC={:.2f}s.".format(
+                            sim_time,
+                            last_right_object_actor_id if last_right_object_actor_id is not None else "none",
+                            right_object_label(right_object),
+                            right_object.distance if math.isfinite(right_object.distance) else 99.9,
+                            right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
+                        )
+                    )
+                    last_right_object_actor_id = right_object.actor_id
+
                 """在右侧物体避让状态下，降低目标速度以增加与右侧过街物体的安全距离，如果需要则增加制动值；如果右侧物体风险已经解除，则切换回车道保持状态，并设置避让完成标志避免重复进入避让状态"""
                 target_speed = RIGHT_OBJECT_YIELD_SPEED # 在右侧物体避让状态下，降低目标速度以增加与右侧过街物体的安全距离，这里直接使用预设的 RIGHT_OBJECT_YIELD_SPEED 作为目标速度，供后续计算控制命令使用
                 throttle, brake = speed_control(ego_speed, target_speed) # 使用 speed_control 函数计算所需的油门和制动值，基于当前自车速度和降低后的目标速度进行计算，供后续应用控制命令使用
-                if right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
+                if not right_object_stop_active and right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
+                    right_object_stop_active = True
+                    print(
+                        "Right object hard stop engaged at {:.2f}s: target={}, distance={:.1f}m.".format(
+                            sim_time, right_object_label(right_object), right_object.distance
+                        )
+                    )
+                elif right_object_stop_active and right_object.distance > RIGHT_OBJECT_STOP_RELEASE_DISTANCE:
+                    right_object_stop_active = False
+                    print(
+                        "Right object hard stop released at {:.2f}s: target={}, distance={:.1f}m.".format(
+                            sim_time, right_object_label(right_object), right_object.distance
+                        )
+                    )
+
+                if right_object_stop_active:
                     """如果右侧过街物体距离小于预设的停止距离，则认为需要紧急避让，增加制动值并将油门设置为0，以最大限度地减小与右侧过街物体的碰撞风险"""
                     throttle = 0.0
                     brake = max(brake, 0.85)
@@ -395,6 +564,8 @@ def main():
                     """如果右侧物体风险已经解除，则切换回车道保持状态，并设置避让完成标志避免重复进入避让状态"""
                     state = "ROUTE_FOLLOW"
                     right_object_yield_done = True
+                    right_object_stop_active = False
+                    last_right_object_actor_id = None
                     print("Right object yield completed at {:.2f}s.".format(sim_time))
 
             else: # 在 ROUTE_FOLLOW 状态下保持路线跟踪控制，如果需要制动则降低目标速度
@@ -415,6 +586,8 @@ def main():
                 )
 
             ego_vehicle.apply_control(ego_control) # 应用控制命令，控制自车的油门、制动和转向，根据当前状态和感知信息计算得到的控制命令进行应用，实现跟车、避障、右侧物体避让等行为
+
+            draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, avoidance_candidates, frame)
 
             if frame % int(1.0 / FIXED_DELTA_SECONDS) == 0:
                 """每秒输出一次当前状态和关键信息，包括仿真时间、当前状态、前车距离和TTC、右侧物体距离和TTC、自车速度、前车速度、控制命令等，供调试和分析使用"""
@@ -457,6 +630,7 @@ def main():
                     "lap_target_distance": loop_route.length,
                 })
             frame += 1 # 增加帧计数器，推进仿真时间的计算，并在下一次循环中使用更新后的仿真时间进行控制逻辑判断和信息输出
+            pace_realtime_playback(start_time, frame * FIXED_DELTA_SECONDS, args.playback_speed, args.free_run)
 
             # 碰撞发生后立即提前终止仿真
             if collision_monitor.history:

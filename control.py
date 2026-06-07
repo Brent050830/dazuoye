@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 
 import carla
 
@@ -7,6 +8,24 @@ from utils import clamp, dot_2d, get_speed, normalize_angle, yaw_to_rad # 一些
 
 
 # ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
+
+@dataclass
+class AvoidancePathCandidate:
+    """一条候选避障路径及其约束/代价诊断信息。"""
+
+    trajectory: object # 换道轨迹对象，包含计算轨迹坐标和参考航向的方法
+    length: float # 换道长度，表示从起点到终点沿全局路径的纵向距离
+    start_offset: float # 起始侧向偏移量，表示换道开始时相对于全局路径的横向位置
+    target_offset: float # 目标侧向偏移量，表示换道结束时相对于全局路径的横向位置
+    lateral_shift: float # 侧向位移，表示车辆在换道过程中的横向移动距离
+    lateral_accel: float # 侧向加速度，表示车辆在换道过程中的横向加速度
+    safety_cost: float # 安全代价，表示换道过程中的安全风险
+    comfort_cost: float # 舒适代价，表示换道过程中的舒适性影响
+    tracking_cost: float # 跟踪代价，表示车辆跟踪轨迹的性能
+    total_cost: float # 总代价，表示候选路径的综合评价
+    is_valid: bool # 标记路径是否有效
+    reject_reason: str = ""
+
 
 class RouteOffsetLaneChangeTrajectory:
     """基于全局路径的换道轨迹：在给定的全局路径上生成一个带有侧向偏移的轨迹。
@@ -17,41 +36,52 @@ class RouteOffsetLaneChangeTrajectory:
         """初始化换道轨迹"""
         self.loop_route = loop_route
         self.start_index = max(0, min(start_index, len(loop_route.points) - 1))
-        self.start_offset = start_offset
-        self.lateral_offset = lateral_offset
-        self.length = length
+        self.start_offset = start_offset # 起始侧向偏移量，表示换道开始时相对于全局路径的横向位置
+        self.lateral_offset = lateral_offset # 目标侧向偏移量，表示换道结束时相对于全局路径的横向位置
+        self.length = length # 换道长度，表示从起点到终点沿全局路径的纵向距离
         self.step_distance = loop_route.step_distance
-        self.right = start_transform.get_right_vector()
-        self.start_yaw = yaw_to_rad(start_transform.rotation)
         self.is_route_relative = True
 
     def _clamp_index(self, index):
         """将索引限制在全局路径点的范围内"""
         return max(0, min(index, len(self.loop_route.points) - 1))
 
-    def _route_pose_at(self, s):
-        """计算全局路径上纵向位置 s 处的坐标和右向单位向量"""
-        raw_index = self.start_index + s / self.step_distance
+    def _route_location_at_raw_index(self, raw_index):
+        """按浮点路线索引插值得到路线中心点。"""
         lower = self._clamp_index(int(math.floor(raw_index)))
         upper = self._clamp_index(lower + 1)
         blend = clamp(raw_index - lower, 0.0, 1.0)
         p0 = self.loop_route.points[lower]
         p1 = self.loop_route.points[upper]
-        location = carla.Location(
+        return carla.Location(
             x=p0.x + (p1.x - p0.x) * blend,
             y=p0.y + (p1.y - p0.y) * blend,
             z=p0.z + (p1.z - p0.z) * blend,
         )
-        right0 = self.loop_route.waypoints[lower].transform.get_right_vector()
-        right1 = self.loop_route.waypoints[upper].transform.get_right_vector()
-        right = carla.Vector3D(
-            x=right0.x + (right1.x - right0.x) * blend,
-            y=right0.y + (right1.y - right0.y) * blend,
-            z=0.0,
-        )
+
+    def _smoothed_route_right_at_raw_index(self, raw_index):
+        """用路线中心线前后差分计算平滑右向，减少弯道 waypoint 朝向跳变带来的折线感。"""
+        look_index = 1.25
+        before = self._route_location_at_raw_index(raw_index - look_index)
+        after = self._route_location_at_raw_index(raw_index + look_index)
+        tangent = carla.Vector3D(x=after.x - before.x, y=after.y - before.y, z=0.0)
+        tangent_length = math.sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
+        if tangent_length < 0.001:
+            waypoint_right = self.loop_route.waypoints[self._clamp_index(int(round(raw_index)))].transform.get_right_vector()
+            return carla.Vector3D(x=waypoint_right.x, y=waypoint_right.y, z=0.0)
+        tangent.x /= tangent_length
+        tangent.y /= tangent_length
+        right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
         right_length = max(math.sqrt(right.x * right.x + right.y * right.y), 0.001)
         right.x /= right_length
         right.y /= right_length
+        return right
+
+    def _route_pose_at(self, s):
+        """计算全局路径上纵向位置 s 处的坐标和右向单位向量"""
+        raw_index = self.start_index + s / self.step_distance
+        location = self._route_location_at_raw_index(raw_index)
+        right = self._smoothed_route_right_at_raw_index(raw_index)
         return location, right
 
     def avoidance_delta_at(self, s):
@@ -104,9 +134,162 @@ class RouteOffsetLaneChangeTrajectory:
         )
         progress = max(0.0, (nearest - self.start_index) * self.step_distance)
         route_location = self.loop_route.points[nearest]
-        route_right = self.loop_route.waypoints[nearest].transform.get_right_vector()
+        route_right = self._smoothed_route_right_at_raw_index(float(nearest))
         lateral = dot_2d(location - route_location, route_right) # 通过计算当前位置与全局路径上最近点的坐标差向量与路径右向单位向量的点积，得到当前位置相对于全局路径的横向偏移量 d
         return progress, lateral
+
+
+def smoothed_route_right_at(loop_route, index):
+    """按路线中心线差分计算指定索引处的平滑右向量。"""
+    helper = RouteOffsetLaneChangeTrajectory(loop_route, index, None, 0.0, loop_route.step_distance)
+    return helper._smoothed_route_right_at_raw_index(float(index))
+
+
+def select_best_route_offset_trajectory(loop_route, ego_vehicle, target_wp, front, base_length):
+    """生成多条路线相对避障候选轨迹，按约束筛选并返回总代价最低的一条。"""
+    if target_wp is None:
+        return None, []
+
+    route_index = loop_route.last_index
+    start_transform = ego_vehicle.get_transform()
+    route_location = loop_route.points[route_index]
+    route_right = smoothed_route_right_at(loop_route, route_index)
+    start_offset = dot_2d(start_transform.location - route_location, route_right)
+    target_center_offset = dot_2d(target_wp.transform.location - route_location, route_right)
+    lane_width = max(target_wp.lane_width, 2.5)
+    ego_speed = max(get_speed(ego_vehicle), 4.0)
+    front_distance = getattr(front, "distance", float("inf"))
+    front_ttc = getattr(front, "ttc", float("inf"))
+    front_target_speed = max(0.0, getattr(front, "target_speed_along", 0.0))
+
+    length_values = _candidate_lengths(base_length)
+    target_values = _candidate_target_offsets(start_offset, target_center_offset, lane_width)
+
+    candidates = []
+    for length in length_values: # 对于每个候选换道长度，生成多条候选轨迹，每条轨迹对应一个候选目标侧向偏移，并计算每条轨迹的约束满足情况和代价，最后从有效的候选中选取总代价最低的一条作为最终的换道轨迹
+        for target_offset in target_values:
+            trajectory = RouteOffsetLaneChangeTrajectory(
+                loop_route, route_index, start_transform, target_offset, length, start_offset
+            )
+            candidates.append(
+                _score_avoidance_candidate(
+                    trajectory,
+                    length,
+                    start_offset,
+                    target_offset,
+                    target_center_offset,
+                    lane_width,
+                    ego_speed,
+                    front_distance,
+                    front_ttc,
+                    front_target_speed,
+                )
+            )
+
+    valid_candidates = [candidate for candidate in candidates if candidate.is_valid]
+    if not valid_candidates:
+        return None, candidates
+    return min(valid_candidates, key=lambda candidate: candidate.total_cost), candidates
+
+
+def _candidate_lengths(base_length):
+    """围绕基础避障长度生成候选纵向长度，避免只固定一条路径。"""
+    values = []
+    for scale in (0.85, 1.0, 1.15, 1.30):
+        length = clamp(base_length * scale, 14.0, 56.0)
+        if all(abs(length - existing) > 0.1 for existing in values):
+            values.append(length)
+    return values
+
+
+def _candidate_target_offsets(start_offset, target_center_offset, lane_width):
+    """围绕目标邻道中心生成候选横向终点，并限制在邻道中心附近。"""
+    side = 1.0 if target_center_offset >= start_offset else -1.0
+    nudges = (-0.20 * lane_width * side, 0.0, 0.15 * lane_width * side)
+    values = []
+    for nudge in nudges:
+        target = target_center_offset + nudge
+        if abs(target - target_center_offset) <= lane_width * 0.35:
+            values.append(target)
+    return values
+
+
+def _score_avoidance_candidate( # 计算每条候选避障路径的约束满足情况和代价，输入轨迹对象、换道长度、起始偏移、目标偏移、目标中心偏移、车道宽度、自车速度、前车距离和前车TTC，输出一个包含轨迹和相关信息的AvoidancePathCandidate对象
+    trajectory,
+    length,
+    start_offset,
+    target_offset,
+    target_center_offset,
+    lane_width,
+    ego_speed,
+    front_distance,
+    front_ttc,
+    front_target_speed,
+):
+    lateral_shift = target_offset - start_offset # 计算侧向位移，表示车辆在换道过程中的横向移动距离，即目标偏移与起始偏移之间的差值
+    maneuver_time = length / ego_speed # 估算换道所需时间，基于换道长度和自车速度计算得到，表示完成换道所需的时间
+    lateral_accel = 10.0 * math.sqrt(3.0) * abs(lateral_shift) / (3.0 * max(maneuver_time * maneuver_time, 0.01))
+    max_lateral_accel = 3.8
+    reject_reason = ""
+
+    if abs(target_offset - target_center_offset) > lane_width * 0.35:
+        reject_reason = "target outside lane bound"
+    elif length < 14.0:
+        reject_reason = "length too short"
+    elif lateral_accel > max_lateral_accel:
+        reject_reason = "lateral acceleration too high"
+    predicted_front_motion = front_target_speed * maneuver_time
+    front_clear_distance = front_distance + predicted_front_motion
+
+    if reject_reason == "" and math.isfinite(front_distance) and length > front_clear_distance + 6.0:
+        reject_reason = "path too long before front vehicle"
+
+    center_error = abs(target_offset - target_center_offset) / lane_width
+    safety_cost = _safety_cost(length, maneuver_time, front_clear_distance, front_ttc)
+    comfort_cost = (lateral_accel / max_lateral_accel) ** 2 + 0.20 * abs(lateral_shift) / lane_width
+    tracking_cost = _tracking_cost(trajectory, length)
+    total_cost = 4.0 * safety_cost + 2.0 * comfort_cost + tracking_cost + 0.6 * center_error
+
+    return AvoidancePathCandidate(
+        trajectory=trajectory,
+        length=length,
+        start_offset=start_offset,
+        target_offset=target_offset,
+        lateral_shift=lateral_shift,
+        lateral_accel=lateral_accel,
+        safety_cost=safety_cost,
+        comfort_cost=comfort_cost,
+        tracking_cost=tracking_cost,
+        total_cost=total_cost,
+        is_valid=(reject_reason == ""),
+        reject_reason=reject_reason,
+    )
+
+
+def _safety_cost(length, maneuver_time, front_distance, front_ttc):
+    """安全代价：TTC 越紧迫越偏向较短、较快完成横向避障的路径。"""
+    distance_cost = 0.0
+    if math.isfinite(front_distance): # 如果前车距离是有限的，计算距离代价，距离越近代价越高，鼓励选择较短的换道路径
+        distance_cost = max(0.0, length * 0.75 - front_distance + 4.0) ** 2 / 25.0
+    ttc_cost = 0.0
+    if math.isfinite(front_ttc): # 如果前车TTC是有限的，计算TTC代价，TTC越紧迫（越小）代价越高，鼓励选择较快完成换道的路径
+        ttc_cost = max(0.0, maneuver_time - front_ttc + 0.4) ** 2 # 如果换道所需时间超过前车TTC，说明在换道过程中可能会与前车发生冲突，代价会显著增加，鼓励选择更快完成换道的路径以避开前车
+    return distance_cost + ttc_cost
+
+
+def _tracking_cost(trajectory, length):
+    """跟踪难度代价：参考航向变化和五次曲线斜率越大，MPC 越难稳定跟踪。"""
+    samples = 6
+    yaws = []
+    max_slope = 0.0
+    for index in range(samples + 1):
+        s = length * index / samples
+        yaws.append(trajectory.reference_yaw_at(s))
+        max_slope = max(max_slope, abs(trajectory.lateral_slope_at(s)))
+    yaw_variation = 0.0
+    for before, after in zip(yaws, yaws[1:]):
+        yaw_variation += abs(normalize_angle(after - before))
+    return 0.35 * yaw_variation + 0.30 * max_slope
 
 
 class SamplingMPCTracker:
@@ -121,74 +304,9 @@ class SamplingMPCTracker:
         """计算当前帧的最优控制指令
         返回：carla.VehicleControl（油门、制动、转向）
         """
-        transform = ego_vehicle.get_transform() # 获取自车的当前变换信息
-        s0, d0 = trajectory.to_local(transform.location)  # 当前局部纵横坐标
-        yaw0 = normalize_angle(yaw_to_rad(transform.rotation) - trajectory.start_yaw)  # 相对航向角
-        v0 = get_speed(ego_vehicle)  # 当前速度
+        if not getattr(trajectory, "is_route_relative", False):
+            raise ValueError("SamplingMPCTracker now only supports route-relative trajectories.")
 
-        # 候选转向角集合（共9个离散值）
-        steer_candidates = [
-            clamp(self.previous_steer + delta, -0.65, 0.65)
-            for delta in (-0.45, -0.32, -0.20, -0.10, 0.0, 0.10, 0.20, 0.32, 0.45)
-        ]
-        # 候选加速度集合（共5个离散值，单位 m/s²）
-        accel_candidates = (-4.0, -2.0, -1.0, 0.0, 1.0)
-
-        if getattr(trajectory, "is_route_relative", False):
-            return self._control_route_relative(ego_vehicle, trajectory, target_speed)
-
-        best_cost = float("inf")
-        best_action = (0.0, -3.0)  # 默认保守制动动作
-
-        for steer in steer_candidates:
-            """对于每个候选转向角，遍历所有候选加速度，进行前向积分预测，并计算代价函数，选取代价最小的动作"""
-            for accel in accel_candidates:
-                """初始化预测状态为当前状态"""
-                s = s0
-                d = d0
-                yaw = yaw0
-                speed = v0
-                cost = 0.0
-
-                # 沿预测时域逐步积分代价
-                for step in range(MPC_HORIZON_STEPS):
-                    speed = max(0.0, speed + accel * MPC_DT)
-                    s += speed * math.cos(yaw) * MPC_DT
-                    d += speed * math.sin(yaw) * MPC_DT
-                    yaw = normalize_angle(yaw + speed / WHEEL_BASE * math.tan(steer) * MPC_DT)
-
-                    ref_d = trajectory.lateral_at(s)          # 参考横向偏移
-                    ref_yaw = math.atan(trajectory.lateral_slope_at(s))  # 参考航向角
-                    lateral_error = d - ref_d                  # 横向跟踪误差
-                    yaw_error = normalize_angle(yaw - ref_yaw) # 航向误差
-                    speed_error = speed - target_speed         # 速度误差
-
-                    cost += 6.0 * lateral_error**2    # 横向误差惩罚
-                    cost += 1.7 * yaw_error**2        # 航向误差惩罚
-                    cost += 0.07 * speed_error**2     # 速度误差惩罚
-                    cost += 0.08 * steer**2           # 转向幅度惩罚
-                    cost += 0.01 * accel**2           # 加速度幅度惩罚
-                    cost += 0.02 * step * abs(steer - self.previous_steer)  # 转向连续性惩罚
-
-                if cost < best_cost:
-                    best_cost = cost
-                    best_action = (steer, accel)
-
-        steer, accel = best_action
-        self.previous_steer = steer  # 保存本帧转向量供下帧使用
-
-        # 将加速度映射为油门/制动量
-        if accel >= 0.0:
-            throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = clamp(-accel / 7.5, 0.0, 1.0)
-
-        return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
-
-    def _control_route_relative(self, ego_vehicle, trajectory, target_speed):
-        """针对基于全局路径的换道轨迹的控制计算，输入自车对象、换道轨迹和目标速度，输出carla.VehicleControl对象"""
         transform = ego_vehicle.get_transform()
         progress0, _ = trajectory.to_local(transform.location)
         x0 = transform.location.x
@@ -234,11 +352,11 @@ class SamplingMPCTracker:
                     dy = y - ref_location.y
                     position_error = math.sqrt(dx * dx + dy * dy)
                     yaw_error = normalize_angle(yaw - ref_yaw)
-                    speed_error = speed - target_speed
+                    speed_error = speed - target_speed # 计算位置误差、航向误差和速度误差，分别表示预测状态与轨迹参考状态之间的偏差
 
                     cost += 6.0 * position_error**2
                     cost += 1.7 * yaw_error**2
-                    cost += 0.07 * speed_error**2
+                    cost += 0.07 * speed_error**2 # 代价函数中包含位置误差、航向误差和速度误差的平方项，分别乘以权重系数，鼓励控制动作能够使车辆更好地跟踪轨迹，同时保持接近目标速度
                     cost += 0.08 * steer**2
                     cost += 0.01 * accel**2
                     cost += 0.02 * step * abs(steer - self.previous_steer)

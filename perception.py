@@ -2,7 +2,14 @@ from dataclasses import dataclass
 
 import carla
 
-from config import LANE_CLEAR_FRONT, LANE_CLEAR_REAR
+from config import (
+    LANE_CLEAR_FRONT,
+    LANE_CLEAR_REAR,
+    RIGHT_OBJECT_LATERAL_MAX,
+    RIGHT_OBJECT_LATERAL_MIN,
+    RIGHT_OBJECT_LONGITUDINAL_MAX,
+    RIGHT_OBJECT_LONGITUDINAL_MIN,
+)
 from utils import dot_2d, same_direction_lane, vector_length
 
 
@@ -18,6 +25,7 @@ class FrontVehicleReading:
     is_front_vehicle: bool  # 是否确认为正前方车辆
     actor_id: int = None
     actor_role: str = ""
+    target_speed_along: float = 0.0
 
 
 @dataclass
@@ -26,6 +34,10 @@ class RightSideObjectReading:
     distance: float
     ttc: float
     is_conflict_object: bool
+    actor_id: int = None
+    actor_role: str = ""
+    longitudinal: float = 0.0
+    lateral: float = 0.0
 
 
 class VirtualGroundTruthSensor:
@@ -41,6 +53,7 @@ class VirtualGroundTruthSensor:
         lead_vehicle,
         front_extra_vehicles=None,
         right_object_scenarios=None,
+        loop_route=None,
     ):
         self.world = world
         self.carla_map = carla_map
@@ -48,9 +61,16 @@ class VirtualGroundTruthSensor:
         self.lead = lead_vehicle
         self.front_extra_vehicles = front_extra_vehicles or []
         self.right_object_scenarios = right_object_scenarios or []
+        self.loop_route = loop_route
 
-    def front_vehicle(self):
+    def front_vehicle(self, use_route_reference=True):
         """计算同车道前方最近车辆的纵向距离、横向偏移、接近速度和TTC。"""
+        if use_route_reference and self.loop_route is not None:
+            return self._route_front_vehicle()
+        return self._ego_frame_front_vehicle()
+
+    def _ego_frame_front_vehicle(self):
+        """用自车当前直角坐标系读取前方车辆，作为无路线参考线时的兜底方案。"""
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
         forward = ego_tf.get_forward_vector()
@@ -74,16 +94,128 @@ class VirtualGroundTruthSensor:
             ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
             if longitudinal < closest.distance: # 如果该车辆比当前最近的车辆更近，则更新最近车辆的信息
                 closest = FrontVehicleReading(
-                    longitudinal,
-                    closing_speed,
-                    ttc,
-                    lateral,
-                    True,
-                    vehicle.id,
-                    vehicle.attributes.get("role_name", vehicle.type_id),
+                    distance=longitudinal,
+                    closing_speed=closing_speed,
+                    ttc=ttc,
+                    lateral_offset=lateral,
+                    is_front_vehicle=True,
+                    actor_id=vehicle.id,
+                    actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
+                    target_speed_along=target_speed_along,
                 )
 
         return closest # 返回最近的前方同车道车辆的感知信息，包括距离、接近速度、TTC、横向偏移和是否确认为正前方车辆（没有正前方的话就是初始值）
+
+    def _route_front_vehicle(self):
+        """将车辆位置投影到当前路线局部弧线，用弧长 s 和横向 d 判断弯道前车。"""
+        ego_loc = self.ego.get_location()
+        ego_projection = self._project_to_route(ego_loc, self.loop_route.last_index, search_back=6, search_ahead=18)
+        lane_width = self.carla_map.get_waypoint(ego_loc).lane_width
+        ego_speed_along = self._speed_along_route(self.ego, ego_projection)
+        closest = FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
+
+        search_ahead = int((LANE_CLEAR_FRONT + 20.0) / self.loop_route.step_distance) + 8
+        for vehicle in [self.lead] + self.front_extra_vehicles:
+            if vehicle is None or not vehicle.is_alive:
+                continue
+
+            target_projection = self._project_to_route(
+                vehicle.get_location(),
+                int(ego_projection["raw_index"]),
+                search_back=3,
+                search_ahead=search_ahead,
+            )
+            longitudinal = (target_projection["raw_index"] - ego_projection["raw_index"]) * self.loop_route.step_distance
+            lateral = target_projection["lateral"] - ego_projection["lateral"]
+            if longitudinal <= 0.0 or abs(lateral) >= lane_width * 0.45:
+                continue
+
+            target_speed_along = self._speed_along_route(vehicle, target_projection)
+            closing_speed = ego_speed_along - target_speed_along
+            ttc = longitudinal / closing_speed if closing_speed > 0.1 else float("inf")
+            if longitudinal < closest.distance:
+                closest = FrontVehicleReading(
+                    distance=longitudinal,
+                    closing_speed=closing_speed,
+                    ttc=ttc,
+                    lateral_offset=lateral,
+                    is_front_vehicle=True,
+                    actor_id=vehicle.id,
+                    actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
+                    target_speed_along=target_speed_along,
+                )
+
+        return closest
+
+    def _project_to_route(self, location, anchor_index, search_back=5, search_ahead=24):
+        """把位置投影到路线局部窗口，返回浮点路线索引和相对路线的横向偏移。"""
+        last_segment = max(0, len(self.loop_route.points) - 2)
+        start = max(0, int(anchor_index) - search_back)
+        end = min(last_segment, int(anchor_index) + search_ahead)
+        best = None
+        for index in range(start, end + 1):
+            p0 = self.loop_route.points[index]
+            p1 = self.loop_route.points[index + 1]
+            segment = p1 - p0
+            segment_len_sq = max(dot_2d(segment, segment), 0.001)
+            to_location = location - p0
+            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
+            projected = carla.Location(
+                x=p0.x + segment.x * blend,
+                y=p0.y + segment.y * blend,
+                z=p0.z + segment.z * blend,
+            )
+            error = projected.distance(location)
+            if best is None or error < best["error"]:
+                raw_index = index + blend
+                right = self._route_right_at(raw_index)
+                lateral = dot_2d(location - projected, right)
+                best = {
+                    "raw_index": raw_index,
+                    "location": projected,
+                    "right": right,
+                    "lateral": lateral,
+                    "error": error,
+                }
+        if best is not None:
+            return best
+
+        right = self._route_right_at(float(anchor_index))
+        return {
+            "raw_index": float(anchor_index),
+            "location": self.loop_route.points[int(anchor_index)],
+            "right": right,
+            "lateral": dot_2d(location - self.loop_route.points[int(anchor_index)], right),
+            "error": 0.0,
+        }
+
+    def _route_location_at_raw_index(self, raw_index):
+        lower = max(0, min(int(raw_index), len(self.loop_route.points) - 1))
+        upper = max(0, min(lower + 1, len(self.loop_route.points) - 1))
+        blend = max(0.0, min(raw_index - lower, 1.0))
+        p0 = self.loop_route.points[lower]
+        p1 = self.loop_route.points[upper]
+        return carla.Location(
+            x=p0.x + (p1.x - p0.x) * blend,
+            y=p0.y + (p1.y - p0.y) * blend,
+            z=p0.z + (p1.z - p0.z) * blend,
+        )
+
+    def _route_right_at(self, raw_index):
+        """由路线中心线前后差分得到平滑道路右向量。"""
+        look_index = 1.25
+        before = self._route_location_at_raw_index(raw_index - look_index)
+        after = self._route_location_at_raw_index(raw_index + look_index)
+        tangent = carla.Vector3D(x=after.x - before.x, y=after.y - before.y, z=0.0)
+        tangent_length = max(vector_length(tangent), 0.001)
+        tangent.x /= tangent_length
+        tangent.y /= tangent_length
+        return carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+
+    def _speed_along_route(self, vehicle, projection):
+        right = projection["right"]
+        tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
+        return dot_2d(vehicle.get_velocity(), tangent)
 
     def lane_clear(self, side):
         """检测指定侧邻道在前后安全范围内是否无车"""
@@ -164,12 +296,23 @@ class VirtualGroundTruthSensor:
         closing_speed = dot_2d(relative_speed, to_object)
         ttc = distance / closing_speed if closing_speed > 0.1 else float("inf")
 
-        in_geometry_gate = -8.0 <= longitudinal <= 34.0 and -14.0 <= lateral <= 18.0
+        in_geometry_gate = (
+            RIGHT_OBJECT_LONGITUDINAL_MIN <= longitudinal <= RIGHT_OBJECT_LONGITUDINAL_MAX
+            and RIGHT_OBJECT_LATERAL_MIN <= lateral <= RIGHT_OBJECT_LATERAL_MAX
+        )
         is_conflict = (
             scenario.is_active
             and scenario.is_conflict_window(route_index)
             and in_geometry_gate
         )
-        return RightSideObjectReading(distance, ttc, is_conflict)
+        return RightSideObjectReading(
+            distance,
+            ttc,
+            is_conflict,
+            scenario.actor.id,
+            scenario.name,
+            longitudinal,
+            lateral,
+        )
 
 
