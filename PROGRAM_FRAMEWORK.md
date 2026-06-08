@@ -1912,5 +1912,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile config.py perception.py guiji.py display.py`，语法检查通过；已运行完整 CARLA 实景仿真（32.4s），自车速度范围 3~8 m/s，顺利完成两次右侧行人 AVOID 让行，前车检测正常，路线终点停车正常，`Collisions: 0`。
 - 未覆盖风险：本次混合感知的身份匹配仅在雷达聚类输出端做后验过滤，尚未在跟踪器层面做时序一致性验证；侧向雷达和相机数据仅占位存储，未接入实际感知链路；AlphaBetaTracker 为占位实现，未输出稳定 track；语义分割相机回调中的 numpy 导入在 python 3.7 环境下未经长期稳定性验证；右转弯时行人避让仍存在盲区（已验证场景中仅避让自行车未避让行人导致碰撞，此问题未在本次修复范围内）。
 - 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：814c918
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
