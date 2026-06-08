@@ -539,10 +539,24 @@ RightSideObjectReading
 - 横向偏移。
 - 是否为本车道前方车辆。
 
-当前 `perception.py` 中前车感知分两种模式：
+当前 `guiji.py` 主流程统一调用 `sensor.front_vehicle(use_route_reference=True)`，但参考线会随状态变化：
 
-- 正常 `ROUTE_FOLLOW`、`EMERGENCY_BRAKE` 等路线跟踪/风险判断阶段，优先使用 `LoopRoute` 作为虚拟道路参考线传感器，把自车和目标投影到当前路线前方局部弧线上，得到沿路线弧长距离 $s$ 和横向偏移 $d$。
-- `AVOID` 避障过程中，切回自车当前直角坐标系作为兜底，避免自车已经横向绕开原车道目标后，路线弧线投影仍然把原车道急停目标当成同车道前车而持续制动。
+- `ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE` 使用 `LoopRoute` 原始路线弧线作为虚拟道路参考线传感器，把自车和目标投影到当前路线前方局部弧线上，得到沿路线弧长距离 $s$ 和横向偏移 $d$。
+- `AVOID` 使用当前避障轨迹加后续路线延伸得到的临时 `FrontReferencePath`。感知层把自车和目标投影到这条“正在计划/跟踪的联合轨迹”上，而不是只看原始路线或自车直线坐标系。
+
+这样，如果触发避障的旧目标已经被避障轨迹绕开，它相对联合轨迹的横向偏移会增大，不再反复触发同一碰撞走廊风险；如果避障轨迹前方又出现新的慢车/危险目标，仍会在联合轨迹坐标下被识别出来。
+
+当前前车判断使用的主动参考线可以写成：
+
+$$
+C_{\mathrm{active}}(s)=
+\begin{cases}
+C_{\mathrm{route}}(s), & \mathrm{state}\ne \mathrm{AVOID} \\
+C_{\mathrm{avoid}}(s), & \mathrm{state}= \mathrm{AVOID}
+\end{cases}
+$$
+
+其中 $C_{\mathrm{avoid}}(s)$ 来自 `RouteOffsetLaneChangeTrajectory.location_at(s)`，在换道长度之后横向偏移保持为目标车道偏移，因此它等价于“避障轨迹 + 目标车道上的后续路线延伸”。
 
 路线参考线模式可以理解为虚拟车道线/导航参考线传感器：目标位置和速度仍来自虚拟真值感知，但“前方”和“同车道”不再由自车当前直线 `forward/right` 一刀切判断，而是由前方道路局部弧线坐标判断。
 
@@ -630,7 +644,7 @@ $$
 
 这样在弯道上，即使两车几何连线与自车当前朝向不重合，只要目标沿道路局部弧线位于自车前方、横向偏移仍属于同一车道，就可以被提前识别为前方目标，避免等到距离很近才触发避障。
 
-如果没有传入 `LoopRoute`，或者处于 `AVOID` 状态，前车感知使用自车坐标系兜底。设：
+如果没有传入 `LoopRoute`、没有临时 `FrontReferencePath`，或者调用方显式设置 `use_route_reference=False`，前车感知才使用自车坐标系兜底。设：
 
 $$
 p_e = \text{ego location},\quad
@@ -1004,6 +1018,17 @@ $$
 \end{cases}
 $$
 
+此外，`RIGHT_OBJECT_YIELD` 不再在单帧 `right_object_risk == False` 时立即退出。当前代码使用 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s` 做连续清空确认：
+
+$$
+\mathrm{right\_clear\_confirmed}
+=
+\left(t_{\mathrm{sim}} - t_{\mathrm{right\_clear\_since}}\right)
+\ge 2.0
+$$
+
+在清空确认期间仍保持停车制动，避免右侧目标在行人/自行车之间切换、短暂漏检或返回 `none` 时自车过早起步。
+
 右侧目标读取现在会携带 `actor_id`、`actor_role`、相对纵向距离和相对横向距离。运行日志会输出右侧让行目标切换，便于判断“再次刹车”是重复进入状态，还是同一 `RIGHT_OBJECT_YIELD` 状态内由不同右侧目标接管。
 
 风险评估层应输出给行为决策层：
@@ -1052,10 +1077,10 @@ $$
 
 | 状态 | 进入条件 | 退出条件 |
 | --- | --- | --- |
-| `ROUTE_FOLLOW` | 初始状态；`AVOID` 完成后回到该状态；`RIGHT_OBJECT_YIELD` 风险解除后也回到该状态。 | 若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}\ne\mathrm{None}$，生成多条候选避障轨迹；若存在有效候选，进入 `AVOID`，否则进入 `EMERGENCY_BRAKE`；若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}=\mathrm{None}$，进入 `EMERGENCY_BRAKE`；若 $\mathrm{right\_object\_risk}$ 且 $\neg\mathrm{right\_object\_yield\_done}$，进入 `RIGHT_OBJECT_YIELD`；若已完成路线并记录 `route_completion_time`，进入 `ROUTE_HOLD`。 |
-| `AVOID` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立、相邻车道存在可用避障方向，并且 `select_best_route_offset_trajectory()` 返回有效候选；或 `EMERGENCY_BRAKE` 中风险仍存在、邻道重新可用且候选轨迹约束通过。 | 若换道进度满足 $s_{\mathrm{traj}} > L_{\mathrm{lanechange}} + 2.0$ 且 $|d_{\mathrm{traj}} - D| < 0.65$，回到 `ROUTE_FOLLOW`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
+| `ROUTE_FOLLOW` | 初始状态；`AVOID` 完成后回到该状态；`RIGHT_OBJECT_YIELD` 风险解除后也回到该状态。 | 若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}\ne\mathrm{None}$，生成多条候选避障轨迹；若存在有效候选，进入 `AVOID`，否则进入 `EMERGENCY_BRAKE`；若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}=\mathrm{None}$，进入 `EMERGENCY_BRAKE`；若 $\mathrm{right\_object\_risk}$ 成立，进入 `RIGHT_OBJECT_YIELD`，不再用“一次完成”标志阻止同一目标或同类目标再次触发；若已完成路线并记录 `route_completion_time`，进入 `ROUTE_HOLD`。 |
+| `AVOID` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立、相邻车道存在可用避障方向，并且 `select_best_route_offset_trajectory()` 返回有效候选；或 `EMERGENCY_BRAKE` 中风险仍存在、邻道重新可用且候选轨迹约束通过。 | 避障过程中先用当前避障轨迹加后续路线生成 `FrontReferencePath`，若联合轨迹前方再次满足 $\mathrm{emergency\_needed}$，且目标切换或同目标仍然紧急，并通过 `AVOID_REPLAN_COOLDOWN_SECONDS` 与最小进度限制，则重新生成候选轨迹；若无法重规划且距离/TTC 已很紧，转入 `EMERGENCY_BRAKE`；若换道进度满足 $s_{\mathrm{traj}} > L_{\mathrm{lanechange}} + 2.0$ 且 $|d_{\mathrm{traj}} - D| < 0.65$，回到 `ROUTE_FOLLOW`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
 | `EMERGENCY_BRAKE` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立，但左右邻道均不可用，或邻道存在但所有候选避障轨迹都不满足路径约束。 | 若 $\mathrm{emergency\_recovered}$ 成立，回到 `ROUTE_FOLLOW`；若 $\mathrm{emergency\_needed}$ 仍成立但 $\mathrm{avoidance\_side}\ne\mathrm{None}$，重新生成候选避障轨迹，存在有效候选时进入 `AVOID`；否则继续保持全制动。路线完成、碰撞、窗口关闭或仿真时间结束仍会提前终止主循环。 |
-| `RIGHT_OBJECT_YIELD` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{right\_object\_risk}$ 成立，并且 `right_object_yield_done == False`。 | 若 $\neg\mathrm{right\_object\_risk}$，回到 `ROUTE_FOLLOW`，并设置 `right_object_yield_done = True`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
+| `RIGHT_OBJECT_YIELD` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{right\_object\_risk}$ 成立。 | 若 $\neg\mathrm{right\_object\_risk}$ 连续保持 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s`，清除 `right_object_stop_active` 和当前目标记录后回到 `ROUTE_FOLLOW`；清空确认期间继续保持停车制动，避免目标短暂丢失后过早起步；后续若同一目标或新的右侧目标再次满足风险条件，可以重新进入 `RIGHT_OBJECT_YIELD`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
 | `ROUTE_HOLD` | `loop_route.update(ego_vehicle)` 判断完成一圈后，主循环记录 `route_completion_time`；下一轮控制计算中进入 `ROUTE_HOLD`。 | 保持停车控制，直到 $t_{\mathrm{sim}} - t_{\mathrm{route\_completion}} \ge \mathrm{ROUTE\_COMPLETION\_HOLD\_SECONDS}$ 后跳出主循环并清理。 |
 
 
@@ -2288,3 +2313,14 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`bb65888`。
 - PR/分支信息：已在本地 `feature/decision-control` 完成剪枝提交；尚未推送。
+
+### 2026-06-08 - 使用联合参考轨迹支持 AVOID 中再次避障判断
+
+- 本次目标：让前方风险判断跟随当前实际计划轨迹变化，避免旧目标被绕开后重复触发，同时在避障过程中仍能发现联合轨迹前方的新危险目标，并允许必要时重新规划。
+- 主要改动：`perception.py` 新增临时 `FrontReferencePath`，支持把车辆投影到“避障轨迹 + 后续路线延伸”的采样参考线上；`guiji.py` 在 `AVOID` 状态下每帧生成并设置联合参考轨迹，其他状态清空回原始 `LoopRoute`；新增 `AVOID_REPLAN_COOLDOWN_SECONDS`、`AVOID_REPLAN_MIN_PROGRESS` 和 `avoid_replan_needed()`，当联合轨迹上出现新目标或同目标仍然紧急时重规划，重规划失败且风险很近时切入 `EMERGENCY_BRAKE`；删除 `right_object_yield_done`，右侧目标风险解除后允许后续再次触发 `RIGHT_OBJECT_YIELD`；新增 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s` 连续清空确认，避免右侧目标短暂丢失时过早起步；同步更新本文档中的前车感知参考线、状态切换条件和待提交记录。
+- 为什么这样改：只用原始路线投影会让避障过程中的“正在跟踪轨迹”和“风险判断轨迹”不一致；只用自车直线坐标又容易在弯道上误判。联合参考轨迹把当前 MPC 正在跟踪的避障路径作为感知参考，旧目标横向脱离后自然不再触发，而避障路径前方的新目标仍会被检测到。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；第一次 `--free-run` 调试发现右侧让行在目标短暂变为 `none` 后过早退出，随后与 `right_side_pedestrian_2` 碰撞；加入连续清空确认后再次运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，第一次急停避障在 `5.85s` 触发并于 `12.35s` 完成，第二次弯道避障在 `16.05s` 触发并于 `23.75s` 完成，右侧让行在 `41.30s` 触发、`49.00s` 完成，路线终点 `ROUTE_HOLD` 停车保持完成，最终 `Collisions: 0`、`Cleanup finished`。
+- 未覆盖风险：当前 `FrontReferencePath` 使用采样线段和车辆中心点投影，尚未投影车辆四角占据区域；AVOID 中途重规划虽然有冷却和最小进度限制，但本次固定场景没有出现 `Avoidance replanned` 日志，仍需要后续用更密集交通流验证重规划分支；雷达模式默认关闭，尚未验证雷达开启时与临时参考轨迹的关系；pygame 画面观感仍建议人工确认。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`3c10c4a`。
+- PR/分支信息：本地待提交，尚未推送。

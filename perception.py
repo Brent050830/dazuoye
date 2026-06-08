@@ -72,6 +72,20 @@ class RightSideObjectReading:
     object_type: str = ""
 
 
+class FrontReferencePath:
+    """A temporary path used by front-vehicle perception during avoidance."""
+
+    def __init__(self, points):
+        self.points = list(points)
+        self.cumulative = [0.0]
+        for before, after in zip(self.points, self.points[1:]):
+            self.cumulative.append(self.cumulative[-1] + before.distance(after))
+
+    @property
+    def is_valid(self):
+        return len(self.points) >= 2 and self.cumulative[-1] > 0.1
+
+
 # ===================== 虚拟/雷达融合感知模块 =====================
 
 class VirtualGroundTruthSensor:
@@ -98,6 +112,7 @@ class VirtualGroundTruthSensor:
         self._right_confirm_frames = RIGHT_CONFIRM_FRAMES
         self._noise_rng = random.Random(20260606)
         self._radar_detections = []
+        self._front_reference_path = None
 
     def _empty_front(self):
         return FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
@@ -140,6 +155,15 @@ class VirtualGroundTruthSensor:
         """接收 CARLA radar callback 的原始点云。"""
         self._radar_detections = list(detections)
 
+    def set_front_reference_points(self, points):
+        """Set a temporary path for front-vehicle perception."""
+        path = FrontReferencePath(points)
+        self._front_reference_path = path if path.is_valid else None
+
+    def clear_front_reference_points(self):
+        """Return front-vehicle perception to the normal route reference."""
+        self._front_reference_path = None
+
     def front_vehicle(self, use_route_reference=True):
         """兼容旧接口：返回前方最近同车道车辆。"""
         readings = self.front_vehicles(use_route_reference=use_route_reference)
@@ -150,6 +174,8 @@ class VirtualGroundTruthSensor:
 
     def front_vehicles(self, use_route_reference=True):
         """返回前方候选车辆列表，默认仍保留当前弧线参考逻辑。"""
+        if use_route_reference and self._front_reference_path is not None:
+            return self._reference_path_front_vehicles()
         if RADAR_ENABLED and self._radar_detections:
             return self._radar_front_vehicles()
         if use_route_reference and self.loop_route is not None:
@@ -238,6 +264,53 @@ class VirtualGroundTruthSensor:
                 target_speed_along=target_speed_along,
             )
             readings.append(reading)
+
+        readings.sort(key=lambda reading: reading.distance)
+        return readings[:FRONT_TOP_K]
+
+    def _reference_path_front_vehicles(self):
+        """Project front targets to the active path: avoidance path plus route continuation."""
+        path = self._front_reference_path
+        ego_loc = self.ego.get_location()
+        ego_projection = self._project_to_reference_path(ego_loc, path)
+        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
+        ego_speed_along = self._speed_along_reference_path(self.ego, ego_projection)
+
+        readings = []
+        for vehicle in [self.lead] + self.front_extra_vehicles:
+            if vehicle is None or not vehicle.is_alive:
+                continue
+
+            target_projection = self._project_to_reference_path(
+                vehicle.get_location(),
+                path,
+                anchor_s=ego_projection["s"],
+                search_back=12.0,
+                search_ahead=LANE_CLEAR_FRONT + 35.0,
+            )
+            longitudinal = target_projection["s"] - ego_projection["s"]
+            lateral = target_projection["lateral"] - ego_projection["lateral"]
+            lane_relative = lateral / lane_width
+            if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
+                continue
+            if not self._check_front_fov(longitudinal, lateral):
+                continue
+            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
+                continue
+
+            target_speed_along = self._speed_along_reference_path(vehicle, target_projection)
+            readings.append(
+                self._make_front_reading(
+                    distance=longitudinal,
+                    closing_speed=ego_speed_along - target_speed_along,
+                    lateral=lateral,
+                    lane_relative=lane_relative,
+                    is_same_lane=abs(lateral) < lane_width * 0.45,
+                    actor_id=vehicle.id,
+                    actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
+                    target_speed_along=target_speed_along,
+                )
+            )
 
         readings.sort(key=lambda reading: reading.distance)
         return readings[:FRONT_TOP_K]
@@ -374,6 +447,57 @@ class VirtualGroundTruthSensor:
             "error": 0.0,
         }
 
+    def _project_to_reference_path(self, location, path, anchor_s=None, search_back=20.0, search_ahead=90.0):
+        """Project a location to a sampled temporary reference path."""
+        best = None
+        for index in range(len(path.points) - 1):
+            s0 = path.cumulative[index]
+            s1 = path.cumulative[index + 1]
+            if anchor_s is not None and (s1 < anchor_s - search_back or s0 > anchor_s + search_ahead):
+                continue
+
+            p0 = path.points[index]
+            p1 = path.points[index + 1]
+            segment = p1 - p0
+            segment_len_sq = max(dot_2d(segment, segment), 0.001)
+            to_location = location - p0
+            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
+            projected = carla.Location(
+                x=p0.x + segment.x * blend,
+                y=p0.y + segment.y * blend,
+                z=p0.z + segment.z * blend,
+            )
+            error = projected.distance(location)
+            if best is None or error < best["error"]:
+                segment_len = max(math.sqrt(segment_len_sq), 0.001)
+                tangent = carla.Vector3D(x=segment.x / segment_len, y=segment.y / segment_len, z=0.0)
+                right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+                best = {
+                    "s": s0 + (s1 - s0) * blend,
+                    "location": projected,
+                    "right": right,
+                    "lateral": dot_2d(location - projected, right),
+                    "error": error,
+                }
+
+        if best is not None:
+            return best
+
+        first = path.points[0]
+        second = path.points[1]
+        tangent = second - first
+        tangent_len = max(vector_length(tangent), 0.001)
+        tangent.x /= tangent_len
+        tangent.y /= tangent_len
+        right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+        return {
+            "s": 0.0,
+            "location": first,
+            "right": right,
+            "lateral": dot_2d(location - first, right),
+            "error": first.distance(location),
+        }
+
     def _route_location_at_raw_index(self, raw_index):
         lower = max(0, min(int(raw_index), len(self.loop_route.points) - 1))
         upper = max(0, min(lower + 1, len(self.loop_route.points) - 1))
@@ -398,6 +522,11 @@ class VirtualGroundTruthSensor:
         return carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
 
     def _speed_along_route(self, vehicle, projection):
+        right = projection["right"]
+        tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
+        return dot_2d(vehicle.get_velocity(), tangent)
+
+    def _speed_along_reference_path(self, vehicle, projection):
         right = projection["right"]
         tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
         return dot_2d(vehicle.get_velocity(), tangent)
