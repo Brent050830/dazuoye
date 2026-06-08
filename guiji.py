@@ -16,7 +16,7 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
 
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
     CLIENT_TIMEOUT,
-    DEBUG_DRAW_INTERVAL_FRAMES,
+    DEBUG_DRAW_INTERVAL_FRAMES, # 调试绘制的帧间隔，控制仿真中轨迹和目标点的绘制频率，避免过于密集导致画面混乱
     DEBUG_DRAW_LIFETIME,
     DEBUG_DRAW_LOOKAHEAD_DISTANCE,
     DEBUG_DRAW_TRAJECTORY,
@@ -29,6 +29,11 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     LEAD_TARGET_SPEED,
     MAP_NAME,
     PORT,
+    RADAR_ENABLED,
+    RADAR_FOV_HORIZONTAL_DEG,
+    RADAR_FOV_VERTICAL_DEG,
+    RADAR_POINTS_PER_SECOND,
+    RADAR_RANGE,
     RIGHT_OBJECT_DETECT_DISTANCE,
     RIGHT_OBJECT_STOP_RELEASE_DISTANCE,
     RIGHT_OBJECT_STOP_DISTANCE,
@@ -315,6 +320,25 @@ def main(args=None):
             right_object_scenarios=right_object_scenarios,
             loop_route=loop_route,
         )
+        if RADAR_ENABLED:
+            radar_bp = world.get_blueprint_library().find("sensor.other.radar")
+            radar_bp.set_attribute("horizontal_fov", str(RADAR_FOV_HORIZONTAL_DEG))
+            radar_bp.set_attribute("vertical_fov", str(RADAR_FOV_VERTICAL_DEG))
+            radar_bp.set_attribute("range", str(RADAR_RANGE))
+            radar_bp.set_attribute("points_per_second", str(RADAR_POINTS_PER_SECOND))
+            radar_tf = carla.Transform(carla.Location(x=2.2, z=1.0), carla.Rotation(pitch=0.0))
+            front_radar = world.spawn_actor(radar_bp, radar_tf, attach_to=ego_vehicle)
+            actor_list.append(front_radar)
+
+            def radar_callback(data):
+                sensor.set_radar_detections(data)
+
+            front_radar.listen(radar_callback)
+            print(
+                "Front radar sensor mounted: range={:.0f}m, horizontal_fov={:.0f}deg.".format(
+                    RADAR_RANGE, RADAR_FOV_HORIZONTAL_DEG
+                )
+            )
 
         state = "ROUTE_FOLLOW" # 定义初始状态为路线跟踪，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
         trajectory = None # 定义当前避障换道轨迹，初始为 None，在需要避障时生成具体的换道轨迹供 MPC 跟踪使用
@@ -416,6 +440,8 @@ def main(args=None):
             right_object_risk = ( # 定义右侧物体是否构成风险的条件，基于右侧过街物体的感知信息进行判断，如果右侧物体确认为冲突对象，并且 TTC 小于右侧物体风险阈值或者距离小于右侧物体检测距离，则认为构成风险
                 right_object.is_conflict_object
                 and (
+                    right_object.risk_level >= 2
+                    or
                     right_object.ttc < RIGHT_OBJECT_TTC_THRESHOLD
                     or right_object.distance < RIGHT_OBJECT_DETECT_DISTANCE
                 )
