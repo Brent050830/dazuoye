@@ -2276,5 +2276,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check --cached`，无空白错误；已尝试运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，但 CARLA 服务端在 `localhost:2000` 等待 `120000ms` 后超时，未完成实景回归。
 - 未覆盖风险：当前尚未完成完整 CARLA 场景回归；雷达模式默认关闭，尚未验证 `RADAR_ENABLED = True` 时的点云聚类效果；噪声/FOV/漏检可能改变触发时机，必要时可临时关闭 `SENSOR_NOISE_ENABLED` 进行对照；需要在 CARLA 服务端已启动且地图可加载时再次运行 `--free-run`。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`、`dazuoye/.gitignore`。
-- 提交代号/Commit ID：待提交。
-- PR/分支信息：本地合并处理中，尚未推送。
+- 提交代号/Commit ID：`2de989b`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成合并提交；尚未推送。
