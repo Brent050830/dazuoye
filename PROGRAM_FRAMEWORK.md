@@ -2322,5 +2322,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；第一次 `--free-run` 调试发现右侧让行在目标短暂变为 `none` 后过早退出，随后与 `right_side_pedestrian_2` 碰撞；加入连续清空确认后再次运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，第一次急停避障在 `5.85s` 触发并于 `12.35s` 完成，第二次弯道避障在 `16.05s` 触发并于 `23.75s` 完成，右侧让行在 `41.30s` 触发、`49.00s` 完成，路线终点 `ROUTE_HOLD` 停车保持完成，最终 `Collisions: 0`、`Cleanup finished`。
 - 未覆盖风险：当前 `FrontReferencePath` 使用采样线段和车辆中心点投影，尚未投影车辆四角占据区域；AVOID 中途重规划虽然有冷却和最小进度限制，但本次固定场景没有出现 `Avoidance replanned` 日志，仍需要后续用更密集交通流验证重规划分支；雷达模式默认关闭，尚未验证雷达开启时与临时参考轨迹的关系；pygame 画面观感仍建议人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
+- 提交代号/Commit ID：`3c10c4a`。
 - PR/分支信息：本地待提交，尚未推送。
