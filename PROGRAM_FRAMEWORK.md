@@ -2286,5 +2286,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：本次为未接入接口删除，尚未重新完成 CARLA 实景回归；如果后续确实要把状态机改成统一风险评估，需要重新设计并接入该接口，而不是沿用这次删除的未验证包装。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
-- PR/分支信息：本地待提交，尚未推送。
+- 提交代号/Commit ID：`bb65888`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成剪枝提交；尚未推送。
