@@ -72,21 +72,6 @@ class RightSideObjectReading:
     object_type: str = ""
 
 
-@dataclass
-class RiskAssessment:
-    """统一风险评估结果，供后续逐步收敛状态机使用。"""
-
-    primary_risk_type: str = "none"
-    primary_risk_level: int = 0
-    front_brake_needed: bool = False
-    front_emergency_needed: bool = False
-    front_emergency_recovered: bool = True
-    right_object_yield_needed: bool = False
-    right_object_stop_needed: bool = False
-    front_reading: FrontVehicleReading = None
-    right_reading: RightSideObjectReading = None
-
-
 # ===================== 虚拟/雷达融合感知模块 =====================
 
 class VirtualGroundTruthSensor:
@@ -550,56 +535,4 @@ class VirtualGroundTruthSensor:
             is_moving_toward_conflict=is_moving_toward,
             predicted_ttc=predicted_ttc,
             object_type=object_type,
-        )
-
-    def assess_risk(self, route_index, use_route_reference=True):
-        """统一风险评估接口，当前主循环仍可继续使用旧的显式状态条件。"""
-        front = self.front_vehicle(use_route_reference=use_route_reference)
-        right = self.right_side_object(route_index)
-        close_slow_front_vehicle = (
-            front.is_front_vehicle
-            and front.distance < 34.0
-            and front.closing_speed > 2.0
-        )
-        brake_needed = front.is_front_vehicle and front.ttc < TTC_BRAKE_THRESHOLD
-        emergency_needed = (
-            front.is_front_vehicle
-            and front.distance < SAFE_DISTANCE
-            and (front.ttc < TTC_AVOID_THRESHOLD or close_slow_front_vehicle)
-        )
-        emergency_recovered = (
-            not front.is_front_vehicle
-            or front.distance > SAFE_DISTANCE + 8.0
-            or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
-        )
-        right_yield_needed = (
-            right.is_conflict_object
-            and (
-                right.risk_level >= 2
-                or right.ttc < RIGHT_OBJECT_TTC_THRESHOLD
-                or right.distance < RIGHT_OBJECT_DETECT_DISTANCE
-            )
-        )
-        right_stop_needed = right.is_conflict_object and right.distance < RIGHT_OBJECT_STOP_DISTANCE
-        primary_type = "none"
-        primary_level = 0
-        if emergency_needed:
-            primary_type = "front"
-            primary_level = 3
-        elif right_yield_needed:
-            primary_type = "right_object"
-            primary_level = max(2, right.risk_level)
-        elif brake_needed:
-            primary_type = "front"
-            primary_level = 2
-        return RiskAssessment(
-            primary_risk_type=primary_type,
-            primary_risk_level=primary_level,
-            front_brake_needed=brake_needed,
-            front_emergency_needed=emergency_needed,
-            front_emergency_recovered=emergency_recovered,
-            right_object_yield_needed=right_yield_needed,
-            right_object_stop_needed=right_stop_needed,
-            front_reading=front,
-            right_reading=right,
         )

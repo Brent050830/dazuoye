@@ -511,7 +511,6 @@ vehicle.gazelle.omafiets
 VirtualGroundTruthSensor
 FrontVehicleReading
 RightSideObjectReading
-RiskAssessment
 ```
 
 当前虚拟感知已输出两类目标：
@@ -708,7 +707,7 @@ $$
 = \arg\min_{o \in \mathcal{O}_{\mathrm{front}}} s_o
 $$
 
-当前 `FrontVehicleReading` 已保留 `actor_id`、`actor_role`、`target_speed_along`、`lane_relative_lateral`、`is_same_lane` 和 `risk_level`。其中 `target_speed_along` 已用于慢车预测，`risk_level` 和多目标列表 `front_vehicles()` 作为后续统一风险评估入口保留；当前主状态机仍主要使用最近同车道前车的路线弧长距离、横向偏移、接近速度和 TTC。
+当前 `FrontVehicleReading` 已保留 `actor_id`、`actor_role`、`target_speed_along`、`lane_relative_lateral`、`is_same_lane` 和 `risk_level`。其中 `target_speed_along` 已用于慢车预测，`front_vehicles()` 保留为雷达/多目标候选读取入口；当前主状态机仍主要使用最近同车道前车的路线弧长距离、横向偏移、接近速度和 TTC。
 
 ### 8.2 右侧非机动车感知
 
@@ -2271,10 +2270,21 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 ### 2026-06-08 - 合并感知增强分支到决策控制分支
 
 - 本次目标：把 `origin/feature/perception-risk` 中的感知增强内容合并到当前决策控制分支，同时保留已经验证过的路线弧线前车识别、多候选避障、慢车位移预测和右转让行控制逻辑。
-- 主要改动：`perception.py` 重整为融合版，保留 `front_vehicle(use_route_reference=...)` 和 `target_speed_along`，新增 `front_vehicles()`、`RiskAssessment`、固定随机种子的距离/速度噪声、前向/侧向 FOV、远距离漏检、CARLA radar 点云输入和简单聚类；`RightSideObjectReading` 增加 `risk_level`、`predicted_ttc`、`object_type` 和连续帧确认；`guiji.py` 在配置开启时挂载前向雷达，并让右侧目标 `risk_level >= 2` 也能触发让行；`config.py` 新增感知增强和雷达配置，默认 `RADAR_ENABLED = False` 以保持主演示稳定；`.gitignore` 增加 `__pycache__/` 与 `*.pyc`，并从合并结果中移除远端误提交的 `.pyc` 文件。
+- 主要改动：`perception.py` 重整为融合版，保留 `front_vehicle(use_route_reference=...)` 和 `target_speed_along`，新增 `front_vehicles()`、固定随机种子的距离/速度噪声、前向/侧向 FOV、远距离漏检、CARLA radar 点云输入和简单聚类；`RightSideObjectReading` 增加 `risk_level`、`predicted_ttc`、`object_type` 和连续帧确认；`guiji.py` 在配置开启时挂载前向雷达，并让右侧目标 `risk_level >= 2` 也能触发让行；`config.py` 新增感知增强和雷达配置，默认 `RADAR_ENABLED = False` 以保持主演示稳定；`.gitignore` 增加 `__pycache__/` 与 `*.pyc`，并从合并结果中移除远端误提交的 `.pyc` 文件。
 - 为什么这样改：感知分支提供了更接近传感器输出的噪声、视场、漏检和雷达点云能力，但直接覆盖当前分支会丢失弯道避障和慢车预测逻辑。因此本次采用“当前控制分支为主、感知增强移植进来”的方式合并。
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check --cached`，无空白错误；已尝试运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，但 CARLA 服务端在 `localhost:2000` 等待 `120000ms` 后超时，未完成实景回归。
 - 未覆盖风险：当前尚未完成完整 CARLA 场景回归；雷达模式默认关闭，尚未验证 `RADAR_ENABLED = True` 时的点云聚类效果；噪声/FOV/漏检可能改变触发时机，必要时可临时关闭 `SENSOR_NOISE_ENABLED` 进行对照；需要在 CARLA 服务端已启动且地图可加载时再次运行 `--free-run`。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`、`dazuoye/.gitignore`。
 - 提交代号/Commit ID：`2de989b`。
 - PR/分支信息：已在本地 `feature/decision-control` 完成合并提交；尚未推送。
+
+### 2026-06-08 - 精简感知合并后的未接入接口
+
+- 本次目标：在合并感知增强分支后进行剪枝收敛，减少当前主流程没有使用的临时接口和配置。
+- 主要改动：删除未接入主循环的 `RiskAssessment` 数据结构和 `VirtualGroundTruthSensor.assess_risk()` 包装函数；删除未使用的 `RIGHT_PREDICTION_SECONDS` 配置；同步收敛维护文档中关于统一风险评估入口的描述。
+- 为什么这样改：当前 `guiji.py` 状态机仍显式读取 `front_vehicle()` 和 `right_side_object()`，统一风险评估包装没有被调用，保留会增加维护者判断成本。先删掉未接入接口，可以让感知层聚焦在已经使用的噪声/FOV/雷达候选和右侧风险等级输出。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：本次为未接入接口删除，尚未重新完成 CARLA 实景回归；如果后续确实要把状态机改成统一风险评估，需要重新设计并接入该接口，而不是沿用这次删除的未验证包装。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地待提交，尚未推送。
