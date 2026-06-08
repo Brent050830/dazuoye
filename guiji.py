@@ -13,6 +13,7 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
     spawn_slow_right_lane_vehicle, # 生成右侧慢速车辆，增加右侧物体避让的复杂性
 )
 
+import config
 from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
     CLIENT_TIMEOUT,
     EGO_TARGET_SPEED,
@@ -188,6 +189,15 @@ def main():
             right_object_scenarios=right_object_scenarios,
         )
 
+                # === 阶段五：Alpha-Beta 跟踪器初始化 ===
+        try:
+            from perception import AlphaBetaTracker
+            tracker = AlphaBetaTracker() if getattr(config, 'TRACKER_ENABLED', True) else None
+        except ImportError:
+            tracker = None
+            print("AlphaBetaTracker not implemented yet, skipping tracker.")
+        _prev_ego_location = ego_vehicle.get_location()
+
                 # === CARLA 前向毫米波雷达挂载（阶段二） ===
         front_radar = None
         if RADAR_ENABLED:
@@ -211,6 +221,84 @@ def main():
             front_radar.listen(radar_callback)
             print("Front radar sensor mounted: range={:.0f}m, fov={:.0f}deg".format(
                 RADAR_RANGE, RADAR_FOV_HORIZONTAL_DEG))
+
+        # === 右侧毫米波雷达挂载（阶段四） ===
+        side_radar = None
+        if getattr(config, 'SIDE_RADAR_ENABLED', True):
+            side_radar_bp = world.get_blueprint_library().find("sensor.other.radar")
+            side_radar_bp.set_attribute("horizontal_fov",
+                str(getattr(config, 'SIDE_RADAR_FOV_HORIZONTAL_DEG', 150.0)))
+            side_radar_bp.set_attribute("vertical_fov", "15.0")
+            side_radar_bp.set_attribute("range",
+                str(getattr(config, 'SIDE_RADAR_RANGE', 30.0)))
+            side_radar_bp.set_attribute("points_per_second",
+                str(getattr(config, 'SIDE_RADAR_POINTS_PER_SECOND', 800)))
+            side_radar_tf = carla.Transform(
+                carla.Location(
+                    x=getattr(config, 'SIDE_RADAR_MOUNT_X', 0.0),
+                    y=getattr(config, 'SIDE_RADAR_MOUNT_Y', 1.0),
+                    z=getattr(config, 'SIDE_RADAR_MOUNT_Z', 0.5)),
+                carla.Rotation(yaw=90.0),
+            )
+            side_radar = world.spawn_actor(side_radar_bp, side_radar_tf, attach_to=ego_vehicle)
+            actor_list.append(side_radar)
+
+            def side_radar_callback(data):
+                """右侧雷达原始点云回调，每帧将检测点写入 sensor。"""
+                sensor._side_radar_detections = data  # placeholder
+
+            side_radar.listen(side_radar_callback)
+            print("Side radar sensor mounted: range={:.0f}m, fov={:.0f}deg".format(
+                getattr(config, 'SIDE_RADAR_RANGE', 30.0),
+                getattr(config, 'SIDE_RADAR_FOV_HORIZONTAL_DEG', 150.0)))
+
+        # === 前向 RGB + 语义分割相机挂载（阶段三） ===
+        if getattr(config, 'CAMERA_ENABLED', True):
+            cam_x = getattr(config, 'CAMERA_FRONT_X', 1.5)
+            cam_z = getattr(config, 'CAMERA_FRONT_Z', 1.4)
+            camera_tf = carla.Transform(carla.Location(x=cam_x, z=cam_z))
+
+            rgb_bp = world.get_blueprint_library().find("sensor.camera.rgb")
+            rgb_bp.set_attribute("image_size_x",
+                str(getattr(config, 'CAMERA_RGB_WIDTH', 800)))
+            rgb_bp.set_attribute("image_size_y",
+                str(getattr(config, 'CAMERA_RGB_HEIGHT', 600)))
+            rgb_bp.set_attribute("fov",
+                str(getattr(config, 'CAMERA_RGB_FOV', 90.0)))
+            rgb_camera = world.spawn_actor(rgb_bp, camera_tf, attach_to=ego_vehicle)
+            actor_list.append(rgb_camera)
+            rgb_camera.listen(lambda image: None)  # 暂不处理 RGB 图像
+            print("RGB camera mounted: {}x{}".format(
+                getattr(config, 'CAMERA_RGB_WIDTH', 800),
+                getattr(config, 'CAMERA_RGB_HEIGHT', 600)))
+
+            sem_bp = world.get_blueprint_library().find("sensor.camera.semantic_segmentation")
+            sem_bp.set_attribute("image_size_x",
+                str(getattr(config, 'CAMERA_SEMANTIC_WIDTH', 800)))
+            sem_bp.set_attribute("image_size_y",
+                str(getattr(config, 'CAMERA_SEMANTIC_HEIGHT', 600)))
+            sem_bp.set_attribute("fov",
+                str(getattr(config, 'CAMERA_SEMANTIC_FOV', 90.0)))
+            sem_camera = world.spawn_actor(sem_bp, camera_tf, attach_to=ego_vehicle)
+            actor_list.append(sem_camera)
+
+            # 语义分割相机回调：将分类结果写入 sensor
+            def sem_camera_callback(image):
+                """语义分割相机回调：提取语义标签并传给 sensor。"""
+                try:
+                    import numpy as np
+                    image.convert(carla.ColorConverter.CityScapesPalette)
+                    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+                    array = np.reshape(array, (image.height, image.width, 4))
+                    semantic_labels = array[:, :, 2].astype(int)
+                    sensor.set_camera_classifications(semantic_labels)
+                except Exception:
+                    pass  # 忽略相机回调异常
+
+            sem_camera.listen(sem_camera_callback)
+            print("Semantic segmentation camera mounted: {}x{}".format(
+                getattr(config, 'CAMERA_SEMANTIC_WIDTH', 800),
+                getattr(config, 'CAMERA_SEMANTIC_HEIGHT', 600)))
         # ======================================
 
         state = "ROUTE_FOLLOW" # 定义初始状态为路线跟踪，后续根据感知信息和事件进行状态转换，包括避障换道、紧急制动、右侧物体避让等
@@ -279,6 +367,35 @@ def main():
 
             for right_object in right_object_scenarios: # 更新右侧过街物体的状态，调用每个右侧过街物体场景的 update 方法，传入当前路线索引和固定步长，执行预设的过街行为
                 right_object.update(loop_route.last_index, FIXED_DELTA_SECONDS)
+
+            # === 阶段五：跟踪器预测与更新 ===
+            if 'tracker' in dir() and tracker is not None:
+                ego_loc_now = ego_vehicle.get_location()
+                ego_dx_local = ego_loc_now.x - _prev_ego_location.x
+                ego_dy_local = ego_loc_now.y - _prev_ego_location.y
+                _prev_ego_location = ego_loc_now
+
+                tracker.predict(ego_dx_local, ego_dy_local)
+
+                # 收集场景中真实Actor作为检测输入
+                detections = []
+                for actor in actor_list:
+                    if actor is None or not actor.is_alive:
+                        continue
+                    if actor.id == ego_vehicle.id:
+                        continue
+                    if actor.type_id.startswith('vehicle.') or actor.type_id.startswith('walker.'):
+                        loc = actor.get_location()
+                        vel = actor.get_velocity()
+                        detections.append({
+                            'x': loc.x,
+                            'y': loc.y,
+                            'vx': vel.x,
+                            'vy': vel.y,
+                            'actor_id': actor.id,
+                            'type': actor.type_id,
+                        })
+                tracker.update(detections)
 
             risk = sensor.assess_risk(loop_route.last_index) # 统一风险评估：调用传感器的 assess_risk 方法综合前车和右侧目标信息，返回 RiskAssessment 结构供决策使用
             front = risk.front_reading # 获取评估结果中的前车感知信息
@@ -465,16 +582,19 @@ def main():
             lap_completed = loop_route.update(ego_vehicle) # 更新固定路线状态，基于自车当前的位置更新路线的进度和索引信息，并判断是否完成一圈
             if camera_display is not None:
                 """渲染仿真画面和信息，调用显示实例的 render 方法，传入当前仿真时间、状态、前车和右侧物体的感知信息、自车和前车的速度、控制命令、碰撞次数、路线进度等信息，在显示窗口中进行实时渲染，供观察和分析使用"""
-                camera_display.render({
-                    "sim_time": sim_time,
+                camera_display.render({"sim_time": sim_time,
                     "state": state,
                     "scenario": "front_brake_and_right_object",
                     "ego_speed": ego_speed,
                     "lead_speed": get_speed(lead_vehicle),
                     "front_distance": front.distance,
                     "front_ttc": front.ttc,
+                    "front_actor_role": front.actor_role,
+                    "front_risk_level": front.risk_level,
                     "right_object_distance": right_object.distance,
                     "right_object_ttc": right_object.ttc,
+                    "right_object_type": right_object.object_type,
+                    "right_risk_level": right_object.risk_level,
                     "steer": ego_control.steer,
                     "throttle": ego_control.throttle,
                     "brake": ego_control.brake,

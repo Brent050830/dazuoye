@@ -128,13 +128,24 @@ class DemoHUD:
         lead_speed = telemetry.get("lead_speed")
         front_distance = telemetry.get("front_distance")
         front_ttc = telemetry.get("front_ttc")
+        front_actor_role = telemetry.get("front_actor_role", "--")
+        front_risk_level = telemetry.get("front_risk_level", 0)
         right_distance = telemetry.get("right_object_distance")
         right_ttc = telemetry.get("right_object_ttc")
+        right_object_type = telemetry.get("right_object_type", "--")
+        right_risk_level = telemetry.get("right_risk_level", 0)
         steer = telemetry.get("steer")
         throttle = telemetry.get("throttle")
         brake = telemetry.get("brake")
         collision_count = telemetry.get("collision_count", 0)
         lap_distance = telemetry.get("lap_distance")
+
+        risk_labels = {0: "安全", 1: "注意", 2: "警告", 3: "危险"}
+        risk_colors = {0: (0, 180, 0), 1: (200, 200, 0), 2: (255, 140, 0), 3: (255, 50, 50)}
+        front_role_short = front_actor_role if len(front_actor_role) <= 24 else front_actor_role[:21] + "..."
+        right_type_short = right_object_type if right_object_type else "--"
+        front_risk_color = risk_colors.get(front_risk_level, (200, 200, 200))
+        right_risk_color = risk_colors.get(right_risk_level, (200, 200, 200))
 
         lines = [
             "t={}s  state={}  scenario={}  collisions={}".format(
@@ -152,7 +163,13 @@ class DemoHUD:
                 self._format_number(throttle, 2),
                 self._format_number(brake, 2),
             ),
-            "right_object_dist={}m  right_object_TTC={}s".format(
+            "FRONT: {} | dist={}m  TTC={}s".format(
+                front_role_short,
+                self._format_number(front_distance, 1),
+                self._format_number(front_ttc, 2),
+            ),
+            "RIGHT: {} | dist={}m  TTC={}s".format(
+                right_type_short,
                 self._format_number(right_distance, 1),
                 self._format_number(right_ttc, 2),
             ),
@@ -162,7 +179,7 @@ class DemoHUD:
             ),
         ]
 
-        panel_height = 104
+        panel_height = 128
         background = pygame.Surface((self.width, panel_height))
         background.set_alpha(165)
         background.fill((0, 0, 0))
@@ -171,6 +188,17 @@ class DemoHUD:
         for index, line in enumerate(lines):
             text_surface = self.font.render(line, True, (255, 255, 255))
             display.blit(text_surface, (12, 8 + index * 24))
+
+        # 用彩色文字叠加风险等级（覆盖在 FRONT/RIGHT 行末尾）
+        risk_overlays = [
+            (2, risk_labels.get(front_risk_level, "?"), front_risk_color),
+            (3, risk_labels.get(right_risk_level, "?"), right_risk_color),
+        ]
+        for line_idx, label, color in risk_overlays:
+            risk_text = self.font.render(label, True, color)
+            x_pos = self.width - 72
+            y_pos = 8 + line_idx * 24
+            display.blit(risk_text, (x_pos, y_pos))
 
 
 class PygameDemoDisplay:

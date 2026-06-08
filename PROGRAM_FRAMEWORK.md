@@ -253,8 +253,14 @@ MISS_DETECTION_PROB = 0.05            # 漏检概率 (0~1)
 RADAR_ENABLED = True                  # 是否启用 CARLA 前向毫米波雷达
 RADAR_RANGE = 80.0                    # 雷达最大检测距离 (米)
 RADAR_FOV_HORIZONTAL_DEG = 60.0       # 雷达水平 FOV (度)
+RADAR_FOV_VERTICAL_DEG = 15.0         # 雷达垂直 FOV (度)
 RADAR_CLUSTER_RADIUS = 1.8            # 点云聚类半径 (米)
 RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数
+RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内雷达检测（过滤地面杂波/自车反射）
+
+# 混合感知参数
+HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角身份匹配；False: 纯雷达模式
+HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配的最大欧氏距离 (米)
 ```
 
 后续加入场景开关时，可以再增加：
@@ -760,7 +766,31 @@ $$
 
 **雷达 vs 虚拟真值切换：**
 
-`front_vehicles()` 在 `RADAR_ENABLED=True` 且 `_radar_detections` 非空时优先调用 `_process_radar_detections()`；否则回退到虚拟真值 + 阶段一噪声模拟。输出格式 (`FrontVehicleReading`) 不变，`guiji.py` 行为决策层无需任何改动。
+`front_vehicles()` 在 `RADAR_ENABLED=True` 且 `_radar_detections` 非空时优先调用 `_process_radar_detections()`；若雷达聚类结果为空（前车超出稳定聚类范围或杂波被全部过滤），则自动回退到虚拟真值 + 阶段一噪声模拟。输出格式 (`FrontVehicleReading`) 不变，`guiji.py` 行为决策层无需任何改动。
+
+**混合感知模式（身份匹配与杂波过滤）：**
+
+当 `HYBRID_PERCEPTION_MODE=True` 时，`_process_radar_detections()` 在聚类完成后额外执行：
+1. 收集场景中所有上帝视角 vehicle 在前方 FOV 内的真实位置；
+2. 将每个雷达聚类中心与最近的上帝视角 Actor 做欧氏距离匹配（阈值 `HYBRID_MATCH_RADIUS=3.0m`）；
+3. 匹配成功的聚类用上帝视角 Actor 的 `id` 和 `role_name` 填充 `actor_id`/`actor_role`；
+4. **匹配失败的聚类视为地面杂波/自车反射，直接丢弃**，避免幽灵目标触发虚假避障。
+
+**雷达最小距离过滤：**
+
+聚类循环中，`avg_long < RADAR_MIN_DISTANCE` 的聚类被直接跳过，过滤掉自车前方 7m 内的地面杂波和自车反射。
+
+**侧向雷达挂载与回调（阶段四占位）：**
+
+`guiji.py` 在自车右侧挂载第二个 CARLA `sensor.other.radar`（水平 FOV=150°，范围 30m，yaw=90°），`VirtualGroundTruthSensor` 通过 `set_side_radar_detections()` 接收原始点云。当前该数据仅存储为占位符，尚未接入右侧目标感知链路。
+
+**前向 RGB + 语义分割相机挂载（阶段三）：**
+
+`guiji.py` 在自车前方挂载一个 RGB 相机和一个语义分割相机，语义分割相机通过 `set_camera_classifications()` 将 CityScapes 语义标签传给 sensor。当前相机数据仅存储，尚未接入视觉感知链路。
+
+**Alpha-Beta 跟踪器（阶段五占位）：**
+
+`guiji.py` 中初始化 `AlphaBetaTracker`（当 `TRACKER_ENABLED=True`），每帧收集所有动态 Actor 作为检测输入，调用 `tracker.predict()` 和 `tracker.update()`。当前跟踪器为占位实现，尚未输出稳定 track 供决策层使用。
 
 ## 9. 风险评估层
 
@@ -1873,3 +1903,14 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：dazuoye/config.py、dazuoye/perception.py、dazuoye/guiji.py、dazuoye/PROGRAM_FRAMEWORK.md。
 - 提交代号/Commit ID：1daf647
 - PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+
+### 2026-06-08 - 混合感知身份匹配、雷达杂波过滤与感知链路增强
+
+- 本次目标：解决 CARLA 毫米波雷达在 ~4.8m 处检测到地面杂波/自车反射导致虚假 AVOID 触发的问题；实现混合感知模式（雷达测距 + 上帝视角身份匹配）过滤幽灵目标；修复雷达结果为空时不回退虚拟真值导致的"盲开"；挂载侧向雷达和相机传感器硬件占位。
+- 主要改动：config.py 新增 `RADAR_MIN_DISTANCE=7.0`、`RADAR_FOV_VERTICAL_DEG=15.0`、`HYBRID_PERCEPTION_MODE=True`、`HYBRID_MATCH_RADIUS=3.0`；perception.py 新增 `set_side_radar_detections()` 占位方法、`set_camera_classifications()` 占位方法；`_process_radar_detections()` 中添加上帝视角身份匹配循环：匹配成功的聚类注入 `actor_id/actor_role`，匹配失败的聚类直接丢弃（杂波过滤）；聚类循环中添加 `RADAR_MIN_DISTANCE` 最小距离过滤；`front_vehicles()` 雷达模式添加空结果回退到虚拟真值的逻辑；guiji.py 挂载右侧毫米波雷达（150° FOV，30m 范围）、前向 RGB 相机和语义分割相机；初始化 AlphaBetaTracker 占位；新增 `right_object_type`、`right_risk_level`、`front_actor_role`、`front_risk_level` 到 telemetry；display.py 将 Front/Right 感知信息拆分为独立显示行，叠加彩色风险等级标签。
+- 为什么这样改：雷达原始点云在近场产生大量自车/地面反射点，聚类后形成幽灵目标，导致决策层频繁进入 AVOID 且速度降至 ~0.5 m/s。混合感知模式利用上帝视角做"身份认证"，确保只有真实车辆产生感知输出。雷达空结果回退保证前车超出 80m 或聚类失败时自车仍能基于虚拟真值正常行驶。
+- 如何验证：已运行 `python -m py_compile config.py perception.py guiji.py display.py`，语法检查通过；已运行完整 CARLA 实景仿真（32.4s），自车速度范围 3~8 m/s，顺利完成两次右侧行人 AVOID 让行，前车检测正常，路线终点停车正常，`Collisions: 0`。
+- 未覆盖风险：本次混合感知的身份匹配仅在雷达聚类输出端做后验过滤，尚未在跟踪器层面做时序一致性验证；侧向雷达和相机数据仅占位存储，未接入实际感知链路；AlphaBetaTracker 为占位实现，未输出稳定 track；语义分割相机回调中的 numpy 导入在 python 3.7 环境下未经长期稳定性验证；右转弯时行人避让仍存在盲区（已验证场景中仅避让自行车未避让行人导致碰撞，此问题未在本次修复范围内）。
+- 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交
+- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。

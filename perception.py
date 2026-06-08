@@ -19,12 +19,15 @@ from config import (
     FRONT_LANE_ADJACENT_THRESHOLD,
     FRONT_LANE_SAME_THRESHOLD,
     FRONT_TOP_K,
-    LANE_CLEAR_FRONT,
+        HYBRID_MATCH_RADIUS,
+        HYBRID_PERCEPTION_MODE,
+        LANE_CLEAR_FRONT,
     LANE_CLEAR_REAR,
     MISS_DETECTION_PROB,
-    RADAR_CLUSTER_RADIUS,
+        RADAR_CLUSTER_RADIUS,
     RADAR_ENABLED,
     RADAR_FOV_HORIZONTAL_DEG,
+    RADAR_MIN_DISTANCE,
     RADAR_MIN_POINTS_PER_CLUSTER,
     RADAR_RANGE,
     RIGHT_CONFIRM_FRAMES,
@@ -126,8 +129,11 @@ class VirtualGroundTruthSensor:
         # 噪声随机数生成器（固定种子确保可重复）
         self._noise_rng = random.Random(20260606)
 
-        # 前向雷达缓冲区（由 guiji.py 中的 radar callback 填充）
+                # 前向雷达缓冲区（由 guiji.py 中的 radar callback 填充）
         self._radar_detections = []  # list of carla.RadarDetection
+
+        # 右侧雷达缓冲区（由 guiji.py 中的 side_radar_callback 填充）
+        self._side_radar_detections = []  # list of carla.RadarDetection
 
     # ========= 传感器模拟辅助方法 =========
 
@@ -195,8 +201,19 @@ class VirtualGroundTruthSensor:
 
         Args:
             detections: list of carla.RadarDetection
-        """
+                """
         self._radar_detections = detections
+
+    def set_side_radar_detections(self, detections):
+        """接收来自 CARLA 右侧雷达传感器的原始检测点云。
+
+        由 guiji.py 中的 side_radar_callback 调用，每帧填充一次。
+        当前作为占位符，存储但不处理。
+
+        Args:
+            detections: list of carla.RadarDetection
+        """
+        self._side_radar_detections = detections
 
     def _process_radar_detections(self, ego_tf, ego_velocity):
         """将 CARLA 雷达原始点云聚类为目标列表。
@@ -267,6 +284,24 @@ class VirtualGroundTruthSensor:
         lane_width = max(ego_wp.lane_width, 2.5)
         ego_speed_along = dot_2d(ego_velocity, forward)
 
+        # === 混合感知：收集上帝视角 Actor 用于身份匹配 ===
+        gt_actors = []
+        if HYBRID_PERCEPTION_MODE:
+            ego_loc = ego_tf.location
+            for actor in self.world.get_actors().filter("vehicle.*"):
+                if actor.id == self.ego.id or not actor.is_alive:
+                    continue
+                rel = actor.get_location() - ego_loc
+                a_long = dot_2d(rel, forward)
+                a_lat = dot_2d(rel, right)
+                if a_long > 0.0:
+                    gt_actors.append({
+                        "actor": actor,
+                        "longitudinal": a_long,
+                        "lateral": a_lat,
+                        "role": actor.attributes.get("role_name", actor.type_id),
+                    })
+
         results = []
         for cluster in clusters:
             # 聚类中心
@@ -301,6 +336,25 @@ class VirtualGroundTruthSensor:
                 elif avg_long < SAFE_DISTANCE * 0.6:
                     risk_level = 1
 
+                        # === 混合感知：上帝视角身份匹配 ===
+            matched_id = None
+            matched_role = "radar_target"
+            if HYBRID_PERCEPTION_MODE and gt_actors:
+                best_match_dist = HYBRID_MATCH_RADIUS
+                for a in gt_actors:
+                    d = math.sqrt(
+                        (avg_long - a["longitudinal"]) ** 2
+                        + (avg_lat - a["lateral"]) ** 2
+                    )
+                    if d < best_match_dist:
+                        best_match_dist = d
+                        matched_id = a["actor"].id
+                        matched_role = a["role"]
+            
+            # 混合模式下：雷达聚类必须匹配到真实车辆才保留，否则视为杂波过滤掉
+            if HYBRID_PERCEPTION_MODE and matched_id is None:
+                continue
+            
             results.append(FrontVehicleReading(
                 distance=avg_long,
                 closing_speed=closing_speed,
@@ -310,8 +364,8 @@ class VirtualGroundTruthSensor:
                 is_front_vehicle=True,
                 is_same_lane=is_same_lane,
                 risk_level=risk_level,
-                actor_id=None,
-                actor_role="radar_target",
+                actor_id=matched_id,
+                actor_role=matched_role,
             ))
 
         # 按距离排序，取前 FRONT_TOP_K 个
@@ -326,10 +380,14 @@ class VirtualGroundTruthSensor:
         当 RADAR_ENABLED=True 时，使用 CARLA 毫米波雷达点云作为数据源；
         否则使用虚拟真值 + 噪声模拟。
         """
-        # === 雷达模式 ===
+                # === 雷达模式 ===
         if RADAR_ENABLED and self._radar_detections:
             ego_tf = self.ego.get_transform()
-            return self._process_radar_detections(ego_tf, self.ego.get_velocity())
+            radar_results = self._process_radar_detections(ego_tf, self.ego.get_velocity())
+            # 雷达结果为空时回退到虚拟真值（前车超出雷达稳定聚类范围等场景）
+            if radar_results:
+                return radar_results
+            # fall through to virtual ground truth below
 
         # === 虚拟真值模式（带回退） ===
         ego_tf = self.ego.get_transform()

@@ -105,5 +105,10 @@ RADAR_FOV_VERTICAL_DEG = 15.0         # 雷达垂直 FOV (度)
 RADAR_POINTS_PER_SECOND = 1500        # 雷达每秒输出点云数量
 RADAR_CLUSTER_RADIUS = 1.8            # 点云聚类半径 (米)，低于此距离的点归为同一目标
 RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数，低于此数目忽略
+RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内的雷达检测（过滤地面杂波/自车反射）
+
+# ========= 混合感知参数 =========
+HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角识别；False: 纯雷达模式
+HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配的最大欧氏距离 (米)
 # ====================================================
 
