@@ -166,7 +166,7 @@ dazuoye/display.py
 - CARLA 连接和地图加载。
 - 自车与前车生成。
 - 前车急停。
-- 虚拟传感器。
+- 虚拟真值感知，并可选叠加噪声、FOV、漏检和前向毫米波雷达点云聚类。
 - TTC 计算。
 - 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的多候选避障轨迹。
 - 采样式 MPC 跟踪，当前主流程使用路线相对轨迹代价计算。
@@ -188,7 +188,7 @@ dazuoye/display.py
 ```text
 config.py       场景、路线、风险阈值和控制参数
 utils.py        通用数学、车辆速度和道路辅助函数
-perception.py   虚拟真值感知、前车与右侧目标风险读取
+perception.py   虚拟真值/雷达融合感知、前车与右侧目标风险读取
 control.py      真实路线叠加局部五次偏移候选轨迹、路径约束/代价选择和采样式 MPC 跟踪
 route.py        Town10 固定短路线、路线进度和转弯事件检测
 actors.py       自车、前车、背景车辆和非机动车生成与运动
@@ -520,6 +520,15 @@ FrontVehicleReading
 RightSideObjectReading
 ```
 
+当前感知层仍以虚拟真值和路线参考线为主演示底座，但已经合入感知增强开关：
+
+- `SENSOR_NOISE_ENABLED`：对距离、接近速度和部分预测 TTC 叠加固定随机种子的高斯噪声。
+- 前向/侧向 FOV：目标超出视场角或检测距离时不返回。
+- 漏检模拟：远距离目标按固定概率漏检。
+- `RADAR_ENABLED`：为 `True` 时在自车前部挂载 CARLA `sensor.other.radar`，通过 `set_radar_detections()` 输入点云，并用简单欧氏距离聚类生成前方候选目标。
+
+当前默认 `RADAR_ENABLED = False`，原因是当前控制演示已经基于路线弧线虚拟感知完成验证；雷达聚类作为可启用增强能力保留，避免默认运行时突然改变前车识别稳定性。
+
 ### 8.1 前方车辆感知
 
 继续保留：
@@ -698,7 +707,7 @@ $$
 = \arg\min_{o \in \mathcal{O}_{\mathrm{front}}} s_o
 $$
 
-当前 `FrontVehicleReading` 已保留 `actor_id` 和 `actor_role`，可用于区分 `lead`、慢速车和背景车角色；现阶段这些字段主要作为诊断信息和后续扩展入口。前方风险触发仍主要使用路线弧长距离、横向偏移、接近速度和 TTC。
+当前 `FrontVehicleReading` 已保留 `actor_id`、`actor_role`、`target_speed_along`、`lane_relative_lateral`、`is_same_lane` 和 `risk_level`。其中 `target_speed_along` 已用于慢车预测，`front_vehicles()` 保留为雷达/多目标候选读取入口；当前主状态机仍主要使用最近同车道前车的路线弧长距离、横向偏移、接近速度和 TTC。
 
 ### 8.2 右侧非机动车感知
 
@@ -710,6 +719,14 @@ class RightSideObjectReading:
     distance: float
     ttc: float
     is_conflict_object: bool
+    actor_id: int
+    actor_role: str
+    longitudinal: float
+    lateral: float
+    risk_level: int
+    is_moving_toward_conflict: bool
+    predicted_ttc: float
+    object_type: str
 ```
 
 重点不只是判断“在不在右侧”，还要判断：
@@ -726,7 +743,24 @@ class RightSideObjectReading:
 目标位置接近右转目标路径
 ```
 
-后续再升级为更稳定的轨迹预测和路口区域判定。
+当前已经加入连续帧确认与风险等级：
+
+$$
+\mathrm{right\_confirm\_count}
+\ge
+\mathrm{RIGHT\_CONFIRM\_FRAMES}
+$$
+
+满足连续确认后才把候选目标标记为真正冲突目标，降低单帧误触发。右侧目标风险等级当前为：
+
+```text
+0 = 无风险
+1 = 注意
+2 = 警告/需要停车让行
+3 = 危险
+```
+
+主状态机仍保留原有 `TTC/距离` 触发条件，同时允许 `risk_level >= 2` 触发右侧让行。
 
 当前右侧目标 TTC 使用目标相对自车的径向接近速度。设：
 
@@ -2232,3 +2266,25 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
 - PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-08 - 合并感知增强分支到决策控制分支
+
+- 本次目标：把 `origin/feature/perception-risk` 中的感知增强内容合并到当前决策控制分支，同时保留已经验证过的路线弧线前车识别、多候选避障、慢车位移预测和右转让行控制逻辑。
+- 主要改动：`perception.py` 重整为融合版，保留 `front_vehicle(use_route_reference=...)` 和 `target_speed_along`，新增 `front_vehicles()`、固定随机种子的距离/速度噪声、前向/侧向 FOV、远距离漏检、CARLA radar 点云输入和简单聚类；`RightSideObjectReading` 增加 `risk_level`、`predicted_ttc`、`object_type` 和连续帧确认；`guiji.py` 在配置开启时挂载前向雷达，并让右侧目标 `risk_level >= 2` 也能触发让行；`config.py` 新增感知增强和雷达配置，默认 `RADAR_ENABLED = False` 以保持主演示稳定；`.gitignore` 增加 `__pycache__/` 与 `*.pyc`，并从合并结果中移除远端误提交的 `.pyc` 文件。
+- 为什么这样改：感知分支提供了更接近传感器输出的噪声、视场、漏检和雷达点云能力，但直接覆盖当前分支会丢失弯道避障和慢车预测逻辑。因此本次采用“当前控制分支为主、感知增强移植进来”的方式合并。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check --cached`，无空白错误；已尝试运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，但 CARLA 服务端在 `localhost:2000` 等待 `120000ms` 后超时，未完成实景回归。
+- 未覆盖风险：当前尚未完成完整 CARLA 场景回归；雷达模式默认关闭，尚未验证 `RADAR_ENABLED = True` 时的点云聚类效果；噪声/FOV/漏检可能改变触发时机，必要时可临时关闭 `SENSOR_NOISE_ENABLED` 进行对照；需要在 CARLA 服务端已启动且地图可加载时再次运行 `--free-run`。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`、`dazuoye/.gitignore`。
+- 提交代号/Commit ID：`2de989b`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成合并提交；尚未推送。
+
+### 2026-06-08 - 精简感知合并后的未接入接口
+
+- 本次目标：在合并感知增强分支后进行剪枝收敛，减少当前主流程没有使用的临时接口和配置。
+- 主要改动：删除未接入主循环的 `RiskAssessment` 数据结构和 `VirtualGroundTruthSensor.assess_risk()` 包装函数；删除未使用的 `RIGHT_PREDICTION_SECONDS` 配置；同步收敛维护文档中关于统一风险评估入口的描述。
+- 为什么这样改：当前 `guiji.py` 状态机仍显式读取 `front_vehicle()` 和 `right_side_object()`，统一风险评估包装没有被调用，保留会增加维护者判断成本。先删掉未接入接口，可以让感知层聚焦在已经使用的噪声/FOV/雷达候选和右侧风险等级输出。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：本次为未接入接口删除，尚未重新完成 CARLA 实景回归；如果后续确实要把状态机改成统一风险评估，需要重新设计并接入该接口，而不是沿用这次删除的未验证包装。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`bb65888`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成剪枝提交；尚未推送。

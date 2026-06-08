@@ -1,2 +1,4 @@
 .claude/
 分布式驱动车轨迹跟踪13.pdf
+__pycache__/
+*.pyc
