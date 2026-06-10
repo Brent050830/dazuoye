@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import carla
 
 from config import MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间步长、预测时域步数和车辆轴距
-from utils import clamp, dot_2d, get_speed, normalize_angle, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
+from utils import clamp, dot_2d, get_speed, normalize_angle, smooth_reference_for, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
 
 
 # ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
@@ -40,48 +40,15 @@ class RouteOffsetLaneChangeTrajectory:
         self.lateral_offset = lateral_offset # 目标侧向偏移量，表示换道结束时相对于全局路径的横向位置
         self.length = length # 换道长度，表示从起点到终点沿全局路径的纵向距离
         self.step_distance = loop_route.step_distance
+        self.route_reference = smooth_reference_for(loop_route)
+        self.start_route_s = self.start_index * self.step_distance
         self.is_route_relative = True
-
-    def _clamp_index(self, index):
-        """将索引限制在全局路径点的范围内"""
-        return max(0, min(index, len(self.loop_route.points) - 1))
-
-    def _route_location_at_raw_index(self, raw_index):
-        """按浮点路线索引插值得到路线中心点。"""
-        lower = self._clamp_index(int(math.floor(raw_index)))
-        upper = self._clamp_index(lower + 1)
-        blend = clamp(raw_index - lower, 0.0, 1.0)
-        p0 = self.loop_route.points[lower]
-        p1 = self.loop_route.points[upper]
-        return carla.Location(
-            x=p0.x + (p1.x - p0.x) * blend,
-            y=p0.y + (p1.y - p0.y) * blend,
-            z=p0.z + (p1.z - p0.z) * blend,
-        )
-
-    def _smoothed_route_right_at_raw_index(self, raw_index):
-        """用路线中心线前后差分计算平滑右向，减少弯道 waypoint 朝向跳变带来的折线感。"""
-        look_index = 1.25
-        before = self._route_location_at_raw_index(raw_index - look_index)
-        after = self._route_location_at_raw_index(raw_index + look_index)
-        tangent = carla.Vector3D(x=after.x - before.x, y=after.y - before.y, z=0.0)
-        tangent_length = math.sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
-        if tangent_length < 0.001:
-            waypoint_right = self.loop_route.waypoints[self._clamp_index(int(round(raw_index)))].transform.get_right_vector()
-            return carla.Vector3D(x=waypoint_right.x, y=waypoint_right.y, z=0.0)
-        tangent.x /= tangent_length
-        tangent.y /= tangent_length
-        right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
-        right_length = max(math.sqrt(right.x * right.x + right.y * right.y), 0.001)
-        right.x /= right_length
-        right.y /= right_length
-        return right
 
     def _route_pose_at(self, s):
         """计算全局路径上纵向位置 s 处的坐标和右向单位向量"""
-        raw_index = self.start_index + s / self.step_distance
-        location = self._route_location_at_raw_index(raw_index)
-        right = self._smoothed_route_right_at_raw_index(raw_index)
+        route_s = self.start_route_s + s
+        location = self.route_reference.location_at_route_s(route_s)
+        right = self.route_reference.right_at_route_s(route_s)
         return location, right
 
     def avoidance_delta_at(self, s):
@@ -125,24 +92,20 @@ class RouteOffsetLaneChangeTrajectory:
 
     def to_local(self, location): 
         """将全局坐标转换为以起点为原点的局部纵横坐标 (s, d)，其中 s 是沿全局路径的进度，d 是相对于全局路径的横向偏移"""
-        search_steps = int((self.length + 24.0) / self.step_distance) + 8
-        start = self._clamp_index(self.start_index - 3)
-        end = self._clamp_index(self.start_index + search_steps)
-        nearest = min(
-            range(start, end + 1),
-            key=lambda index: self.loop_route.points[index].distance(location),
+        projection = self.route_reference.project(
+            location,
+            self.start_route_s,
+            search_back=12.0,
+            search_ahead=self.length + 32.0,
         )
-        progress = max(0.0, (nearest - self.start_index) * self.step_distance)
-        route_location = self.loop_route.points[nearest]
-        route_right = self._smoothed_route_right_at_raw_index(float(nearest))
-        lateral = dot_2d(location - route_location, route_right) # 通过计算当前位置与全局路径上最近点的坐标差向量与路径右向单位向量的点积，得到当前位置相对于全局路径的横向偏移量 d
+        progress = max(0.0, projection["route_s"] - self.start_route_s)
+        lateral = projection["lateral"] # 通过当前位置到平滑参考线的投影计算横向偏移量 d
         return progress, lateral
 
 
 def smoothed_route_right_at(loop_route, index):
     """按路线中心线差分计算指定索引处的平滑右向量。"""
-    helper = RouteOffsetLaneChangeTrajectory(loop_route, index, None, 0.0, loop_route.step_distance)
-    return helper._smoothed_route_right_at_raw_index(float(index))
+    return smooth_reference_for(loop_route).right_at_route_s(index * loop_route.step_distance)
 
 
 def select_best_route_offset_trajectory(loop_route, ego_vehicle, target_wp, front, base_length):
@@ -152,7 +115,8 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, target_wp, fron
 
     route_index = loop_route.last_index
     start_transform = ego_vehicle.get_transform()
-    route_location = loop_route.points[route_index]
+    route_reference = smooth_reference_for(loop_route)
+    route_location = route_reference.location_at_route_s(route_index * loop_route.step_distance)
     route_right = smoothed_route_right_at(loop_route, route_index)
     start_offset = dot_2d(start_transform.location - route_location, route_right)
     target_center_offset = dot_2d(target_wp.transform.location - route_location, route_right)
