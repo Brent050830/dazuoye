@@ -2349,5 +2349,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已通过 `conda install -n carla_env scipy=1.7.3 -y` 安装 scipy；已确认补充 `Library\bin` 后 `scipy 1.7.3` 可导入；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\utils.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\guiji.py`，语法检查通过。本次按要求未实跑 CARLA。
 - 未覆盖风险：尚未在 pygame/CARLA 画面中人工确认弯道轨迹观感；当前投影搜索是沿样条采样近似最近点，尚未实现严格连续优化投影；`FrontReferencePath` 的平滑参考线由避障轨迹采样点拟合而来，采样密度仍会影响细节。
 - 需要 reviewer 重点看的文件：`dazuoye/utils.py`、`dazuoye/control.py`、`dazuoye/perception.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：`1af2788`。
+- 提交代号/Commit ID：`f392f1a`。
 - PR/分支信息：本地待提交，尚未推送。
