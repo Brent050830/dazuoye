@@ -1,10 +1,22 @@
 """通用数学、车辆状态和基础道路辅助函数。"""
 
 import math
+import os
+import sys
 
 import carla
 
 from config import TOWN10_START_SPAWN_INDEX
+
+if os.name == "nt":
+    _conda_dll_dir = os.path.join(os.path.dirname(sys.executable), "Library", "bin")
+    if os.path.isdir(_conda_dll_dir) and _conda_dll_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _conda_dll_dir + os.pathsep + os.environ.get("PATH", "")
+
+try:
+    from scipy.interpolate import CubicSpline
+except Exception:
+    CubicSpline = None
 
 
 def clamp(value, low, high):
@@ -20,6 +32,137 @@ def vector_length(vector):
 def dot_2d(a, b):
     """计算两个向量在水平面（XY）上的点积。"""
     return a.x * b.x + a.y * b.y
+
+
+class SmoothRouteReference:
+    """基于累计弧长和样条的平滑路线参考线。"""
+
+    def __init__(self, loop_route):
+        self.loop_route = loop_route
+        self.s_values = []
+        self.points = []
+        cumulative = 0.0
+        previous = None
+
+        for point in loop_route.points:
+            if previous is not None:
+                distance = point.distance(previous)
+                if distance < 0.01:
+                    continue
+                cumulative += distance
+            self.points.append(point)
+            self.s_values.append(cumulative)
+            previous = point
+
+        self.max_s = self.s_values[-1] if self.s_values else 0.0
+        self._use_spline = CubicSpline is not None and len(self.points) >= 4 and self.max_s > 1.0
+        if self._use_spline:
+            self._spline_x = CubicSpline(self.s_values, [point.x for point in self.points], bc_type="natural")
+            self._spline_y = CubicSpline(self.s_values, [point.y for point in self.points], bc_type="natural")
+            self._spline_z = CubicSpline(self.s_values, [point.z for point in self.points], bc_type="natural")
+        else:
+            self._spline_x = None
+            self._spline_y = None
+            self._spline_z = None
+
+    def clamp_s(self, route_s):
+        return clamp(route_s, 0.0, self.max_s)
+
+    def location_at_route_s(self, route_s):
+        route_s = self.clamp_s(route_s)
+        if self._use_spline:
+            return carla.Location(
+                x=float(self._spline_x(route_s)),
+                y=float(self._spline_y(route_s)),
+                z=float(self._spline_z(route_s)),
+            )
+        return self._linear_location_at(route_s)
+
+    def tangent_at_route_s(self, route_s):
+        route_s = self.clamp_s(route_s)
+        if self._use_spline:
+            dx = float(self._spline_x(route_s, 1))
+            dy = float(self._spline_y(route_s, 1))
+        else:
+            before = self.location_at_route_s(route_s - 0.75)
+            after = self.location_at_route_s(route_s + 0.75)
+            dx = after.x - before.x
+            dy = after.y - before.y
+
+        length = math.sqrt(dx * dx + dy * dy)
+        if length < 0.001:
+            return carla.Vector3D(x=1.0, y=0.0, z=0.0)
+        return carla.Vector3D(x=dx / length, y=dy / length, z=0.0)
+
+    def right_at_route_s(self, route_s):
+        tangent = self.tangent_at_route_s(route_s)
+        return carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+
+    def yaw_at_route_s(self, route_s):
+        tangent = self.tangent_at_route_s(route_s)
+        return math.atan2(tangent.y, tangent.x)
+
+    def project(self, location, center_route_s, search_back=12.0, search_ahead=80.0):
+        start_s = self.clamp_s(center_route_s - search_back)
+        end_s = self.clamp_s(center_route_s + search_ahead)
+        if end_s <= start_s:
+            end_s = min(self.max_s, start_s + max(search_ahead, 1.0))
+
+        best_s = self._nearest_sample_s(location, start_s, end_s, 1.0)
+        best_s = self._nearest_sample_s(location, max(start_s, best_s - 1.5), min(end_s, best_s + 1.5), 0.20)
+
+        route_location = self.location_at_route_s(best_s)
+        route_right = self.right_at_route_s(best_s)
+        return {
+            "route_s": best_s,
+            "location": route_location,
+            "right": route_right,
+            "lateral": dot_2d(location - route_location, route_right),
+            "error": route_location.distance(location),
+        }
+
+    def _nearest_sample_s(self, location, start_s, end_s, step):
+        best_s = start_s
+        best_distance = float("inf")
+        count = max(1, int((end_s - start_s) / step))
+        for index in range(count + 1):
+            sample_s = min(end_s, start_s + index * step)
+            sample_location = self.location_at_route_s(sample_s)
+            distance = sample_location.distance(location)
+            if distance < best_distance:
+                best_distance = distance
+                best_s = sample_s
+        return best_s
+
+    def _linear_location_at(self, route_s):
+        if not self.points:
+            return carla.Location()
+        if route_s <= 0.0:
+            return self.points[0]
+        if route_s >= self.max_s:
+            return self.points[-1]
+        for index in range(len(self.s_values) - 1):
+            s0 = self.s_values[index]
+            s1 = self.s_values[index + 1]
+            if s0 <= route_s <= s1:
+                blend = (route_s - s0) / max(s1 - s0, 0.001)
+                p0 = self.points[index]
+                p1 = self.points[index + 1]
+                return carla.Location(
+                    x=p0.x + (p1.x - p0.x) * blend,
+                    y=p0.y + (p1.y - p0.y) * blend,
+                    z=p0.z + (p1.z - p0.z) * blend,
+                )
+        return self.points[-1]
+
+
+def smooth_reference_for(loop_route):
+    """缓存并返回路线对应的平滑参考线。"""
+    reference = getattr(loop_route, "_smooth_reference", None)
+    if reference is None:
+        reference = SmoothRouteReference(loop_route)
+        setattr(loop_route, "_smooth_reference", reference)
+    return reference
 
 
 def normalize_angle(angle):

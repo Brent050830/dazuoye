@@ -33,7 +33,7 @@ from config import (
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
-from utils import dot_2d, same_direction_lane, vector_length
+from utils import SmoothRouteReference, dot_2d, same_direction_lane, smooth_reference_for, vector_length
 
 
 # ===================== 感知数据结构 =====================
@@ -80,6 +80,7 @@ class FrontReferencePath:
         self.cumulative = [0.0]
         for before, after in zip(self.points, self.points[1:]):
             self.cumulative.append(self.cumulative[-1] + before.distance(after))
+        self.reference = SmoothRouteReference(self) if len(self.points) >= 2 else None
 
     @property
     def is_valid(self):
@@ -113,6 +114,7 @@ class VirtualGroundTruthSensor:
         self._noise_rng = random.Random(20260606)
         self._radar_detections = []
         self._front_reference_path = None
+        self._route_reference = smooth_reference_for(loop_route) if loop_route is not None else None
 
     def _empty_front(self):
         return FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
@@ -238,11 +240,11 @@ class VirtualGroundTruthSensor:
 
             target_projection = self._project_to_route(
                 vehicle.get_location(),
-                int(ego_projection["raw_index"]),
+                ego_projection["raw_index"],
                 search_back=3,
                 search_ahead=search_ahead,
             )
-            longitudinal = (target_projection["raw_index"] - ego_projection["raw_index"]) * self.loop_route.step_distance
+            longitudinal = target_projection["route_s"] - ego_projection["route_s"]
             lateral = target_projection["lateral"] - ego_projection["lateral"]
             lane_relative = lateral / lane_width
             if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
@@ -407,81 +409,39 @@ class VirtualGroundTruthSensor:
         return readings[:FRONT_TOP_K]
 
     def _project_to_route(self, location, anchor_index, search_back=5, search_ahead=24):
-        """把位置投影到路线局部窗口，返回浮点路线索引和相对路线的横向偏移。"""
-        last_segment = max(0, len(self.loop_route.points) - 2)
-        start = max(0, int(anchor_index) - search_back)
-        end = min(last_segment, int(anchor_index) + search_ahead)
-        best = None
-        for index in range(start, end + 1):
-            p0 = self.loop_route.points[index]
-            p1 = self.loop_route.points[index + 1]
-            segment = p1 - p0
-            segment_len_sq = max(dot_2d(segment, segment), 0.001)
-            to_location = location - p0
-            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
-            projected = carla.Location(
-                x=p0.x + segment.x * blend,
-                y=p0.y + segment.y * blend,
-                z=p0.z + segment.z * blend,
-            )
-            error = projected.distance(location)
-            if best is None or error < best["error"]:
-                raw_index = index + blend
-                right = self._route_right_at(raw_index)
-                best = {
-                    "raw_index": raw_index,
-                    "location": projected,
-                    "right": right,
-                    "lateral": dot_2d(location - projected, right),
-                    "error": error,
-                }
-        if best is not None:
-            return best
+        """把位置投影到平滑路线局部窗口，返回弧长 s 和相对路线的横向偏移。"""
+        if self._route_reference is None:
+            return {
+                "route_s": 0.0,
+                "raw_index": 0.0,
+                "location": location,
+                "right": carla.Vector3D(x=1.0, y=0.0, z=0.0),
+                "lateral": 0.0,
+                "error": 0.0,
+            }
 
-        right = self._route_right_at(float(anchor_index))
-        return {
-            "raw_index": float(anchor_index),
-            "location": self.loop_route.points[int(anchor_index)],
-            "right": right,
-            "lateral": dot_2d(location - self.loop_route.points[int(anchor_index)], right),
-            "error": 0.0,
-        }
+        center_route_s = float(anchor_index) * self.loop_route.step_distance
+        projection = self._route_reference.project(
+            location,
+            center_route_s,
+            search_back=search_back * self.loop_route.step_distance,
+            search_ahead=search_ahead * self.loop_route.step_distance,
+        )
+        projection["raw_index"] = projection["route_s"] / max(self.loop_route.step_distance, 0.001)
+        return projection
 
     def _project_to_reference_path(self, location, path, anchor_s=None, search_back=20.0, search_ahead=90.0):
-        """Project a location to a sampled temporary reference path."""
-        best = None
-        for index in range(len(path.points) - 1):
-            s0 = path.cumulative[index]
-            s1 = path.cumulative[index + 1]
-            if anchor_s is not None and (s1 < anchor_s - search_back or s0 > anchor_s + search_ahead):
-                continue
-
-            p0 = path.points[index]
-            p1 = path.points[index + 1]
-            segment = p1 - p0
-            segment_len_sq = max(dot_2d(segment, segment), 0.001)
-            to_location = location - p0
-            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
-            projected = carla.Location(
-                x=p0.x + segment.x * blend,
-                y=p0.y + segment.y * blend,
-                z=p0.z + segment.z * blend,
+        """Project a location to the smooth active temporary reference path."""
+        if path.reference is not None:
+            center_s = anchor_s if anchor_s is not None else 0.0
+            projection = path.reference.project(
+                location,
+                center_s,
+                search_back=search_back,
+                search_ahead=search_ahead,
             )
-            error = projected.distance(location)
-            if best is None or error < best["error"]:
-                segment_len = max(math.sqrt(segment_len_sq), 0.001)
-                tangent = carla.Vector3D(x=segment.x / segment_len, y=segment.y / segment_len, z=0.0)
-                right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
-                best = {
-                    "s": s0 + (s1 - s0) * blend,
-                    "location": projected,
-                    "right": right,
-                    "lateral": dot_2d(location - projected, right),
-                    "error": error,
-                }
-
-        if best is not None:
-            return best
+            projection["s"] = projection["route_s"]
+            return projection
 
         first = path.points[0]
         second = path.points[1]
@@ -497,29 +457,6 @@ class VirtualGroundTruthSensor:
             "lateral": dot_2d(location - first, right),
             "error": first.distance(location),
         }
-
-    def _route_location_at_raw_index(self, raw_index):
-        lower = max(0, min(int(raw_index), len(self.loop_route.points) - 1))
-        upper = max(0, min(lower + 1, len(self.loop_route.points) - 1))
-        blend = max(0.0, min(raw_index - lower, 1.0))
-        p0 = self.loop_route.points[lower]
-        p1 = self.loop_route.points[upper]
-        return carla.Location(
-            x=p0.x + (p1.x - p0.x) * blend,
-            y=p0.y + (p1.y - p0.y) * blend,
-            z=p0.z + (p1.z - p0.z) * blend,
-        )
-
-    def _route_right_at(self, raw_index):
-        """由路线中心线前后差分得到平滑道路右向量。"""
-        look_index = 1.25
-        before = self._route_location_at_raw_index(raw_index - look_index)
-        after = self._route_location_at_raw_index(raw_index + look_index)
-        tangent = carla.Vector3D(x=after.x - before.x, y=after.y - before.y, z=0.0)
-        tangent_length = max(vector_length(tangent), 0.001)
-        tangent.x /= tangent_length
-        tangent.y /= tangent_length
-        return carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
 
     def _speed_along_route(self, vehicle, projection):
         right = projection["right"]

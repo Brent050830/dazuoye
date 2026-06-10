@@ -187,9 +187,9 @@ dazuoye/display.py
 
 ```text
 config.py       场景、路线、风险阈值和控制参数
-utils.py        通用数学、车辆速度和道路辅助函数
-perception.py   虚拟真值/雷达融合感知、前车与右侧目标风险读取
-control.py      真实路线叠加局部五次偏移候选轨迹、路径约束/代价选择和采样式 MPC 跟踪
+utils.py        通用数学、车辆速度、平滑参考线投影和道路辅助函数
+perception.py   虚拟真值/雷达融合感知、基于平滑参考线的前车读取与右侧目标风险读取
+control.py      平滑路线叠加局部五次偏移候选轨迹、路径约束/代价选择和采样式 MPC 跟踪
 route.py        Town10 固定短路线、路线进度和转弯事件检测
 actors.py       自车、前车、背景车辆和非机动车生成与运动
 display.py      碰撞监测、CARLA 摄像头、pygame HUD 和显示窗口
@@ -541,8 +541,8 @@ RightSideObjectReading
 
 当前 `guiji.py` 主流程统一调用 `sensor.front_vehicle(use_route_reference=True)`，但参考线会随状态变化：
 
-- `ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE` 使用 `LoopRoute` 原始路线弧线作为虚拟道路参考线传感器，把自车和目标投影到当前路线前方局部弧线上，得到沿路线弧长距离 $s$ 和横向偏移 $d$。
-- `AVOID` 使用当前避障轨迹加后续路线延伸得到的临时 `FrontReferencePath`。感知层把自车和目标投影到这条“正在计划/跟踪的联合轨迹”上，而不是只看原始路线或自车直线坐标系。
+- `ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE` 使用 `LoopRoute` 对应的 `SmoothRouteReference` 作为虚拟道路参考线传感器，把自车和目标投影到当前路线前方局部平滑曲线上，得到沿路线弧长距离 $s$ 和横向偏移 $d$。
+- `AVOID` 使用当前避障轨迹加后续路线延伸得到的临时 `FrontReferencePath`。该临时参考路径内部同样构造平滑参考线，感知层把自车和目标投影到这条“正在计划/跟踪的联合轨迹”上，而不是只看原始路线或自车直线坐标系。
 
 这样，如果触发避障的旧目标已经被避障轨迹绕开，它相对联合轨迹的横向偏移会增大，不再反复触发同一碰撞走廊风险；如果避障轨迹前方又出现新的慢车/危险目标，仍会在联合轨迹坐标下被识别出来。
 
@@ -560,47 +560,54 @@ $$
 
 路线参考线模式可以理解为虚拟车道线/导航参考线传感器：目标位置和速度仍来自虚拟真值感知，但“前方”和“同车道”不再由自车当前直线 `forward/right` 一刀切判断，而是由前方道路局部弧线坐标判断。
 
-设 `LoopRoute` 局部弧线参考点为 $P_{\mathrm{route}}(i)$，自车和目标投影得到浮点路线索引：
+路线参考线模式中的参考线由 `SmoothRouteReference` 表示。设平滑参考线为：
 
 $$
-i_e = \operatorname{project}_{\mathrm{route}}(p_e)
-$$
-
-$$
-i_o = \operatorname{project}_{\mathrm{route}}(p_o)
-$$
-
-路线步长为 $\Delta s$，则前方目标沿路线弧长距离为：
-
-$$
-s_{\mathrm{front}} = (i_o - i_e)\Delta s
-$$
-
-路线右向单位向量由路线中心线前后差分得到：
-
-$$
-r_{\mathrm{route}}(i)
-=
+C(s)=
 \begin{bmatrix}
--T_y(i) \\
-T_x(i)
+x(s)\\
+y(s)
 \end{bmatrix}
 $$
 
-目标与自车相对参考线的横向差为：
+对车辆位置 $p$，在当前进度附近的局部搜索窗口内求最近投影：
+
+$$
+s^*=\arg\min_s \|p-C(s)\|^2
+$$
+
+投影点和切向量为：
+
+$$
+C^*=C(s^*),\qquad
+t(s^*)=
+\frac{C'(s^*)}{\|C'(s^*)\|}
+$$
+
+道路右向单位向量为：
+
+$$
+r(s^*)=
+\begin{bmatrix}
+-t_y(s^*)\\
+t_x(s^*)
+\end{bmatrix}
+$$
+
+横向偏移为：
+
+$$
+d(p)=\operatorname{dot}_{2D}(p-C^*,\ r(s^*))
+$$
+
+自车和目标分别投影为 $(s_e,d_e)$、$(s_o,d_o)$，则前方目标沿参考线的弧长距离和横向差为：
+
+$$
+s_{\mathrm{front}} = s_o - s_e
+$$
 
 $$
 d_{\mathrm{front}} = d_o - d_e
-$$
-
-其中：
-
-$$
-d_e = \operatorname{dot}_{2D}(p_e-P_{\mathrm{route}}(i_e),\ r_{\mathrm{route}}(i_e))
-$$
-
-$$
-d_o = \operatorname{dot}_{2D}(p_o-P_{\mathrm{route}}(i_o),\ r_{\mathrm{route}}(i_o))
 $$
 
 当前只认为满足以下条件的目标是“同车道前方车辆”：
@@ -613,14 +620,14 @@ $$
 |d_{\mathrm{front}}| < 0.45w_{\mathrm{lane}}
 $$
 
-自车和目标车速度投影到各自路线切线方向：
+自车和目标车速度投影到各自参考线切线方向：
 
 $$
-v_{e,\mathrm{route}} = \operatorname{dot}_{2D}(v_e,\ T_{\mathrm{route}}(i_e))
+v_{e,\mathrm{route}} = \operatorname{dot}_{2D}(v_e,\ t(s_e))
 $$
 
 $$
-v_{o,\mathrm{route}} = \operatorname{dot}_{2D}(v_o,\ T_{\mathrm{route}}(i_o))
+v_{o,\mathrm{route}} = \operatorname{dot}_{2D}(v_o,\ t(s_o))
 $$
 
 `FrontVehicleReading.target_speed_along` 保存的就是 $v_{o,\mathrm{route}}$。后续避障规划会用它估计慢前车在换道时间内继续前进的距离；急刹前车 `actor_role == "lead"` 时按静止障碍处理，避免把已经急停的目标错误外推。
@@ -1221,9 +1228,9 @@ SamplingMPCTracker
 
 ### 11.2 前车急停避障轨迹
 
-当前主流程进入 `AVOID` 时使用 `RouteOffsetLaneChangeTrajectory`。它不再把整段避障轨迹固定成一条直线，而是保留 `LoopRoute` 的真实路线点作为道路弯曲基线，再沿路线中心线差分得到的平滑道路右方向叠加五次多项式横向避障增量。
+当前主流程进入 `AVOID` 时使用 `RouteOffsetLaneChangeTrajectory`。它不再把整段避障轨迹固定成一条直线，而是先把 `LoopRoute` 的真实路线点按累计弧长拟合成平滑参考线 $C(s)$，再沿该参考线的连续法向量叠加五次多项式横向避障增量。
 
-注意：当前横向偏移不是简单固定为一个车道宽。程序使用避障开始处路线中心线差分右向量计算目标邻道中心偏移，并在轨迹上使用同一差分方法得到每个位置的平滑右向量叠加横向增量。这样弯道上横向偏移方向会随道路旋转，而不是固定在触发瞬间的自车右方向；同时避免直接使用相邻 waypoint 朝向跳变造成明显折线感。
+注意：当前横向偏移不是简单固定为一个车道宽。程序使用避障开始处平滑参考线的右向法向量计算目标邻道中心偏移，并在轨迹上使用同一条平滑参考线的导数得到每个位置的连续右向量。这样弯道上横向偏移方向会随道路旋转，而不是固定在触发瞬间的自车右方向；同时减少离散 waypoint 分段线性投影造成的折线感。
 
 五次横向偏移采用分段形式，避免在换道长度之后继续外推五次多项式：
 
@@ -1243,68 +1250,71 @@ $$
 
 其中 $d_0$ 为避障开始时的横向偏移，$d_1$ 为目标邻道中心附近的横向偏移。也就是说，车辆在 $0<s<L$ 内完成横向换道；当 $s \ge L$ 后，参考横向偏移固定为 $d_1$，只沿目标车道继续向前行驶。
 
-设避障开始时的路线索引为：
+设 `LoopRoute` 的离散路线点为：
 
 $$
-i_0 = \texttt{loop\_route.last\_index}
+P_i=(x_i,\ y_i,\ z_i)
 $$
 
-路线离散参考点为 $P_i$，路线步长为 $\Delta s$。对避障轨迹纵向进度 $s$，对应的路线索引为：
+先计算累计弧长：
 
 $$
-i(s) = i_0 + \frac{s}{\Delta s}
+s_0=0,\qquad s_i=s_{i-1}+\|P_i-P_{i-1}\|
 $$
 
-实际代码中使用相邻路线点线性插值得到道路参考点：
+然后使用三次样条分别拟合：
 
 $$
-P_{\mathrm{route}}(s)
-= (1-\alpha)P_{\lfloor i(s)\rfloor}
-+ \alpha P_{\lfloor i(s)\rfloor+1}
+x_{\mathrm{route}}=f_x(s),\qquad
+y_{\mathrm{route}}=f_y(s),\qquad
+z_{\mathrm{route}}=f_z(s)
 $$
 
-其中：
+因此平滑道路参考线为：
 
 $$
-\alpha = i(s)-\lfloor i(s)\rfloor
+C(s)=
+\begin{bmatrix}
+f_x(s)\\
+f_y(s)\\
+f_z(s)
+\end{bmatrix}
 $$
 
-路线点对应的道路右向单位向量不再直接取 CARLA waypoint yaw，而是由路线中心线前后差分得到。设平滑差分窗口为 $\Delta i = 1.25$：
+参考线切向单位向量由样条导数得到：
 
 $$
-T_{\mathrm{route}}(s)
+t(s)
 =
 \frac{
-P_{\mathrm{route}}(i(s)+\Delta i)
--
-P_{\mathrm{route}}(i(s)-\Delta i)
+\begin{bmatrix}
+f'_x(s)\\
+f'_y(s)
+\end{bmatrix}
 }{
-\left\|
-P_{\mathrm{route}}(i(s)+\Delta i)
--
-P_{\mathrm{route}}(i(s)-\Delta i)
-\right\|
+\sqrt{f'_x(s)^2+f'_y(s)^2}
 }
 $$
 
-则道路右向单位向量为：
+对应右向法向量为：
 
 $$
-r_{\mathrm{route}}(s)
-=
+r(s)=
 \begin{bmatrix}
--T_y(s) \\
-T_x(s)
+-t_y(s)\\
+t_x(s)
 \end{bmatrix}
 $$
+
+若当前运行环境没有 `scipy` 或 `CubicSpline` 导入失败，代码会回退到旧的线性插值和有限差分切向量，避免程序直接中断。
 
 目标邻道中心横向偏移：
 
 $$
 d_1 = \operatorname{dot}_{2D}
 \left(
-p_{\mathrm{target\_lane}}-P_{\mathrm{route}}(0),\
-r_{\mathrm{route}}(0)
+p_{\mathrm{target\_lane}}-C(s_{\mathrm{start}}),\
+r(s_{\mathrm{start}})
 \right)
 $$
 
@@ -1313,8 +1323,8 @@ $$
 $$
 d_0 = \operatorname{dot}_{2D}
 \left(
-p_{\mathrm{ego}}-P_{\mathrm{route}}(0),\
-r_{\mathrm{route}}(0)
+p_{\mathrm{ego}}-C(s_{\mathrm{start}}),\
+r(s_{\mathrm{start}})
 \right)
 $$
 
@@ -1334,15 +1344,15 @@ $$
 
 $$
 P_{\mathrm{ref}}(s)
-= P_{\mathrm{route}}(s)
-+ d_{\mathrm{avoid}}(s) r_{\mathrm{route}}(s)
+= C(s_{\mathrm{start}}+s)
++ d_{\mathrm{avoid}}(s) r(s_{\mathrm{start}}+s)
 $$
 
 其中：
 
-- `i_0` 为进入 `AVOID` 时的 `loop_route.last_index`。
-- `P_route(s)` 为真实路线上的插值点。
-- `r_route(s)` 为路线中心线前后差分得到的平滑道路右向单位向量。
+- $s_{\mathrm{start}}=\texttt{loop\_route.last\_index}\cdot\texttt{loop\_route.step\_distance}$。
+- $C(s)$ 为 `SmoothRouteReference` 通过累计弧长和 `CubicSpline` 得到的平滑路线参考线。
+- $r(s)$ 为平滑参考线导数得到的道路右向单位向量。
 - `d_0` 为进入 `AVOID` 时自车相对避障起点路线点的道路右向距离。
 - `d_1` 为目标邻道中心相对避障起点路线点的道路右向距离。
 - `L` 为换道纵向长度，当前由候选轨迹选择器在一组长度中筛选得到。
@@ -1539,14 +1549,14 @@ $$
 
 如果 $\mathcal{T}_{\mathrm{valid}}$ 为空，状态机不强行进入 `AVOID`，而是进入或保持 `EMERGENCY_BRAKE`。
 
-`RouteOffsetLaneChangeTrajectory.to_local()` 使用当前车辆位置到最近路线点的弧长差作为进度，并使用最近路线点处的平滑道路右向量计算车辆相对真实路线的横向避障量：
+`RouteOffsetLaneChangeTrajectory.to_local()` 使用 `SmoothRouteReference.project()` 在当前避障起点前后搜索平滑参考线上的最近弧长位置 $s^*$，再用该点的右向法向量计算车辆相对真实路线的横向避障量：
 
 $$
 d_{\mathrm{local}}
 = \operatorname{dot}_{2D}
 \left(
-p-P_{\mathrm{nearest\ route}},\
-r_{\mathrm{route}}(s_{\mathrm{nearest}})
+p-C(s^*),\
+r(s^*)
 \right)
 $$
 
@@ -1602,11 +1612,17 @@ $$
 
 $$
 \psi_{\mathrm{ref}}
-= \psi_{\mathrm{route}}(s)
+= \psi_{\mathrm{route}}(s_{\mathrm{start}}+s)
 + \arctan\left(\frac{d d_{\mathrm{avoid}}}{ds}\right)
 $$
 
-当前路线相对轨迹的实际代码使用最终参考点的有限差分计算参考航向，使参考航向与叠加后的真实轨迹一致：
+其中：
+
+$$
+\psi_{\mathrm{route}}(s)=\operatorname{atan2}(f'_y(s), f'_x(s))
+$$
+
+当前路线相对轨迹的实际代码使用平滑参考点叠加横向偏移后的最终轨迹有限差分计算参考航向，使参考航向与实际跟踪轨迹一致：
 
 $$
 \psi_{\mathrm{ref}}(s)
@@ -1628,13 +1644,13 @@ $$
 弯道避障不再使用触发瞬间固定直角坐标系生成整段轨迹。当前采用 `RouteOffsetLaneChangeTrajectory`：
 
 ```text
-LoopRoute 真实路线 + 每个路线点道路右方向五次横向增量
+SmoothRouteReference 平滑路线 + 连续道路右方向五次横向增量
 ```
 
 这样做的目的：
 
 - 保留道路本身的转弯方向。
-- 当右侧邻道可用时，先保留真实路线本身的弯曲，再把五次避障增量沿路线点自身的道路右方向叠加。
+- 当右侧邻道可用时，先保留真实路线本身的弯曲，再把五次避障增量沿平滑路线导数得到的道路右方向叠加。
 - 弯道第二次避障与直道第一次避障共用同一套 `AVOID` 状态和 MPC 跟踪接口。
 - 避障完成后回到 `ROUTE_FOLLOW`，继续沿固定路线行驶。
 
@@ -2323,4 +2339,15 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：当前 `FrontReferencePath` 使用采样线段和车辆中心点投影，尚未投影车辆四角占据区域；AVOID 中途重规划虽然有冷却和最小进度限制，但本次固定场景没有出现 `Avoidance replanned` 日志，仍需要后续用更密集交通流验证重规划分支；雷达模式默认关闭，尚未验证雷达开启时与临时参考轨迹的关系；pygame 画面观感仍建议人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`3c10c4a`。
+- PR/分支信息：本地待提交，尚未推送。
+
+### 2026-06-10 - 使用样条平滑路线与轨迹投影
+
+- 本次目标：减少弯道避障轨迹由离散 waypoint 和分段线性参考线造成的折线感，并让车辆在路线/轨迹坐标中的位置确定也统一使用平滑参考线投影。
+- 主要改动：在 `utils.py` 新增公共 `SmoothRouteReference`，按离散路线点或临时轨迹点计算累计弧长，并使用 `scipy.interpolate.CubicSpline` 拟合 $x(s)$、$y(s)$、$z(s)$；`RouteOffsetLaneChangeTrajectory` 改为从平滑参考线读取位置、切向量和右向法向量；`to_local()` 改为在平滑参考线上搜索投影位置；候选轨迹起点偏移和目标邻道中心偏移也统一使用平滑参考线；`perception.py` 的原始 `LoopRoute` 前车投影改为使用同一平滑参考线的 `route_s/d`，`FrontReferencePath` 也为 AVOID 联合参考轨迹构造平滑参考线；Windows 下直接运行 `python.exe` 时自动补充当前 Conda 环境的 `Library\bin`，避免 scipy/numpy DLL 加载失败；同步更新本文档中的轨迹公式。
+- 为什么这样改：单纯加密 waypoint 仍可能保留分段折线方向变化；使用弧长参数化样条后，参考线位置和法向量连续，五次横向偏移叠加到弯道上时更接近连续 Frenet 轨迹。同时，感知层和控制层使用同一类投影口径，可以减少“生成轨迹很平滑，但判断车辆位置仍按折线算”的不一致。
+- 如何验证：已通过 `conda install -n carla_env scipy=1.7.3 -y` 安装 scipy；已确认补充 `Library\bin` 后 `scipy 1.7.3` 可导入；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\utils.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\guiji.py`，语法检查通过。本次按要求未实跑 CARLA。
+- 未覆盖风险：尚未在 pygame/CARLA 画面中人工确认弯道轨迹观感；当前投影搜索是沿样条采样近似最近点，尚未实现严格连续优化投影；`FrontReferencePath` 的平滑参考线由避障轨迹采样点拟合而来，采样密度仍会影响细节。
+- 需要 reviewer 重点看的文件：`dazuoye/utils.py`、`dazuoye/control.py`、`dazuoye/perception.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`1af2788`。
 - PR/分支信息：本地待提交，尚未推送。
