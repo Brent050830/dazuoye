@@ -1,14 +1,6 @@
-"""虚拟感知与风险评估模块。
-
-维护约定：
-- FrontVehicleReading / RightSideObjectReading / RiskAssessment 数据类
-  的字段变更必须同步更新 PROGRAM_FRAMEWORK.md 第 8、9 节。
-- 风险阈值参数统一维护在 config.py 中。
-"""
-
-from dataclasses import dataclass, field
 import math
 import random
+from dataclasses import dataclass
 
 import carla
 
@@ -19,24 +11,23 @@ from config import (
     FRONT_LANE_ADJACENT_THRESHOLD,
     FRONT_LANE_SAME_THRESHOLD,
     FRONT_TOP_K,
-        HYBRID_MATCH_RADIUS,
-        HYBRID_PERCEPTION_MODE,
         LANE_CLEAR_FRONT,
     LANE_CLEAR_REAR,
     MISS_DETECTION_PROB,
-        RADAR_CLUSTER_RADIUS,
+    HYBRID_MATCH_RADIUS,
+    HYBRID_PERCEPTION_MODE,
+    RADAR_CLUSTER_RADIUS,
     RADAR_ENABLED,
-    RADAR_FOV_HORIZONTAL_DEG,
     RADAR_MIN_DISTANCE,
     RADAR_MIN_POINTS_PER_CLUSTER,
-    RADAR_RANGE,
     RIGHT_CONFIRM_FRAMES,
-    RIGHT_CONFLICT_FRONT_ANGLE_DEG,
-    RIGHT_CONFLICT_MAX_DISTANCE,
-    RIGHT_CONFLICT_MIN_LATERAL,
-    RIGHT_CONFLICT_MAX_LATERAL,
+    RIGHT_OBJECT_DETECT_DISTANCE,
+    RIGHT_OBJECT_LATERAL_MAX,
+    RIGHT_OBJECT_LATERAL_MIN,
+    RIGHT_OBJECT_LONGITUDINAL_MAX,
+    RIGHT_OBJECT_LONGITUDINAL_MIN,
     RIGHT_OBJECT_STOP_DISTANCE,
-    RIGHT_PREDICTION_SECONDS,
+    RIGHT_OBJECT_TTC_THRESHOLD,
     SAFE_DISTANCE,
     SENSOR_NOISE_ENABLED,
     SIDE_DETECTION_RANGE,
@@ -52,59 +43,56 @@ from utils import dot_2d, same_direction_lane, vector_length
 
 @dataclass
 class FrontVehicleReading:
-    """前车感知数据结构。
-    维护约定：新增字段时必须同步更新 PROGRAM_FRAMEWORK.md 第 8.1 节。
-    """
-    distance: float          # 纵向间距（米），正值表示在前方
-    closing_speed: float     # 接近速度（m/s），正值表示靠近
-    ttc: float               # 碰撞时间（秒）
-    lateral_offset: float    # 横向偏移（米），正值表示在右侧
-    lane_relative_lateral: float = 0.0   # 横向偏移占车道宽度的比例，范围约 (-1, 1)
-    is_front_vehicle: bool = False       # 是否确认为正前方车辆（同车道或邻车道前方）
-    is_same_lane: bool = False           # 是否明确在同一车道
-    risk_level: int = 0                  # 0=无风险, 1=注意, 2=警告, 3=危险
+    """前车感知数据结构。"""
+
+    distance: float
+    closing_speed: float
+    ttc: float
+    lateral_offset: float
+    is_front_vehicle: bool
     actor_id: int = None
     actor_role: str = ""
+    target_speed_along: float = 0.0
+    lane_relative_lateral: float = 0.0
+    is_same_lane: bool = True
+    risk_level: int = 0
 
 
 @dataclass
 class RightSideObjectReading:
-    """右侧非机动车/行人目标的虚拟感知数据。
-    维护约定：新增字段时必须同步更新 PROGRAM_FRAMEWORK.md 第 8.2 节。
-    """
-    distance: float            # 欧氏距离（米）
-    ttc: float                 # 基于径向接近速度的 TTC（秒）
-    relative_longitudinal: float = 0.0  # 自车坐标系下的纵向相对位置（米）
-    relative_lateral: float = 0.0       # 自车坐标系下的横向相对位置（米），正值表示右侧
-    is_conflict_object: bool = False    # 是否处于冲突窗口
-    risk_level: int = 0                 # 0=无风险, 1=注意, 2=警告, 3=危险
-    is_moving_toward_conflict: bool = False  # 是否朝冲突区域移动
-    predicted_ttc: float = float("inf")     # 基于运动预测的 TTC（秒）
-    object_type: str = ""                   # "bicycle" / "pedestrian"
+    """右侧非机动车/行人目标的虚拟感知数据。"""
+
+    distance: float
+    ttc: float
+    is_conflict_object: bool = False
+    actor_id: int = None
+    actor_role: str = ""
+    longitudinal: float = 0.0
+    lateral: float = 0.0
+    risk_level: int = 0
+    is_moving_toward_conflict: bool = False
+    predicted_ttc: float = float("inf")
+    object_type: str = ""
 
 
-@dataclass
-class RiskAssessment:
-    """统一的风险评估结果，供行为决策层使用。
-    维护约定：新增字段时必须同步更新 PROGRAM_FRAMEWORK.md 第 9 节。
-    """
-    primary_risk_type: str = "none"   # "front" / "right_object" / "none"
-    primary_risk_level: int = 0       # 0~3
-    front_brake_needed: bool = False          # 前车需要制动
-    front_emergency_needed: bool = False      # 前车需要紧急避障
-    front_emergency_recovered: bool = False   # 紧急制动是否已恢复
-    right_object_yield_needed: bool = False   # 右侧目标需要减速让行
-    right_object_stop_needed: bool = False    # 右侧目标需要停车
-    front_reading: FrontVehicleReading = field(default_factory=FrontVehicleReading)
-    right_reading: RightSideObjectReading = field(default_factory=RightSideObjectReading)
+class FrontReferencePath:
+    """A temporary path used by front-vehicle perception during avoidance."""
+
+    def __init__(self, points):
+        self.points = list(points)
+        self.cumulative = [0.0]
+        for before, after in zip(self.points, self.points[1:]):
+            self.cumulative.append(self.cumulative[-1] + before.distance(after))
+
+    @property
+    def is_valid(self):
+        return len(self.points) >= 2 and self.cumulative[-1] > 0.1
 
 
-# ===================== 虚拟传感器模块 =====================
+# ===================== 虚拟/雷达融合感知模块 =====================
 
 class VirtualGroundTruthSensor:
-    """虚拟真值传感器：直接从仿真引擎读取精确状态，供决策与控制使用。
-    注意：此传感器无噪声和延迟，仅用于算法验证阶段，后续可替换为雷达/激光雷达感知。
-    """
+    """虚拟真值传感器，可选叠加噪声/FOV/漏检和 CARLA 前向雷达点云。"""
 
     def __init__(
         self,
@@ -114,6 +102,7 @@ class VirtualGroundTruthSensor:
         lead_vehicle,
         front_extra_vehicles=None,
         right_object_scenarios=None,
+        loop_route=None,
     ):
         self.world = world
         self.carla_map = carla_map
@@ -121,284 +110,93 @@ class VirtualGroundTruthSensor:
         self.lead = lead_vehicle
         self.front_extra_vehicles = front_extra_vehicles or []
         self.right_object_scenarios = right_object_scenarios or []
-
-                        # 右侧目标连续确认计数器
+        self.loop_route = loop_route
         self._right_confirm_count = 0
         self._right_confirm_frames = RIGHT_CONFIRM_FRAMES
-
-        # 噪声随机数生成器（固定种子确保可重复）
         self._noise_rng = random.Random(20260606)
+        self._radar_detections = []
+        self._side_radar_detections = []
+        self._camera_classifications = []
+        self._front_reference_path = None
 
-                # 前向雷达缓冲区（由 guiji.py 中的 radar callback 填充）
-        self._radar_detections = []  # list of carla.RadarDetection
-
-        # 右侧雷达缓冲区（由 guiji.py 中的 side_radar_callback 填充）
-        self._side_radar_detections = []  # list of carla.RadarDetection
-
-    # ========= 传感器模拟辅助方法 =========
+    def _empty_front(self):
+        return FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
 
     def _add_noise(self, value, std):
-        """给测量值叠加高斯噪声。
-        
-        用 Box-Muller 方法生成高斯随机数，避免依赖 numpy。
-        """
+        """给测量值叠加固定随机种子的高斯噪声。"""
         if not SENSOR_NOISE_ENABLED or std <= 0.0:
             return value
-        u1 = self._noise_rng.random()
+        u1 = max(self._noise_rng.random(), 1e-10)
         u2 = self._noise_rng.random()
-        # 避免 log(0)
-        if u1 <= 0.0:
-            u1 = 1e-10
         z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
         return value + z * std
 
+    def _should_miss_detect(self, distance):
+        """模拟远距离目标漏检。"""
+        if not SENSOR_NOISE_ENABLED or distance <= 50.0:
+            return False
+        return self._noise_rng.random() < MISS_DETECTION_PROB
+
     def _check_front_fov(self, longitudinal, lateral):
-        """检查目标是否在前向传感器 FOV 内。
-        
-        返回 True 表示可检测。
-        """
+        """检查前向目标是否处于前视 FOV。"""
         if not SENSOR_NOISE_ENABLED:
             return True
-        if longitudinal <= 0.0:
-            return False
-        if longitudinal > FRONT_DETECTION_RANGE:
+        if longitudinal <= 0.0 or longitudinal > FRONT_DETECTION_RANGE:
             return False
         angle = abs(math.degrees(math.atan2(abs(lateral), longitudinal)))
         return angle <= FRONT_FOV_HALF_ANGLE_DEG
 
     def _check_side_fov(self, longitudinal, lateral):
-        """检查目标是否在侧向传感器 FOV 内。
-        
-        侧向 FOV 定义：目标在自车右侧（lateral > 0）且在角度范围内。
-        """
+        """检查右侧目标是否处于侧向 FOV。"""
         if not SENSOR_NOISE_ENABLED:
             return True
-        distance = math.sqrt(longitudinal**2 + lateral**2)
-        if distance > SIDE_DETECTION_RANGE:
-            return False
-        if lateral <= 0.0:
+        distance = math.sqrt(longitudinal * longitudinal + lateral * lateral)
+        if distance > SIDE_DETECTION_RANGE or lateral <= 0.0:
             return False
         angle = abs(math.degrees(math.atan2(longitudinal, lateral)))
         return angle <= SIDE_FOV_HALF_ANGLE_DEG
 
-    def _should_miss_detect(self, distance):
-        """根据距离决定是否模拟漏检。
-        
-        仅对超出 50m 的目标有概率漏检。
-        """
-        if not SENSOR_NOISE_ENABLED:
-            return False
-        if distance <= 50.0:
-            return False
-        return self._noise_rng.random() < MISS_DETECTION_PROB
-
-        # ========= 雷达传感器方法 =========
-
     def set_radar_detections(self, detections):
-        """接收来自 CARLA 雷达传感器的原始检测点云。
+        """接收 CARLA radar callback 的原始点云。"""
+        self._radar_detections = list(detections)
 
-        由 guiji.py 中的 radar callback 调用，每帧填充一次。
+    def set_front_reference_points(self, points):
+        """Set a temporary path for front-vehicle perception."""
+        path = FrontReferencePath(points)
+        self._front_reference_path = path if path.is_valid else None
 
-        Args:
-            detections: list of carla.RadarDetection
-                """
-        self._radar_detections = detections
+    def clear_front_reference_points(self):
+        """Return front-vehicle perception to the normal route reference."""
+        self._front_reference_path = None
 
-    def set_side_radar_detections(self, detections):
-        """接收来自 CARLA 右侧雷达传感器的原始检测点云。
+    def front_vehicle(self, use_route_reference=True):
+        """兼容旧接口：返回前方最近同车道车辆。"""
+        readings = self.front_vehicles(use_route_reference=use_route_reference)
+        for reading in readings:
+            if reading.is_front_vehicle and reading.is_same_lane:
+                return reading
+        return self._empty_front()
 
-        由 guiji.py 中的 side_radar_callback 调用，每帧填充一次。
-        当前作为占位符，存储但不处理。
-
-        Args:
-            detections: list of carla.RadarDetection
-        """
-        self._side_radar_detections = detections
-
-    def _process_radar_detections(self, ego_tf, ego_velocity):
-        """将 CARLA 雷达原始点云聚类为目标列表。
-
-        简单欧氏距离聚类（无需 numpy）：
-        1. 按距离升序排序检测点
-        2. 对每个点，找最近的聚类中心，若距离 < RADAR_CLUSTER_RADIUS 则合并
-        3. 每个聚类取中心位置和平均速度
-        4. 过滤点数不足 RADAR_MIN_POINTS_PER_CLUSTER 的聚类
-
-        Returns:
-            list of FrontVehicleReading，按距离排序
-        """
-        if not self._radar_detections:
-            return []
-
-        forward = ego_tf.get_forward_vector()
-        right = ego_tf.get_right_vector()
-
-        # 步骤 1: 将每个检测点转换为自车坐标系 (longitudinal, lateral, speed)
-        points = []
-        for det in self._radar_detections:
-            # det.depth 是径向距离，det.azimuth 是水平角 (rad)
-            depth = det.depth
-            azimuth = det.azimuth
-            # 转换为自车坐标系
-            longitudinal = depth * math.cos(azimuth)
-            lateral = depth * math.sin(azimuth)
-            # 径向速度（正值远离，负值接近）
-            radial_velocity = det.velocity
-            points.append({
-                "longitudinal": longitudinal,
-                "lateral": lateral,
-                "radial_velocity": radial_velocity,
-            })
-
-        # 步骤 2: 按纵向距离排序
-        points.sort(key=lambda p: p["longitudinal"])
-
-        # 步骤 3: 聚类
-        clusters = []  # 每个聚类: list of point dicts
-        for point in points:
-            # 找最近的聚类
-            best_cluster = None
-            best_dist = float("inf")
-            for cluster in clusters:
-                # 用聚类中心点距离作为代表
-                center = cluster[0]
-                dist = math.sqrt(
-                    (point["longitudinal"] - center["longitudinal"])**2
-                    + (point["lateral"] - center["lateral"])**2
-                )
-                if dist < best_dist:
-                    best_dist = dist
-                    best_cluster = cluster
-
-            if best_dist < RADAR_CLUSTER_RADIUS and best_cluster is not None:
-                best_cluster.append(point)
-            else:
-                clusters.append([point])
-
-        # 步骤 4: 过滤点数不足的聚类
-        min_points = RADAR_MIN_POINTS_PER_CLUSTER if RADAR_ENABLED else 1
-        clusters = [c for c in clusters if len(c) >= min_points]
-
-        # 步骤 5: 每个聚类生成 FrontVehicleReading
-        ego_wp = self.carla_map.get_waypoint(ego_tf.location)
-        lane_width = max(ego_wp.lane_width, 2.5)
-        ego_speed_along = dot_2d(ego_velocity, forward)
-
-        # === 混合感知：收集上帝视角 Actor 用于身份匹配 ===
-        gt_actors = []
-        if HYBRID_PERCEPTION_MODE:
-            ego_loc = ego_tf.location
-            for actor in self.world.get_actors().filter("vehicle.*"):
-                if actor.id == self.ego.id or not actor.is_alive:
-                    continue
-                rel = actor.get_location() - ego_loc
-                a_long = dot_2d(rel, forward)
-                a_lat = dot_2d(rel, right)
-                if a_long > 0.0:
-                    gt_actors.append({
-                        "actor": actor,
-                        "longitudinal": a_long,
-                        "lateral": a_lat,
-                        "role": actor.attributes.get("role_name", actor.type_id),
-                    })
-
-        results = []
-        for cluster in clusters:
-            # 聚类中心
-            avg_long = sum(p["longitudinal"] for p in cluster) / len(cluster)
-            avg_lat = sum(p["lateral"] for p in cluster) / len(cluster)
-            avg_radial_vel = sum(p["radial_velocity"] for p in cluster) / len(cluster)
-
-            # 只保留前方的聚类
-            if avg_long <= 0.0:
-                continue
-
-            lane_relative = avg_lat / lane_width
-
-            # 只考虑同车道或邻车道的聚类
-            if abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
-                continue
-
-            # 接近速度：径向速度正值表示远离，所以 closing = -radial_velocity
-            # 再加上自车速度补偿（雷达测的是相对速度）
-            closing_speed = -avg_radial_vel
-            ttc = avg_long / closing_speed if closing_speed > 0.1 else float("inf")
-
-            is_same_lane = abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD
-
-            # 风险等级
-            risk_level = 0
-            if is_same_lane and avg_long < SAFE_DISTANCE:
-                if ttc < TTC_AVOID_THRESHOLD:
-                    risk_level = 3
-                elif ttc < TTC_BRAKE_THRESHOLD:
-                    risk_level = 2
-                elif avg_long < SAFE_DISTANCE * 0.6:
-                    risk_level = 1
-
-                        # === 混合感知：上帝视角身份匹配 ===
-            matched_id = None
-            matched_role = "radar_target"
-            if HYBRID_PERCEPTION_MODE and gt_actors:
-                best_match_dist = HYBRID_MATCH_RADIUS
-                for a in gt_actors:
-                    d = math.sqrt(
-                        (avg_long - a["longitudinal"]) ** 2
-                        + (avg_lat - a["lateral"]) ** 2
-                    )
-                    if d < best_match_dist:
-                        best_match_dist = d
-                        matched_id = a["actor"].id
-                        matched_role = a["role"]
-            
-            # 混合模式下：雷达聚类必须匹配到真实车辆才保留，否则视为杂波过滤掉
-            if HYBRID_PERCEPTION_MODE and matched_id is None:
-                continue
-            
-            results.append(FrontVehicleReading(
-                distance=avg_long,
-                closing_speed=closing_speed,
-                ttc=ttc,
-                lateral_offset=avg_lat,
-                lane_relative_lateral=lane_relative,
-                is_front_vehicle=True,
-                is_same_lane=is_same_lane,
-                risk_level=risk_level,
-                actor_id=matched_id,
-                actor_role=matched_role,
-            ))
-
-        # 按距离排序，取前 FRONT_TOP_K 个
-        results.sort(key=lambda r: r.distance)
-        return results[:FRONT_TOP_K]
-
-        # ==================================
-
-    def front_vehicles(self):
-        """返回前方同车道和邻车道的前 FRONT_TOP_K 个最近车辆。
-
-        当 RADAR_ENABLED=True 时，使用 CARLA 毫米波雷达点云作为数据源；
-        否则使用虚拟真值 + 噪声模拟。
-        """
-                # === 雷达模式 ===
+    def front_vehicles(self, use_route_reference=True):
+        """返回前方候选车辆列表，默认仍保留当前弧线参考逻辑。"""
+        if use_route_reference and self._front_reference_path is not None:
+            return self._reference_path_front_vehicles()
         if RADAR_ENABLED and self._radar_detections:
-            ego_tf = self.ego.get_transform()
-            radar_results = self._process_radar_detections(ego_tf, self.ego.get_velocity())
-            # 雷达结果为空时回退到虚拟真值（前车超出雷达稳定聚类范围等场景）
-            if radar_results:
-                return radar_results
-            # fall through to virtual ground truth below
+            return self._radar_front_vehicles()
+        if use_route_reference and self.loop_route is not None:
+            return self._route_front_vehicles()
+        return self._ego_frame_front_vehicles()
 
-        # === 虚拟真值模式（带回退） ===
+    def _ego_frame_front_vehicles(self):
+        """用自车当前直角坐标系读取前方车辆，作为无路线参考时的兜底方案。"""
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
         forward = ego_tf.get_forward_vector()
         right = ego_tf.get_right_vector()
-        ego_wp = self.carla_map.get_waypoint(ego_loc)
-        lane_width = max(ego_wp.lane_width, 2.5)
+        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
         ego_speed_along = dot_2d(self.ego.get_velocity(), forward)
 
-        candidates = []
+        readings = []
         for vehicle in [self.lead] + self.front_extra_vehicles:
             if vehicle is None or not vehicle.is_alive:
                 continue
@@ -407,73 +205,339 @@ class VirtualGroundTruthSensor:
             longitudinal = dot_2d(relative, forward)
             lateral = dot_2d(relative, right)
             lane_relative = lateral / lane_width
-
-                        # 只考虑前方且在邻车道范围内的车辆
             if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
                 continue
-
-            # === 传感器模拟：前向 FOV 和漏检 ===
             if not self._check_front_fov(longitudinal, lateral):
                 continue
-            raw_distance = math.sqrt(longitudinal**2 + lateral**2)
-            if self._should_miss_detect(raw_distance):
+            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
                 continue
 
             target_speed_along = dot_2d(vehicle.get_velocity(), forward)
-            raw_closing_speed = ego_speed_along - target_speed_along
-
-            # 叠加噪声
-            noisy_longitudinal = max(0.1, self._add_noise(longitudinal, DISTANCE_STD))
-            noisy_closing_speed = self._add_noise(raw_closing_speed, SPEED_STD)
-
-            ttc = noisy_longitudinal / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
-
-            # 判断车道归属（用去噪后的 longitudinal 但保留 noisy 距离用于风险评估）
-            is_same_lane = abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD
-
-            # 风险等级（基于噪声后的距离和 TTC）
-            risk_level = 0
-            if is_same_lane and noisy_longitudinal < SAFE_DISTANCE:
-                if ttc < TTC_AVOID_THRESHOLD:
-                    risk_level = 3  # 危险
-                elif ttc < TTC_BRAKE_THRESHOLD:
-                    risk_level = 2  # 警告
-                elif noisy_longitudinal < SAFE_DISTANCE * 0.6:
-                    risk_level = 1  # 注意
-
-            candidates.append(FrontVehicleReading(
-                distance=noisy_longitudinal,
-                closing_speed=noisy_closing_speed,
-                ttc=ttc,
-                lateral_offset=lateral,
-                lane_relative_lateral=lane_relative,
-                is_front_vehicle=True,
-                is_same_lane=is_same_lane,
-                risk_level=risk_level,
+            reading = self._make_front_reading(
+                distance=longitudinal,
+                closing_speed=ego_speed_along - target_speed_along,
+                lateral=lateral,
+                lane_relative=lane_relative,
+                is_same_lane=abs(lane_relative) < 0.65,
                 actor_id=vehicle.id,
                 actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
-            ))
+                target_speed_along=target_speed_along,
+            )
+            readings.append(reading)
 
-        # 按距离排序，取前 FRONT_TOP_K 个
-        candidates.sort(key=lambda r: r.distance)
-        return candidates[:FRONT_TOP_K]
+        readings.sort(key=lambda reading: reading.distance)
+        return readings[:FRONT_TOP_K]
 
-    def front_vehicle(self):
-        """兼容旧接口：返回前方最近车辆。
-        实际调用 front_vehicles() 取第一个。
-        """
-        results = self.front_vehicles()
-        if results:
-            return results[0]
-        return FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
+    def _route_front_vehicles(self):
+        """将车辆投影到当前路线局部弧线，用弧长 s 和横向 d 判断弯道前车。"""
+        ego_loc = self.ego.get_location()
+        ego_projection = self._project_to_route(ego_loc, self.loop_route.last_index, search_back=6, search_ahead=18)
+        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
+        ego_speed_along = self._speed_along_route(self.ego, ego_projection)
+        search_ahead = int((LANE_CLEAR_FRONT + 20.0) / self.loop_route.step_distance) + 8
+
+        readings = []
+        for vehicle in [self.lead] + self.front_extra_vehicles:
+            if vehicle is None or not vehicle.is_alive:
+                continue
+
+            target_projection = self._project_to_route(
+                vehicle.get_location(),
+                int(ego_projection["raw_index"]),
+                search_back=3,
+                search_ahead=search_ahead,
+            )
+            longitudinal = (target_projection["raw_index"] - ego_projection["raw_index"]) * self.loop_route.step_distance
+            lateral = target_projection["lateral"] - ego_projection["lateral"]
+            lane_relative = lateral / lane_width
+            if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
+                continue
+            if not self._check_front_fov(longitudinal, lateral):
+                continue
+            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
+                continue
+
+            target_speed_along = self._speed_along_route(vehicle, target_projection)
+            reading = self._make_front_reading(
+                distance=longitudinal,
+                closing_speed=ego_speed_along - target_speed_along,
+                lateral=lateral,
+                lane_relative=lane_relative,
+                is_same_lane=abs(lateral) < lane_width * 0.45,
+                actor_id=vehicle.id,
+                actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
+                target_speed_along=target_speed_along,
+            )
+            readings.append(reading)
+
+        readings.sort(key=lambda reading: reading.distance)
+        return readings[:FRONT_TOP_K]
+
+    def _reference_path_front_vehicles(self):
+        """Project front targets to the active path: avoidance path plus route continuation."""
+        path = self._front_reference_path
+        ego_loc = self.ego.get_location()
+        ego_projection = self._project_to_reference_path(ego_loc, path)
+        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
+        ego_speed_along = self._speed_along_reference_path(self.ego, ego_projection)
+
+        readings = []
+        for vehicle in [self.lead] + self.front_extra_vehicles:
+            if vehicle is None or not vehicle.is_alive:
+                continue
+
+            target_projection = self._project_to_reference_path(
+                vehicle.get_location(),
+                path,
+                anchor_s=ego_projection["s"],
+                search_back=12.0,
+                search_ahead=LANE_CLEAR_FRONT + 35.0,
+            )
+            longitudinal = target_projection["s"] - ego_projection["s"]
+            lateral = target_projection["lateral"] - ego_projection["lateral"]
+            lane_relative = lateral / lane_width
+            if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
+                continue
+            if not self._check_front_fov(longitudinal, lateral):
+                continue
+            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
+                continue
+
+            target_speed_along = self._speed_along_reference_path(vehicle, target_projection)
+            readings.append(
+                self._make_front_reading(
+                    distance=longitudinal,
+                    closing_speed=ego_speed_along - target_speed_along,
+                    lateral=lateral,
+                    lane_relative=lane_relative,
+                    is_same_lane=abs(lateral) < lane_width * 0.45,
+                    actor_id=vehicle.id,
+                    actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
+                    target_speed_along=target_speed_along,
+                )
+            )
+
+        readings.sort(key=lambda reading: reading.distance)
+        return readings[:FRONT_TOP_K]
+
+    def _make_front_reading(
+        self,
+        distance,
+        closing_speed,
+        lateral,
+        lane_relative,
+        is_same_lane,
+        actor_id=None,
+        actor_role="",
+        target_speed_along=0.0,
+    ):
+        noisy_distance = max(0.1, self._add_noise(distance, DISTANCE_STD))
+        noisy_closing_speed = self._add_noise(closing_speed, SPEED_STD)
+        ttc = noisy_distance / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
+        risk_level = 0
+        if is_same_lane and noisy_distance < SAFE_DISTANCE:
+            if ttc < TTC_AVOID_THRESHOLD:
+                risk_level = 3
+            elif ttc < TTC_BRAKE_THRESHOLD:
+                risk_level = 2
+            elif noisy_distance < SAFE_DISTANCE * 0.6:
+                risk_level = 1
+        return FrontVehicleReading(
+            distance=noisy_distance,
+            closing_speed=noisy_closing_speed,
+            ttc=ttc,
+            lateral_offset=lateral,
+            is_front_vehicle=is_same_lane,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            target_speed_along=target_speed_along,
+            lane_relative_lateral=lane_relative,
+            is_same_lane=is_same_lane,
+            risk_level=risk_level,
+        )
+
+    def _radar_front_vehicles(self):
+        """将 CARLA 雷达原始点云聚类为前方候选目标。"""
+        ego_tf = self.ego.get_transform()
+        ego_loc = ego_tf.location
+        right = ego_tf.get_right_vector()
+        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
+        ego_speed_along = dot_2d(self.ego.get_velocity(), ego_tf.get_forward_vector())
+
+        clusters = []
+        for detection in self._radar_detections:
+            longitudinal = detection.depth * math.cos(detection.azimuth)
+            lateral = detection.depth * math.sin(detection.azimuth)
+            if longitudinal <= 0.0:
+                continue
+            point = {"longitudinal": longitudinal, "lateral": lateral, "velocity": detection.velocity, "count": 1}
+            matched = None
+            for cluster in clusters:
+                dx = cluster["longitudinal"] - longitudinal
+                dy = cluster["lateral"] - lateral
+                if math.sqrt(dx * dx + dy * dy) < RADAR_CLUSTER_RADIUS:
+                    matched = cluster
+                    break
+            if matched is None:
+                clusters.append(point)
+            else:
+                count = matched["count"] + 1
+                matched["longitudinal"] = (matched["longitudinal"] * matched["count"] + longitudinal) / count
+                matched["lateral"] = (matched["lateral"] * matched["count"] + lateral) / count
+                matched["velocity"] = (matched["velocity"] * matched["count"] + detection.velocity) / count
+                matched["count"] = count
+
+        readings = []
+        for cluster in clusters:
+            if cluster["count"] < RADAR_MIN_POINTS_PER_CLUSTER:
+                continue
+            lane_relative = cluster["lateral"] / lane_width
+            if abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
+                continue
+            closing_speed = max(0.0, -cluster["velocity"])
+            target_speed_along = max(0.0, ego_speed_along - closing_speed)
+            readings.append(
+                self._make_front_reading(
+                    distance=cluster["longitudinal"],
+                    closing_speed=closing_speed,
+                    lateral=cluster["lateral"],
+                    lane_relative=lane_relative,
+                    is_same_lane=abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD,
+                    actor_role="radar_cluster",
+                    target_speed_along=target_speed_along,
+                )
+            )
+
+        readings.sort(key=lambda reading: reading.distance)
+        return readings[:FRONT_TOP_K]
+
+    def _project_to_route(self, location, anchor_index, search_back=5, search_ahead=24):
+        """把位置投影到路线局部窗口，返回浮点路线索引和相对路线的横向偏移。"""
+        last_segment = max(0, len(self.loop_route.points) - 2)
+        start = max(0, int(anchor_index) - search_back)
+        end = min(last_segment, int(anchor_index) + search_ahead)
+        best = None
+        for index in range(start, end + 1):
+            p0 = self.loop_route.points[index]
+            p1 = self.loop_route.points[index + 1]
+            segment = p1 - p0
+            segment_len_sq = max(dot_2d(segment, segment), 0.001)
+            to_location = location - p0
+            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
+            projected = carla.Location(
+                x=p0.x + segment.x * blend,
+                y=p0.y + segment.y * blend,
+                z=p0.z + segment.z * blend,
+            )
+            error = projected.distance(location)
+            if best is None or error < best["error"]:
+                raw_index = index + blend
+                right = self._route_right_at(raw_index)
+                best = {
+                    "raw_index": raw_index,
+                    "location": projected,
+                    "right": right,
+                    "lateral": dot_2d(location - projected, right),
+                    "error": error,
+                }
+        if best is not None:
+            return best
+
+        right = self._route_right_at(float(anchor_index))
+        return {
+            "raw_index": float(anchor_index),
+            "location": self.loop_route.points[int(anchor_index)],
+            "right": right,
+            "lateral": dot_2d(location - self.loop_route.points[int(anchor_index)], right),
+            "error": 0.0,
+        }
+
+    def _project_to_reference_path(self, location, path, anchor_s=None, search_back=20.0, search_ahead=90.0):
+        """Project a location to a sampled temporary reference path."""
+        best = None
+        for index in range(len(path.points) - 1):
+            s0 = path.cumulative[index]
+            s1 = path.cumulative[index + 1]
+            if anchor_s is not None and (s1 < anchor_s - search_back or s0 > anchor_s + search_ahead):
+                continue
+
+            p0 = path.points[index]
+            p1 = path.points[index + 1]
+            segment = p1 - p0
+            segment_len_sq = max(dot_2d(segment, segment), 0.001)
+            to_location = location - p0
+            blend = max(0.0, min(dot_2d(to_location, segment) / segment_len_sq, 1.0))
+            projected = carla.Location(
+                x=p0.x + segment.x * blend,
+                y=p0.y + segment.y * blend,
+                z=p0.z + segment.z * blend,
+            )
+            error = projected.distance(location)
+            if best is None or error < best["error"]:
+                segment_len = max(math.sqrt(segment_len_sq), 0.001)
+                tangent = carla.Vector3D(x=segment.x / segment_len, y=segment.y / segment_len, z=0.0)
+                right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+                best = {
+                    "s": s0 + (s1 - s0) * blend,
+                    "location": projected,
+                    "right": right,
+                    "lateral": dot_2d(location - projected, right),
+                    "error": error,
+                }
+
+        if best is not None:
+            return best
+
+        first = path.points[0]
+        second = path.points[1]
+        tangent = second - first
+        tangent_len = max(vector_length(tangent), 0.001)
+        tangent.x /= tangent_len
+        tangent.y /= tangent_len
+        right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+        return {
+            "s": 0.0,
+            "location": first,
+            "right": right,
+            "lateral": dot_2d(location - first, right),
+            "error": first.distance(location),
+        }
+
+    def _route_location_at_raw_index(self, raw_index):
+        lower = max(0, min(int(raw_index), len(self.loop_route.points) - 1))
+        upper = max(0, min(lower + 1, len(self.loop_route.points) - 1))
+        blend = max(0.0, min(raw_index - lower, 1.0))
+        p0 = self.loop_route.points[lower]
+        p1 = self.loop_route.points[upper]
+        return carla.Location(
+            x=p0.x + (p1.x - p0.x) * blend,
+            y=p0.y + (p1.y - p0.y) * blend,
+            z=p0.z + (p1.z - p0.z) * blend,
+        )
+
+    def _route_right_at(self, raw_index):
+        """由路线中心线前后差分得到平滑道路右向量。"""
+        look_index = 1.25
+        before = self._route_location_at_raw_index(raw_index - look_index)
+        after = self._route_location_at_raw_index(raw_index + look_index)
+        tangent = carla.Vector3D(x=after.x - before.x, y=after.y - before.y, z=0.0)
+        tangent_length = max(vector_length(tangent), 0.001)
+        tangent.x /= tangent_length
+        tangent.y /= tangent_length
+        return carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
+
+    def _speed_along_route(self, vehicle, projection):
+        right = projection["right"]
+        tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
+        return dot_2d(vehicle.get_velocity(), tangent)
+
+    def _speed_along_reference_path(self, vehicle, projection):
+        right = projection["right"]
+        tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
+        return dot_2d(vehicle.get_velocity(), tangent)
 
     def lane_clear(self, side):
-        """检测指定侧邻道在前后安全范围内是否无车。
-        增强说明：
-        - 复用前车感知数据避免重复遍历
-        - 在路口附近放宽 lane_id 精确匹配，改用方向一致性
-        - 检查邻道车辆相对速度，高速车辆即使距离近也可能不阻塞
-        """
+        """检测指定侧邻道在前后安全范围内是否无车。"""
         ego_wp = self.carla_map.get_waypoint(
             self.ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
         )
@@ -488,46 +552,18 @@ class VirtualGroundTruthSensor:
         for actor in self.world.get_actors().filter("vehicle.*"):
             if actor.id == self.ego.id:
                 continue
-
             actor_wp = self.carla_map.get_waypoint(
                 actor.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
             )
-
-            # 放宽路口附近的车道匹配：如果 road_id 相同且方向一致，视为同车道
-            same_road = actor_wp.road_id == target_wp.road_id
-            same_lane = actor_wp.lane_id == target_wp.lane_id
-            if not same_road:
+            if actor_wp.road_id != target_wp.road_id or actor_wp.lane_id != target_wp.lane_id:
                 continue
-            if not same_lane and not same_direction_lane(target_wp, actor_wp):
-                continue
-
-            relative = actor.get_location() - ego_loc
-            longitudinal = dot_2d(relative, forward)
-
-            if -LANE_CLEAR_REAR > longitudinal or longitudinal > LANE_CLEAR_FRONT:
-                continue
-
-            # 检查邻道车辆相对速度：如果邻道车辆速度明显快于自车，说明它在拉开距离
-            actor_speed_along = dot_2d(actor.get_velocity(), forward)
-            relative_speed = dot_2d(self.ego.get_velocity(), forward) - actor_speed_along
-            relative_speed_ahead = relative_speed  # 正值表示前车在远离
-
-            if relative_speed_ahead > 2.0 and longitudinal > 0:
-                continue  # 前车在加速远离，不阻塞
-
-            return False
-
+            longitudinal = dot_2d(actor.get_location() - ego_loc, forward)
+            if -LANE_CLEAR_REAR <= longitudinal <= LANE_CLEAR_FRONT:
+                return False
         return True
 
     def right_side_object(self, route_index):
-        """读取右侧非机动车目标，并判断其是否位于当前右转冲突窗口。
-        增强说明：
-        - 新增 relative_longitudinal / relative_lateral 输出
-        - 使用连续帧确认避免单帧误判
-        - 预测目标未来位置，判断是否趋向冲突区域
-        - 输出 object_type 区分自行车和行人
-        - 计算 risk_level：综合距离、TTC、是否进入冲突窗口
-        """
+        """读取右侧非机动车/行人目标，并判断其是否位于当前右转冲突窗口。"""
         best_conflict = None
         best_nearby = None
         for scenario in self.right_object_scenarios:
@@ -543,7 +579,6 @@ class VirtualGroundTruthSensor:
             ):
                 best_conflict = reading
 
-        # 连续帧确认
         if best_conflict is not None and best_conflict.is_conflict_object:
             self._right_confirm_count += 1
         else:
@@ -552,25 +587,12 @@ class VirtualGroundTruthSensor:
         result = best_conflict if best_conflict is not None else best_nearby
         if result is None:
             return RightSideObjectReading(float("inf"), float("inf"))
-
-        # 只有连续确认帧数达到阈值才标记为真正的冲突
         if result.is_conflict_object and self._right_confirm_count < self._right_confirm_frames:
-            # 返回数据但标记为非冲突，让调用方预览
-            return RightSideObjectReading(
-                distance=result.distance,
-                ttc=result.ttc,
-                relative_longitudinal=result.relative_longitudinal,
-                relative_lateral=result.relative_lateral,
-                is_conflict_object=False,
-                risk_level=min(result.risk_level, 1),
-                is_moving_toward_conflict=result.is_moving_toward_conflict,
-                predicted_ttc=result.predicted_ttc,
-                object_type=result.object_type,
-            )
+            result.is_conflict_object = False
+            result.risk_level = min(result.risk_level, 1)
         return result
 
     def _right_side_object_reading(self, scenario, route_index):
-        """计算单个右侧目标的感知读数。"""
         if scenario is None or scenario.actor is None:
             return None
 
@@ -583,170 +605,68 @@ class VirtualGroundTruthSensor:
 
         longitudinal = dot_2d(relative, forward)
         lateral = dot_2d(relative, right)
-        raw_distance = vector_length(relative)
-
-        # === 传感器模拟：侧向 FOV 和漏检 ===
-        if not self._check_side_fov(longitudinal, lateral):
-            return None
-        if self._should_miss_detect(raw_distance):
+        distance = vector_length(relative)
+        if not self._check_side_fov(longitudinal, lateral) or self._should_miss_detect(distance):
             return None
 
-        # 叠加噪声
-        noisy_distance = max(0.1, self._add_noise(raw_distance, DISTANCE_STD))
+        noisy_distance = max(0.1, self._add_noise(distance, DISTANCE_STD))
         noisy_longitudinal = self._add_noise(longitudinal, DISTANCE_STD)
         noisy_lateral = self._add_noise(lateral, DISTANCE_STD)
-
-        # 径向接近速度与 TTC（基于噪声距离）
-        to_object_len = max(noisy_distance, 0.1)
-        to_object = carla.Vector3D(
-            relative.x / to_object_len, relative.y / to_object_len, 0.0
-        )
+        to_object_length = max(distance, 0.1)
+        to_object = carla.Vector3D(relative.x / to_object_length, relative.y / to_object_length, 0.0)
         ego_velocity = self.ego.get_velocity()
-        raw_relative_vel = carla.Vector3D(
+        relative_speed = carla.Vector3D(
             ego_velocity.x - scenario.velocity.x,
             ego_velocity.y - scenario.velocity.y,
             ego_velocity.z - scenario.velocity.z,
         )
-        raw_closing_speed = dot_2d(raw_relative_vel, to_object)
-        noisy_closing_speed = self._add_noise(raw_closing_speed, SPEED_STD)
+        closing_speed = dot_2d(relative_speed, to_object)
+        noisy_closing_speed = self._add_noise(closing_speed, SPEED_STD)
         ttc = noisy_distance / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
 
-        # 判断目标类型
-        obj_type = ""
-        if scenario.is_walker:
-            obj_type = "pedestrian"
-        elif hasattr(scenario, "name") and "bicycle" in scenario.name:
-            obj_type = "bicycle"
-        elif scenario.actor.type_id.startswith("vehicle."):
-            obj_type = "bicycle"
+        object_type = ""
+        if getattr(scenario, "is_walker", False):
+            object_type = "pedestrian"
+        elif "bicycle" in getattr(scenario, "name", "") or scenario.actor.type_id.startswith("vehicle."):
+            object_type = "bicycle"
 
-                # 基础几何门限（使用去噪的原始位置判断，不受噪声影响）
         in_geometry_gate = (
-            -8.0 <= longitudinal <= RIGHT_CONFLICT_MAX_DISTANCE
-            and RIGHT_CONFLICT_MIN_LATERAL <= lateral <= RIGHT_CONFLICT_MAX_LATERAL
+            RIGHT_OBJECT_LONGITUDINAL_MIN <= longitudinal <= RIGHT_OBJECT_LONGITUDINAL_MAX
+            and RIGHT_OBJECT_LATERAL_MIN <= lateral <= RIGHT_OBJECT_LATERAL_MAX
         )
-
-        # 自车速度自适应调整检测距离
-        ego_speed = vector_length(ego_velocity)
-        dynamic_max_dist = RIGHT_CONFLICT_MAX_DISTANCE + max(0.0, ego_speed * 0.5)
-        in_dynamic_gate = (
-            -8.0 <= longitudinal <= dynamic_max_dist
-            and RIGHT_CONFLICT_MIN_LATERAL <= lateral <= RIGHT_CONFLICT_MAX_LATERAL
-        )
-
-        # 冲突窗口 + 几何门限
-        in_window = scenario.is_active and scenario.is_conflict_window(route_index)
-        is_conflict = in_window and in_dynamic_gate
-
-        # 预测判断：目标是否朝冲突区域移动（使用去噪原始位置和速度）
+        is_conflict = scenario.is_active and scenario.is_conflict_window(route_index) and in_geometry_gate
         is_moving_toward = False
         predicted_ttc = float("inf")
         if is_conflict:
-            obj_forward_speed = dot_2d(scenario.velocity, forward)
-            relative_long_speed = (ego_speed * 1.0) - obj_forward_speed
-            if relative_long_speed > 0.5 and longitudinal > 0:
+            ego_speed = vector_length(ego_velocity)
+            object_forward_speed = dot_2d(scenario.velocity, forward)
+            relative_long_speed = ego_speed - object_forward_speed
+            if relative_long_speed > 0.5 and longitudinal > 0.0:
                 is_moving_toward = True
-                closing_long = relative_long_speed
-                # predicted_ttc 叠加噪声
-                raw_predicted_ttc = longitudinal / closing_long if closing_long > 0.1 else float("inf")
-                predicted_ttc = self._add_noise(raw_predicted_ttc, 0.3) if raw_predicted_ttc != float("inf") else float("inf")
-            elif lateral > RIGHT_CONFLICT_MIN_LATERAL and lateral < 10.0:
+                predicted_ttc = longitudinal / relative_long_speed
+                predicted_ttc = self._add_noise(predicted_ttc, 0.3)
+            elif RIGHT_OBJECT_LATERAL_MIN < lateral < 10.0:
                 is_moving_toward = True
 
-        # 风险等级（基于噪声后的距离和 TTC）
         risk_level = 0
         if is_conflict:
-            if ttc < TTC_AVOID_THRESHOLD or (predicted_ttc < TTC_AVOID_THRESHOLD and is_moving_toward):
-                risk_level = 3  # 危险
-            elif ttc < TTC_BRAKE_THRESHOLD:
-                risk_level = 2  # 警告
-            elif noisy_distance < SAFE_DISTANCE:
-                risk_level = 1  # 注意
+            if ttc < RIGHT_OBJECT_TTC_THRESHOLD or predicted_ttc < TTC_AVOID_THRESHOLD:
+                risk_level = 3
+            elif noisy_distance < RIGHT_OBJECT_STOP_DISTANCE:
+                risk_level = 2
+            elif noisy_distance < RIGHT_OBJECT_DETECT_DISTANCE:
+                risk_level = 1
 
         return RightSideObjectReading(
             distance=noisy_distance,
             ttc=ttc,
-            relative_longitudinal=noisy_longitudinal,
-            relative_lateral=noisy_lateral,
             is_conflict_object=is_conflict,
+            actor_id=scenario.actor.id,
+            actor_role=getattr(scenario, "name", scenario.actor.type_id),
+            longitudinal=noisy_longitudinal,
+            lateral=noisy_lateral,
             risk_level=risk_level,
             is_moving_toward_conflict=is_moving_toward,
             predicted_ttc=predicted_ttc,
-            object_type=obj_type,
+            object_type=object_type,
         )
-
-    def assess_risk(self, route_index):
-        """统一风险评估：综合前车和右侧目标信息，输出 RiskAssessment。
-        维护约定：此方法封装了第 9 节中的风险判断逻辑。
-        如果修改风险判断条件，必须同步更新 PROGRAM_FRAMEWORK.md。
-        """
-        front_readings = self.front_vehicles()
-        right_reading = self.right_side_object(route_index)
-
-        # 主前车（最近同车道车辆）
-        front = front_readings[0] if front_readings else FrontVehicleReading(
-            float("inf"), 0.0, float("inf"), 0.0, False
-        )
-
-        # === 前车风险 ===
-        brake_needed = (
-            front.is_front_vehicle
-            and front.is_same_lane
-            and front.ttc < TTC_BRAKE_THRESHOLD
-        )
-        emergency_needed = (
-            front.is_front_vehicle
-            and front.is_same_lane
-            and front.distance < SAFE_DISTANCE
-            and front.ttc < TTC_AVOID_THRESHOLD
-        )
-        emergency_recovered = (
-            not front.is_front_vehicle
-            or not front.is_same_lane
-            or front.distance > SAFE_DISTANCE + 8.0
-            or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
-        )
-
-                # === 右侧目标风险 ===
-        # 放宽条件：恢复到与原来等效的"TTC < 阈值 或 距离 < 阈值"逻辑
-        # 同时保留 risk_level >= 3（危险）的硬触发
-        right_yield_needed = (
-            right_reading.is_conflict_object
-            and (
-                right_reading.risk_level >= 3
-                or (right_reading.risk_level >= 1 and right_reading.distance < 34.0)
-                or right_reading.ttc < 5.0
-            )
-        )
-        right_stop_needed = (
-            right_reading.is_conflict_object
-            and right_reading.risk_level >= 2
-            and right_reading.distance < RIGHT_OBJECT_STOP_DISTANCE
-        )
-
-        # === 优先级仲裁 ===
-        primary_type = "none"
-        primary_level = 0
-        if emergency_needed:
-            primary_type = "front"
-            primary_level = 3
-        elif right_yield_needed:
-            primary_type = "right_object"
-            primary_level = 2
-        elif brake_needed:
-            primary_type = "front"
-            primary_level = 2
-
-        return RiskAssessment(
-            primary_risk_type=primary_type,
-            primary_risk_level=primary_level,
-            front_brake_needed=brake_needed,
-            front_emergency_needed=emergency_needed,
-            front_emergency_recovered=emergency_recovered,
-            right_object_yield_needed=right_yield_needed,
-            right_object_stop_needed=right_stop_needed,
-            front_reading=front,
-            right_reading=right_reading,
-        )
-
-

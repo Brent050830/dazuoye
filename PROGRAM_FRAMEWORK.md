@@ -166,10 +166,10 @@ dazuoye/display.py
 - CARLA 连接和地图加载。
 - 自车与前车生成。
 - 前车急停。
-- 虚拟传感器。
+- 虚拟真值感知，并可选叠加噪声、FOV、漏检和前向毫米波雷达点云聚类。
 - TTC 计算。
-- 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的避障轨迹。
-- 采样式 MPC 跟踪，支持直线局部轨迹和路线相对轨迹两种代价计算。
+- 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的多候选避障轨迹。
+- 采样式 MPC 跟踪，当前主流程使用路线相对轨迹代价计算。
 - Town10 固定起点。
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
@@ -188,8 +188,8 @@ dazuoye/display.py
 ```text
 config.py       场景、路线、风险阈值和控制参数
 utils.py        通用数学、车辆速度和道路辅助函数
-perception.py   虚拟真值感知、前车与右侧目标风险读取
-control.py      真实路线叠加局部五次偏移避障轨迹、旧直线换道轨迹和采样式 MPC 跟踪
+perception.py   虚拟真值/雷达融合感知、前车与右侧目标风险读取
+control.py      真实路线叠加局部五次偏移候选轨迹、路径约束/代价选择和采样式 MPC 跟踪
 route.py        Town10 固定短路线、路线进度和转弯事件检测
 actors.py       自车、前车、背景车辆和非机动车生成与运动
 display.py      碰撞监测、CARLA 摄像头、pygame HUD 和显示窗口
@@ -224,21 +224,32 @@ TOWN10_ROUTE_STEP = 4.0
 ROUTE_COMPLETION_HOLD_SECONDS = 4.0
 RIGHT_OBJECT_TTC_THRESHOLD = 5.0
 RIGHT_OBJECT_DETECT_DISTANCE = 34.0
+RIGHT_OBJECT_STOP_DISTANCE = 13.0
+RIGHT_OBJECT_STOP_RELEASE_DISTANCE = 14.5
 RIGHT_OBJECT_YIELD_SPEED = 3.0
+RIGHT_OBJECT_LONGITUDINAL_MIN = -30.0
+RIGHT_OBJECT_LONGITUDINAL_MAX = 12.0
+RIGHT_OBJECT_LATERAL_MIN = -3.0
+RIGHT_OBJECT_LATERAL_MAX = 20.0
 RIGHT_OBJECT_R344_ANCHOR_BACK_STEPS = 6
-RIGHT_OBJECT_R344_RIGHT_OFFSET = 3.0
-RIGHT_OBJECT_R344_START_FORWARD_OFFSET = -8.0
-RIGHT_OBJECT_R344_END_FORWARD_OFFSET = 22.0
+RIGHT_OBJECT_R344_RIGHT_OFFSET = 2.4
+RIGHT_OBJECT_R344_START_FORWARD_OFFSET = -3.5
+RIGHT_OBJECT_R344_END_FORWARD_OFFSET = 42.0
 TRAFFIC_RANDOM_SEED = 20260602
 BACKGROUND_VEHICLE_ROUTE_INDICES = (32, 54, 76, 96, 108)
 BACKGROUND_VEHICLE_SPEED_MIN = 7.0
 BACKGROUND_VEHICLE_SPEED_MAX = 8.8
-BACKGROUND_BICYCLE_FORWARD_OFFSETS = (-42.0, -30.0, -18.0)
-BACKGROUND_BICYCLE_RIGHT_OFFSETS = (4.4, 1.8, 5.6)
-BACKGROUND_BICYCLE_END_FORWARD_OFFSET = 36.0
+BACKGROUND_VEHICLE_EGO_CLEARANCE = 18.0
+BACKGROUND_BICYCLE_FORWARD_OFFSETS = (-1.5,)
+BACKGROUND_BICYCLE_RIGHT_OFFSETS = (4.6,)
+BACKGROUND_BICYCLE_END_FORWARD_OFFSET = 48.0
 BACKGROUND_BICYCLE_SPEED_MIN = 2.6
 BACKGROUND_BICYCLE_SPEED_MAX = 4.3
-
+DEBUG_DRAW_TRAJECTORY = True
+DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
+DEBUG_DRAW_TRAJECTORY_STEP = 2.0
+DEBUG_DRAW_INTERVAL_FRAMES = 4
+DEBUG_DRAW_LIFETIME = 0.25
 # 传感器模拟参数（阶段一：噪声叠加层）
 SENSOR_NOISE_ENABLED = True
 FRONT_DETECTION_RANGE = 80.0          # 前向雷达最大检测距离 (米)
@@ -261,6 +272,11 @@ RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内雷达检测（过�
 # 混合感知参数
 HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角身份匹配；False: 纯雷达模式
 HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配的最大欧氏距离 (米)
+DEBUG_DRAW_TRAJECTORY = True
+DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
+DEBUG_DRAW_TRAJECTORY_STEP = 2.0
+DEBUG_DRAW_INTERVAL_FRAMES = 4
+DEBUG_DRAW_LIFETIME = 0.25
 ```
 
 后续加入场景开关时，可以再增加：
@@ -494,6 +510,8 @@ vehicle.lincoln.mkz_2020
 
 背景车辆不使用 Traffic Manager 自由自动驾驶，而是沿自车同一条 `LoopRoute` 做确定性路线进度推进。这样可以保证背景车路线与被控车一致，只通过初始位置和目标速度制造交通流差异。
 
+当前 `BackgroundRouteVehicle.update()` 会在背景车从后方接近自车到 `BACKGROUND_VEHICLE_EGO_CLEARANCE = 18.0m` 内时暂停脚本进度，避免右转让行等长时间停车工况中背景车按固定路线硬追尾自车。
+
 ### 7.4 右侧非机动车
 
 优先使用 CARLA 可用的两轮车蓝图，例如：
@@ -529,6 +547,15 @@ FrontVehicleReading
 RightSideObjectReading
 ```
 
+当前感知层仍以虚拟真值和路线参考线为主演示底座，但已经合入感知增强开关：
+
+- `SENSOR_NOISE_ENABLED`：对距离、接近速度和部分预测 TTC 叠加固定随机种子的高斯噪声。
+- 前向/侧向 FOV：目标超出视场角或检测距离时不返回。
+- 漏检模拟：远距离目标按固定概率漏检。
+- `RADAR_ENABLED`：为 `True` 时在自车前部挂载 CARLA `sensor.other.radar`，通过 `set_radar_detections()` 输入点云，并用简单欧氏距离聚类生成前方候选目标。
+
+当前默认 `RADAR_ENABLED = False`，原因是当前控制演示已经基于路线弧线虚拟感知完成验证；雷达聚类作为可启用增强能力保留，避免默认运行时突然改变前车识别稳定性。
+
 ### 8.1 前方车辆感知
 
 继续保留：
@@ -539,7 +566,112 @@ RightSideObjectReading
 - 横向偏移。
 - 是否为本车道前方车辆。
 
-当前 `perception.py` 中前车感知使用自车坐标系计算。设：
+当前 `guiji.py` 主流程统一调用 `sensor.front_vehicle(use_route_reference=True)`，但参考线会随状态变化：
+
+- `ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE` 使用 `LoopRoute` 原始路线弧线作为虚拟道路参考线传感器，把自车和目标投影到当前路线前方局部弧线上，得到沿路线弧长距离 $s$ 和横向偏移 $d$。
+- `AVOID` 使用当前避障轨迹加后续路线延伸得到的临时 `FrontReferencePath`。感知层把自车和目标投影到这条“正在计划/跟踪的联合轨迹”上，而不是只看原始路线或自车直线坐标系。
+
+这样，如果触发避障的旧目标已经被避障轨迹绕开，它相对联合轨迹的横向偏移会增大，不再反复触发同一碰撞走廊风险；如果避障轨迹前方又出现新的慢车/危险目标，仍会在联合轨迹坐标下被识别出来。
+
+当前前车判断使用的主动参考线可以写成：
+
+$$
+C_{\mathrm{active}}(s)=
+\begin{cases}
+C_{\mathrm{route}}(s), & \mathrm{state}\ne \mathrm{AVOID} \\
+C_{\mathrm{avoid}}(s), & \mathrm{state}= \mathrm{AVOID}
+\end{cases}
+$$
+
+其中 $C_{\mathrm{avoid}}(s)$ 来自 `RouteOffsetLaneChangeTrajectory.location_at(s)`，在换道长度之后横向偏移保持为目标车道偏移，因此它等价于“避障轨迹 + 目标车道上的后续路线延伸”。
+
+路线参考线模式可以理解为虚拟车道线/导航参考线传感器：目标位置和速度仍来自虚拟真值感知，但“前方”和“同车道”不再由自车当前直线 `forward/right` 一刀切判断，而是由前方道路局部弧线坐标判断。
+
+设 `LoopRoute` 局部弧线参考点为 $P_{\mathrm{route}}(i)$，自车和目标投影得到浮点路线索引：
+
+$$
+i_e = \operatorname{project}_{\mathrm{route}}(p_e)
+$$
+
+$$
+i_o = \operatorname{project}_{\mathrm{route}}(p_o)
+$$
+
+路线步长为 $\Delta s$，则前方目标沿路线弧长距离为：
+
+$$
+s_{\mathrm{front}} = (i_o - i_e)\Delta s
+$$
+
+路线右向单位向量由路线中心线前后差分得到：
+
+$$
+r_{\mathrm{route}}(i)
+=
+\begin{bmatrix}
+-T_y(i) \\
+T_x(i)
+\end{bmatrix}
+$$
+
+目标与自车相对参考线的横向差为：
+
+$$
+d_{\mathrm{front}} = d_o - d_e
+$$
+
+其中：
+
+$$
+d_e = \operatorname{dot}_{2D}(p_e-P_{\mathrm{route}}(i_e),\ r_{\mathrm{route}}(i_e))
+$$
+
+$$
+d_o = \operatorname{dot}_{2D}(p_o-P_{\mathrm{route}}(i_o),\ r_{\mathrm{route}}(i_o))
+$$
+
+当前只认为满足以下条件的目标是“同车道前方车辆”：
+
+$$
+s_{\mathrm{front}} > 0
+$$
+
+$$
+|d_{\mathrm{front}}| < 0.45w_{\mathrm{lane}}
+$$
+
+自车和目标车速度投影到各自路线切线方向：
+
+$$
+v_{e,\mathrm{route}} = \operatorname{dot}_{2D}(v_e,\ T_{\mathrm{route}}(i_e))
+$$
+
+$$
+v_{o,\mathrm{route}} = \operatorname{dot}_{2D}(v_o,\ T_{\mathrm{route}}(i_o))
+$$
+
+`FrontVehicleReading.target_speed_along` 保存的就是 $v_{o,\mathrm{route}}$。后续避障规划会用它估计慢前车在换道时间内继续前进的距离；急刹前车 `actor_role == "lead"` 时按静止障碍处理，避免把已经急停的目标错误外推。
+
+接近速度：
+
+$$
+v_{\mathrm{close}}
+= v_{e,\mathrm{route}} - v_{o,\mathrm{route}}
+$$
+
+TTC 计算：
+
+$$
+\mathrm{TTC}_{\mathrm{front}} =
+\begin{cases}
+\dfrac{s_{\mathrm{front}}}{v_{\mathrm{close}}}, & v_{\mathrm{close}} > 0.1 \\
+\infty, & v_{\mathrm{close}} \le 0.1
+\end{cases}
+$$
+
+这样在弯道上，即使两车几何连线与自车当前朝向不重合，只要目标沿道路局部弧线位于自车前方、横向偏移仍属于同一车道，就可以被提前识别为前方目标，避免等到距离很近才触发避障。
+
+如果没有传入 `LoopRoute`、没有临时 `FrontReferencePath`，或者调用方显式设置 `use_route_reference=False`，前车感知才使用自车坐标系兜底。设：
 
 $$
 p_e = \text{ego location},\quad
@@ -572,7 +704,7 @@ $$
 d = \operatorname{dot}_{2D}(\Delta p,\ r_e)
 $$
 
-当前只认为满足以下条件的目标是“同车道前方车辆”：
+自车坐标系兜底模式下，只认为满足以下条件的目标是“同车道前方车辆”：
 
 $$
 s > 0
@@ -616,7 +748,7 @@ $$
 = \arg\min_{o \in \mathcal{O}_{\mathrm{front}}} s_o
 $$
 
-当前 `FrontVehicleReading` 已保留 `actor_id` 和 `actor_role`，可用于区分 `lead`、慢速车和背景车角色；现阶段这些字段仅作为诊断信息和后续扩展入口，不参与避障触发条件或控制量计算。
+当前 `FrontVehicleReading` 已保留 `actor_id`、`actor_role`、`target_speed_along`、`lane_relative_lateral`、`is_same_lane` 和 `risk_level`。其中 `target_speed_along` 已用于慢车预测，`front_vehicles()` 保留为雷达/多目标候选读取入口；当前主状态机仍主要使用最近同车道前车的路线弧长距离、横向偏移、接近速度和 TTC。
 
 ### 8.2 右侧非机动车感知
 
@@ -628,6 +760,14 @@ class RightSideObjectReading:
     distance: float
     ttc: float
     is_conflict_object: bool
+    actor_id: int
+    actor_role: str
+    longitudinal: float
+    lateral: float
+    risk_level: int
+    is_moving_toward_conflict: bool
+    predicted_ttc: float
+    object_type: str
 ```
 
 重点不只是判断“在不在右侧”，还要判断：
@@ -644,7 +784,24 @@ class RightSideObjectReading:
 目标位置接近右转目标路径
 ```
 
-后续再升级为更稳定的轨迹预测和路口区域判定。
+当前已经加入连续帧确认与风险等级：
+
+$$
+\mathrm{right\_confirm\_count}
+\ge
+\mathrm{RIGHT\_CONFIRM\_FRAMES}
+$$
+
+满足连续确认后才把候选目标标记为真正冲突目标，降低单帧误触发。右侧目标风险等级当前为：
+
+```text
+0 = 无风险
+1 = 注意
+2 = 警告/需要停车让行
+3 = 危险
+```
+
+主状态机仍保留原有 `TTC/距离` 触发条件，同时允许 `risk_level >= 2` 触发右侧让行。
 
 当前右侧目标 TTC 使用目标相对自车的径向接近速度。设：
 
@@ -708,11 +865,11 @@ $$
 $$
 
 $$
--8.0 \le s_{\mathrm{right}} \le 34.0
+-30.0 \le s_{\mathrm{right}} \le 12.0
 $$
 
 $$
--14.0 \le d_{\mathrm{right}} \le 18.0
+-3.0 \le d_{\mathrm{right}} \le 20.0
 $$
 
 其中：
@@ -790,7 +947,7 @@ $$
 
 **Alpha-Beta 跟踪器（阶段五占位）：**
 
-`guiji.py` 中初始化 `AlphaBetaTracker`（当 `TRACKER_ENABLED=True`），每帧收集所有动态 Actor 作为检测输入，调用 `tracker.predict()` 和 `tracker.update()`。当前跟踪器为占位实现，尚未输出稳定 track 供决策层使用。
+`guiji.py` 中初始化 `AlphaBetaTracker`（当 `TRACKER_ENABLED=True`），每帧收集所有动态 Actor 作为检测输入，调用 `tracker.predict()` 和 `tracker.update()`。当前跟踪器为占位实现，尚未输出稳定 track 供决策层使
 
 ## 9. 风险评估层
 
@@ -826,13 +983,29 @@ $$
 \left(\mathrm{front.ttc} < \mathrm{TTC\_BRAKE\_THRESHOLD}\right)
 $$
 
+为了避免弯道前车被提前感知后只持续跟车制动、反而错过可用避障距离，当前还定义了“近距离慢前车”触发项：
+
+$$
+\mathrm{close\_slow\_front\_vehicle}
+=
+\mathrm{front.is\_front\_vehicle}
+\land
+\left(\mathrm{front.distance} < \mathrm{LANE\_CHANGE\_LENGTH} + 6.0\right)
+\land
+\left(\mathrm{front.closing\_speed} > 2.0\right)
+$$
+
 $$
 \mathrm{emergency\_needed}
 = \mathrm{front.is\_front\_vehicle}
 \land
 \left(\mathrm{front.distance} < \mathrm{SAFE\_DISTANCE}\right)
 \land
+\left[
 \left(\mathrm{front.ttc} < \mathrm{TTC\_AVOID\_THRESHOLD}\right)
+\lor
+\mathrm{close\_slow\_front\_vehicle}
+\right]
 $$
 
 `EMERGENCY_BRAKE` 恢复判定当前使用更宽的滞回阈值，避免紧急制动状态成为永久状态：
@@ -852,9 +1025,20 @@ $$
 TTC_BRAKE_THRESHOLD = 4.5 s
 TTC_AVOID_THRESHOLD = 3.6 s
 SAFE_DISTANCE = 34.0 m
+LANE_CHANGE_LENGTH = 28.0 m
 ```
 
 如果 `emergency_needed` 成立，程序再调用 `sensor.lane_clear("left")` 和 `sensor.lane_clear("right")` 判断邻道是否可用于换道。
+
+进入 `AVOID` 后，如果车辆已经横向绕开原车道目标，制动不再继续按同车道前车强制加大。当前横向分离判定为：
+
+$$
+\left|d_{\mathrm{current}}-d_0\right|
+>
+\min\left(1.4,\ 0.55\left|d_1-d_0\right|\right)
+$$
+
+其中 $d_0$ 为避障起点横向偏移，$d_1$ 为目标避障横向偏移。当该条件成立且感知层不再认为存在同车道前方目标时，`AVOID` 中的制动上限收敛到较小值，避免已经完成横向绕行后仍大力制动。
 
 邻道净空判断使用前后安全窗口：
 
@@ -902,10 +1086,11 @@ $$
 RIGHT_OBJECT_TTC_THRESHOLD = 5.0 s
 RIGHT_OBJECT_DETECT_DISTANCE = 34.0 m
 RIGHT_OBJECT_STOP_DISTANCE = 13.0 m
+RIGHT_OBJECT_STOP_RELEASE_DISTANCE = 14.5 m
 RIGHT_OBJECT_YIELD_SPEED = 3.0 m/s
 ```
 
-进入 `RIGHT_OBJECT_YIELD` 后，自车目标速度降为 `RIGHT_OBJECT_YIELD_SPEED`。如果右侧目标距离进一步小于 `RIGHT_OBJECT_STOP_DISTANCE`，则制动至少提升到：
+进入 `RIGHT_OBJECT_YIELD` 后，自车目标速度降为 `RIGHT_OBJECT_YIELD_SPEED`。如果右侧目标距离进一步小于 `RIGHT_OBJECT_STOP_DISTANCE`，则激活硬刹停标志 `right_object_stop_active`，制动至少提升到：
 
 $$
 \mathrm{brake} = \max(\mathrm{brake},\ 0.85)
@@ -914,6 +1099,29 @@ $$
 $$
 \mathrm{throttle} = 0.0
 $$
+
+硬刹停释放使用距离滞回，只有当当前右侧目标距离大于 `RIGHT_OBJECT_STOP_RELEASE_DISTANCE` 后才关闭 `right_object_stop_active`，避免目标距离在 13m 附近波动时反复刹停：
+
+$$
+\begin{cases}
+\mathrm{stop\_active} \leftarrow \mathrm{True}, & d_{\mathrm{right}} < 13.0 \\
+\mathrm{stop\_active} \leftarrow \mathrm{False}, & d_{\mathrm{right}} > 14.5 \\
+\mathrm{stop\_active}\ \mathrm{保持不变}, & \text{otherwise}
+\end{cases}
+$$
+
+此外，`RIGHT_OBJECT_YIELD` 不再在单帧 `right_object_risk == False` 时立即退出。当前代码使用 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s` 做连续清空确认：
+
+$$
+\mathrm{right\_clear\_confirmed}
+=
+\left(t_{\mathrm{sim}} - t_{\mathrm{right\_clear\_since}}\right)
+\ge 2.0
+$$
+
+在清空确认期间仍保持停车制动，避免右侧目标在行人/自行车之间切换、短暂漏检或返回 `none` 时自车过早起步。
+
+右侧目标读取现在会携带 `actor_id`、`actor_role`、相对纵向距离和相对横向距离。运行日志会输出右侧让行目标切换，便于判断“再次刹车”是重复进入状态，还是同一 `RIGHT_OBJECT_YIELD` 状态内由不同右侧目标接管。
 
 风险评估层应输出给行为决策层：
 
@@ -961,10 +1169,10 @@ $$
 
 | 状态 | 进入条件 | 退出条件 |
 | --- | --- | --- |
-| `ROUTE_FOLLOW` | 初始状态；`AVOID` 完成后回到该状态；`RIGHT_OBJECT_YIELD` 风险解除后也回到该状态。 | 若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}\ne\mathrm{None}$，进入 `AVOID`；若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}=\mathrm{None}$，进入 `EMERGENCY_BRAKE`；若 $\mathrm{right\_object\_risk}$ 且 $\neg\mathrm{right\_object\_yield\_done}$，进入 `RIGHT_OBJECT_YIELD`；若已完成路线并记录 `route_completion_time`，进入 `ROUTE_HOLD`。 |
-| `AVOID` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立，并且相邻车道存在可用避障方向；或 `EMERGENCY_BRAKE` 中风险仍存在但邻道重新可用。进入时基于 `loop_route.last_index`、目标邻道和车道宽度生成 `RouteOffsetLaneChangeTrajectory`。 | 若换道进度满足 $s_{\mathrm{traj}} > L_{\mathrm{lanechange}} + 2.0$ 且 $|d_{\mathrm{traj}} - D| < 0.65$，回到 `ROUTE_FOLLOW`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
-| `EMERGENCY_BRAKE` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立，但左右邻道均不可用。 | 若 $\mathrm{emergency\_recovered}$ 成立，回到 `ROUTE_FOLLOW`；若 $\mathrm{emergency\_needed}$ 仍成立但 $\mathrm{avoidance\_side}\ne\mathrm{None}$，重新生成避障轨迹并进入 `AVOID`；否则继续保持全制动。路线完成、碰撞、窗口关闭或仿真时间结束仍会提前终止主循环。 |
-| `RIGHT_OBJECT_YIELD` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{right\_object\_risk}$ 成立，并且 `right_object_yield_done == False`。 | 若 $\neg\mathrm{right\_object\_risk}$，回到 `ROUTE_FOLLOW`，并设置 `right_object_yield_done = True`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
+| `ROUTE_FOLLOW` | 初始状态；`AVOID` 完成后回到该状态；`RIGHT_OBJECT_YIELD` 风险解除后也回到该状态。 | 若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}\ne\mathrm{None}$，生成多条候选避障轨迹；若存在有效候选，进入 `AVOID`，否则进入 `EMERGENCY_BRAKE`；若 $\mathrm{emergency\_needed}$ 且 $\mathrm{avoidance\_side}=\mathrm{None}$，进入 `EMERGENCY_BRAKE`；若 $\mathrm{right\_object\_risk}$ 成立，进入 `RIGHT_OBJECT_YIELD`，不再用“一次完成”标志阻止同一目标或同类目标再次触发；若已完成路线并记录 `route_completion_time`，进入 `ROUTE_HOLD`。 |
+| `AVOID` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立、相邻车道存在可用避障方向，并且 `select_best_route_offset_trajectory()` 返回有效候选；或 `EMERGENCY_BRAKE` 中风险仍存在、邻道重新可用且候选轨迹约束通过。 | 避障过程中先用当前避障轨迹加后续路线生成 `FrontReferencePath`，若联合轨迹前方再次满足 $\mathrm{emergency\_needed}$，且目标切换或同目标仍然紧急，并通过 `AVOID_REPLAN_COOLDOWN_SECONDS` 与最小进度限制，则重新生成候选轨迹；若无法重规划且距离/TTC 已很紧，转入 `EMERGENCY_BRAKE`；若换道进度满足 $s_{\mathrm{traj}} > L_{\mathrm{lanechange}} + 2.0$ 且 $|d_{\mathrm{traj}} - D| < 0.65$，回到 `ROUTE_FOLLOW`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
+| `EMERGENCY_BRAKE` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{emergency\_needed}$ 成立，但左右邻道均不可用，或邻道存在但所有候选避障轨迹都不满足路径约束。 | 若 $\mathrm{emergency\_recovered}$ 成立，回到 `ROUTE_FOLLOW`；若 $\mathrm{emergency\_needed}$ 仍成立但 $\mathrm{avoidance\_side}\ne\mathrm{None}$，重新生成候选避障轨迹，存在有效候选时进入 `AVOID`；否则继续保持全制动。路线完成、碰撞、窗口关闭或仿真时间结束仍会提前终止主循环。 |
+| `RIGHT_OBJECT_YIELD` | 当前状态为 `ROUTE_FOLLOW`，且 $\mathrm{right\_object\_risk}$ 成立。 | 若 $\neg\mathrm{right\_object\_risk}$ 连续保持 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s`，清除 `right_object_stop_active` 和当前目标记录后回到 `ROUTE_FOLLOW`；清空确认期间继续保持停车制动，避免目标短暂丢失后过早起步；后续若同一目标或新的右侧目标再次满足风险条件，可以重新进入 `RIGHT_OBJECT_YIELD`；若 `route_completion_time` 已记录，进入 `ROUTE_HOLD`。 |
 | `ROUTE_HOLD` | `loop_route.update(ego_vehicle)` 判断完成一圈后，主循环记录 `route_completion_time`；下一轮控制计算中进入 `ROUTE_HOLD`。 | 保持停车控制，直到 $t_{\mathrm{sim}} - t_{\mathrm{route\_completion}} \ge \mathrm{ROUTE\_COMPLETION\_HOLD\_SECONDS}$ 后跳出主循环并清理。 |
 
 
@@ -1083,7 +1291,7 @@ FINISHED
 当前已有：
 
 ```python
-QuinticLaneChangeTrajectory
+RouteOffsetLaneChangeTrajectory
 SamplingMPCTracker
 ```
 
@@ -1105,21 +1313,27 @@ SamplingMPCTracker
 
 ### 11.2 前车急停避障轨迹
 
-当前主流程进入 `AVOID` 时使用 `RouteOffsetLaneChangeTrajectory`。它不再把整段避障轨迹固定成一条直线，而是保留 `LoopRoute` 的真实路线点作为道路弯曲基线，再沿每个路线点对应的道路右方向叠加五次多项式横向避障增量。
+当前主流程进入 `AVOID` 时使用 `RouteOffsetLaneChangeTrajectory`。它不再把整段避障轨迹固定成一条直线，而是保留 `LoopRoute` 的真实路线点作为道路弯曲基线，再沿路线中心线差分得到的平滑道路右方向叠加五次多项式横向避障增量。
 
-注意：当前横向偏移不是简单固定为一个车道宽。程序使用避障开始处路线点的道路右向量计算目标邻道中心偏移，并在轨迹上使用每个路线点自己的道路右向量叠加横向增量。这样弯道上横向偏移方向会随道路旋转，而不是固定在触发瞬间的自车右方向。
+注意：当前横向偏移不是简单固定为一个车道宽。程序使用避障开始处路线中心线差分右向量计算目标邻道中心偏移，并在轨迹上使用同一差分方法得到每个位置的平滑右向量叠加横向增量。这样弯道上横向偏移方向会随道路旋转，而不是固定在触发瞬间的自车右方向；同时避免直接使用相邻 waypoint 朝向跳变造成明显折线感。
 
-五次横向偏移仍为：
+五次横向偏移采用分段形式，避免在换道长度之后继续外推五次多项式：
 
 $$
-d(s) = D\left(10t^3 - 15t^4 + 6t^5\right)
+d_{\mathrm{avoid}}(s)
+=
+\begin{cases}
+d_0, & s \le 0 \\
+d_0 + (d_1-d_0)\left(10t^3 - 15t^4 + 6t^5\right), & 0 < s < L \\
+d_1, & s \ge L
+\end{cases}
 $$
 
 $$
 t = \frac{s}{L}
 $$
 
-用于快速完成横向避障。
+其中 $d_0$ 为避障开始时的横向偏移，$d_1$ 为目标邻道中心附近的横向偏移。也就是说，车辆在 $0<s<L$ 内完成横向换道；当 $s \ge L$ 后，参考横向偏移固定为 $d_1$，只沿目标车道继续向前行驶。
 
 设避障开始时的路线索引为：
 
@@ -1147,10 +1361,33 @@ $$
 \alpha = i(s)-\lfloor i(s)\rfloor
 $$
 
-路线点对应的道路右向单位向量为：
+路线点对应的道路右向单位向量不再直接取 CARLA waypoint yaw，而是由路线中心线前后差分得到。设平滑差分窗口为 $\Delta i = 1.25$：
+
+$$
+T_{\mathrm{route}}(s)
+=
+\frac{
+P_{\mathrm{route}}(i(s)+\Delta i)
+-
+P_{\mathrm{route}}(i(s)-\Delta i)
+}{
+\left\|
+P_{\mathrm{route}}(i(s)+\Delta i)
+-
+P_{\mathrm{route}}(i(s)-\Delta i)
+\right\|
+}
+$$
+
+则道路右向单位向量为：
 
 $$
 r_{\mathrm{route}}(s)
+=
+\begin{bmatrix}
+-T_y(s) \\
+T_x(s)
+\end{bmatrix}
 $$
 
 目标邻道中心横向偏移：
@@ -1173,11 +1410,16 @@ r_{\mathrm{route}}(0)
 \right)
 $$
 
-五次曲线的避障横向增量为：
+五次曲线的避障横向偏移与代码 `avoidance_delta_at(s)` 一致，写成分段形式为：
 
 $$
 d_{\mathrm{avoid}}(s)
-= d_0 + (d_1-d_0)b(t)
+=
+\begin{cases}
+d_0, & s \le 0 \\
+d_0 + (d_1-d_0)b(t), & 0 < s < L \\
+d_1, & s \ge L
+\end{cases}
 $$
 
 最终避障参考点为：
@@ -1192,16 +1434,204 @@ $$
 
 - `i_0` 为进入 `AVOID` 时的 `loop_route.last_index`。
 - `P_route(s)` 为真实路线上的插值点。
-- `r_route(s)` 为路线点对应的道路右向单位向量。
+- `r_route(s)` 为路线中心线前后差分得到的平滑道路右向单位向量。
 - `d_0` 为进入 `AVOID` 时自车相对避障起点路线点的道路右向距离。
 - `d_1` 为目标邻道中心相对避障起点路线点的道路右向距离。
-- `L` 为换道纵向长度，当前根据前方目标距离动态取值：
+- `L` 为换道纵向长度，当前由候选轨迹选择器在一组长度中筛选得到。
+
+当前 `guiji.py` 不再直接把基础长度和目标邻道中心固定成唯一轨迹，而是调用 `control.py` 中的 `select_best_route_offset_trajectory()` 生成候选集合。横向五次函数本身不引入时间变量，目标车速度主要用于拉伸候选轨迹的纵向尺度和安全约束。
+
+对于急刹前车，若 `actor_role == "lead"`，目标速度按 $0$ 处理：
 
 $$
-L = \max\left(14.0,\ \min\left(\texttt{LANE\_CHANGE\_LENGTH},\ d_{\mathrm{front}}+4.0\right)\right)
+v_{o,\mathrm{plan}} = 0
 $$
 
-`RouteOffsetLaneChangeTrajectory.to_local()` 使用当前车辆位置到最近路线点的弧长差作为进度，并使用最近路线点的道路右向量计算车辆相对真实路线的横向避障量：
+对于普通慢速前车，取路线方向目标速度：
+
+$$
+v_{o,\mathrm{plan}} = \max(0,\ v_{o,\mathrm{route}})
+$$
+
+先用当前前车距离和接近速度估计一个有限预测时间：
+
+$$
+t_{\mathrm{pred}}
+=
+\min\left(
+3.0,\
+\max\left(1.0,\ \frac{d_{\mathrm{front}}}{\max(v_{\mathrm{close}},0.1)}\right)
+\right)
+$$
+
+目标车预测前进距离为：
+
+$$
+\Delta s_o = v_{o,\mathrm{plan}} t_{\mathrm{pred}}
+$$
+
+基础长度为：
+
+$$
+L_0 =
+\max\left(
+14.0,\
+\min\left(52.0,\ \texttt{LANE\_CHANGE\_LENGTH}+\Delta s_o\right)
+\right)
+$$
+
+候选纵向长度集合为：
+
+$$
+\mathcal{L}
+=
+\left\{
+\operatorname{clamp}(\lambda L_0,\ 14.0,\ 56.0)
+\mid
+\lambda \in \{0.85,\ 1.00,\ 1.15,\ 1.30\}
+\right\}
+$$
+
+候选横向终点围绕目标邻道中心 $d_{\mathrm{center}}$ 生成。设目标侧方向为：
+
+$$
+\sigma =
+\begin{cases}
+1, & d_{\mathrm{center}} \ge d_0 \\
+-1, & d_{\mathrm{center}} < d_0
+\end{cases}
+$$
+
+候选终点集合为：
+
+$$
+\mathcal{D}
+=
+\left\{
+d_{\mathrm{center}} + \eta W_{\mathrm{lane}}\sigma
+\mid
+\eta \in \{-0.20,\ 0,\ 0.15\}
+\right\}
+$$
+
+并要求候选终点仍在目标车道中心附近：
+
+$$
+\left|d_1-d_{\mathrm{center}}\right|
+\le
+0.35 W_{\mathrm{lane}}
+$$
+
+对每一组 $(L,d_1)$，都构造一条 `RouteOffsetLaneChangeTrajectory`。因此当前避障入口处理的是候选轨迹集合：
+
+$$
+\mathcal{T}
+=
+\left\{
+T(L,d_1)
+\mid
+L \in \mathcal{L},\ d_1 \in \mathcal{D}
+\right\}
+$$
+
+路径约束包括：
+
+$$
+L \ge 14.0
+$$
+
+$$
+\left|d_1-d_{\mathrm{center}}\right|
+\le
+0.35 W_{\mathrm{lane}}
+$$
+
+$$
+a_{y,\max}
+=
+\frac{10\sqrt{3}\left|d_1-d_0\right|}{3t_e^2}
+\le 3.8\ \mathrm{m/s^2}
+$$
+
+其中：
+
+$$
+t_e = \frac{L}{\max(v_{\mathrm{ego}}, 4.0)}
+$$
+
+若前方车辆距离有限，还会在每条候选轨迹的预计换道时间 $t_e$ 内估计目标车继续前进的距离：
+
+$$
+d_{\mathrm{front,pred}}
+=
+d_{\mathrm{front}}
++ v_{o,\mathrm{plan}}t_e
+$$
+
+候选长度不能明显超过预测后的可用前向距离：
+
+$$
+L \le d_{\mathrm{front,pred}} + 6.0
+$$
+
+候选路径代价由安全性、舒适性、跟踪难度和终点居中误差组成：
+
+$$
+J = 4.0J_s + 2.0J_c + J_t + 0.6J_d
+$$
+
+安全性代价：
+
+$$
+J_s
+=
+\frac{\max(0,\ 0.75L-d_{\mathrm{front,pred}}+4.0)^2}{25.0}
++
+\max(0,\ t_e-\mathrm{TTC}_{\mathrm{front}}+0.4)^2
+$$
+
+舒适性代价：
+
+$$
+J_c
+=
+\left(\frac{a_{y,\max}}{3.8}\right)^2
++ 0.20\frac{\left|d_1-d_0\right|}{W_{\mathrm{lane}}}
+$$
+
+终点居中代价：
+
+$$
+J_d
+=
+\frac{\left|d_1-d_{\mathrm{center}}\right|}{W_{\mathrm{lane}}}
+$$
+
+跟踪难度代价当前用参考航向累计变化和最大横向斜率近似：
+
+$$
+J_t
+=
+0.35\sum_k
+\left|
+\operatorname{normalize\_angle}
+\left(\psi_{\mathrm{ref},k+1}-\psi_{\mathrm{ref},k}\right)
+\right|
++ 0.30 \max_k
+\left|\frac{d d_{\mathrm{avoid}}}{ds}(s_k)\right|
+$$
+
+最终选择：
+
+$$
+T^*
+=
+\arg\min_{T_i\in\mathcal{T}_{\mathrm{valid}}} J_i
+$$
+
+如果 $\mathcal{T}_{\mathrm{valid}}$ 为空，状态机不强行进入 `AVOID`，而是进入或保持 `EMERGENCY_BRAKE`。
+
+`RouteOffsetLaneChangeTrajectory.to_local()` 使用当前车辆位置到最近路线点的弧长差作为进度，并使用最近路线点处的平滑道路右向量计算车辆相对真实路线的横向避障量：
 
 $$
 d_{\mathrm{local}}
@@ -1219,7 +1649,15 @@ b(t) = 10t^3 - 15t^4 + 6t^5
 $$
 
 $$
-d_{\mathrm{avoid}}(s) = d_0 + (d_1-d_0)b(t),\quad t = \frac{s}{L}
+d_{\mathrm{avoid}}(s)
+=
+\begin{cases}
+d_0, & s \le 0 \\
+d_0 + (d_1-d_0)b(t), & 0 < s < L \\
+d_1, & s \ge L
+\end{cases}
+\quad
+t = \frac{s}{L}
 $$
 
 边界条件：
@@ -1238,7 +1676,7 @@ $$
 
 因此换道起点和终点的横向速度、横向加速度都为 0，轨迹相对平滑。
 
-旧直线轨迹使用五次曲线斜率生成参考航向：
+路线相对轨迹的五次横向偏移斜率为：
 
 $$
 b'(t) = 30t^2 - 60t^3 + 30t^4
@@ -1246,7 +1684,12 @@ $$
 
 $$
 \frac{d d_{\mathrm{avoid}}}{ds}
-= \frac{d_1 b'(t)}{L}
+=
+\begin{cases}
+0, & s \le 0 \\
+\frac{(d_1-d_0)b'(t)}{L}, & 0 < s < L \\
+0, & s \ge L
+\end{cases}
 $$
 
 $$
@@ -1270,7 +1713,7 @@ $$
 \Delta s_d = \max(0.5,\ 0.25\Delta s)
 $$
 
-`QuinticLaneChangeTrajectory` 旧直线局部轨迹类仍保留在 `control.py` 中，作为回退和对比实现；当前 `guiji.py` 的 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都生成 `RouteOffsetLaneChangeTrajectory`。
+旧的 `QuinticLaneChangeTrajectory` 直线局部轨迹类已从 `control.py` 删除；当前 `guiji.py` 的 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都生成 `RouteOffsetLaneChangeTrajectory`。后续如果需要旧直线局部轨迹，可从 Git 历史恢复。
 
 ### 11.3 弯道避障轨迹
 
@@ -1320,27 +1763,7 @@ $$
 N = \texttt{MPC\_HORIZON\_STEPS} = 18
 $$
 
-对于保留的旧直线局部轨迹，车辆模型使用简化运动学自行车模型，在换道轨迹局部坐标中积分：
-
-$$
-v_{k+1} = \max(0,\ v_k + a\Delta t)
-$$
-
-$$
-s_{k+1} = s_k + v_{k+1}\cos(\psi_k)\Delta t
-$$
-
-$$
-d_{k+1} = d_k + v_{k+1}\sin(\psi_k)\Delta t
-$$
-
-$$
-\psi_{k+1}
-= \operatorname{normalize\_angle}
-\left(
-\psi_k + \frac{v_{k+1}}{\mathrm{WHEEL\_BASE}}\tan(\delta)\Delta t
-\right)
-$$
+采样式 MPC 使用简化运动学自行车模型。历史上的非路线相对局部轨迹分支已从 `SamplingMPCTracker.control()` 中删除；当前控制器只接受 `RouteOffsetLaneChangeTrajectory` 这类带 `is_route_relative=True` 的路线相对轨迹。如果误传旧式轨迹，代码会直接抛出错误，避免静默走旧逻辑。
 
 当前轴距参数：
 
@@ -1348,40 +1771,7 @@ $$
 \mathrm{WHEEL\_BASE} = 2.85\ \mathrm{m}
 $$
 
-每个预测步的误差：
-
-$$
-e_d = d_k - d_{\mathrm{ref}}(s_k)
-$$
-
-$$
-e_{\psi}
-= \operatorname{normalize\_angle}(\psi_k - \psi_{\mathrm{ref}}(s_k))
-$$
-
-$$
-e_v = v_k - v_{\mathrm{target}}
-$$
-
-单步代价当前为：
-
-$$
-J_k =
-6.0e_d^2
-+ 1.7e_{\psi}^2
-+ 0.07e_v^2
-+ 0.08\delta^2
-+ 0.01a^2
-+ 0.02k\left|\delta-\delta_{\mathrm{prev}}\right|
-$$
-
-一个候选动作的总代价：
-
-$$
-J = \sum_{k=0}^{N-1} J_k
-$$
-
-对于当前主流程使用的 `RouteOffsetLaneChangeTrajectory`，MPC 改为在全局坐标中预测：
+对于当前主流程使用的 `RouteOffsetLaneChangeTrajectory`，MPC 在全局坐标中预测：
 
 $$
 x_{k+1} = x_k + v_{k+1}\cos(\psi_k)\Delta t
@@ -1570,6 +1960,35 @@ PygameDemoDisplay
 
 pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置为俯视跟随，方便观察整体交通流和环形路线。
 
+当前 `guiji.py` 默认按真实时间 1x 播放同步仿真，避免 pygame 动画在机器负载变化时忽快忽慢。直接运行入口：
+
+```powershell
+E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py
+```
+
+如需尽快跑完场景用于调试日志，可以使用自由推进模式：
+
+```powershell
+E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run
+```
+
+如需指定其他固定播放倍率，可以使用：
+
+```powershell
+E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --playback-speed 1.0
+```
+
+当前还通过 CARLA `world.debug` 增加了轨迹调试标记，便于在 pygame/CARLA 画面中观察当前规划目标：
+
+- `ROUTE_FOLLOW` 状态下，在当前路线前方约 `DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0m` 处绘制红色竖向标记，表示自车下一段路线跟踪目标。
+- `AVOID` 状态下，在避障轨迹前方约 `10.0m` 处绘制红色竖向标记，表示当前避障轨迹的前视目标。
+- `AVOID` 状态下，把有效候选避障轨迹绘制为绿色线段，最终选中的候选轨迹使用更亮、更粗的绿色线段。
+- 调试绘制由 `DEBUG_DRAW_TRAJECTORY` 控制；线段采样间隔为 `DEBUG_DRAW_TRAJECTORY_STEP = 2.0m`，每 `DEBUG_DRAW_INTERVAL_FRAMES = 4` 帧刷新一次，绘制生命周期为 `DEBUG_DRAW_LIFETIME = 0.25s`，因此视觉上保持连续，同时避免避障时每帧绘制大量候选线拖慢 1x 播放。
+
+这些标记只用于演示和调试，不参与控制计算；如果画面过密或影响性能，可以在 `config.py` 中关闭 `DEBUG_DRAW_TRAJECTORY`。
+
+注意：`--playback-speed 1.0` 只能在仿真循环跑得比真实时间快时主动等待，不能把已经超时的计算/渲染帧“加速回来”。如果避障时 MPC 计算或 debug 绘制耗时超过 `FIXED_DELTA_SECONDS = 0.05s`，画面仍会慢下来。因此当前候选轨迹 debug 绘制采用低频刷新，以降低避障段的渲染负担。
+
 ## 14. 评价指标
 
 为了证明“安全行驶一圈”，建议记录以下指标：
@@ -1657,8 +2076,6 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 - 3 辆 R344 右侧背景自行车。
 - `R344 -> R20` 右转处右侧关键非机动车直行目标。
 - `RIGHT_OBJECT_YIELD` 减速让行状态。
-- **传感器噪声模拟层**：前向/侧向 FOV 限制、距离/速度高斯噪声、漏检概率模拟（阶段一）。
-- **CARLA 前向毫米波雷达**：挂载 `sensor.other.radar`，点云聚类→目标列表，输出格式与虚拟真值一致（阶段二）。
 
 尚未完成：
 
@@ -1667,9 +2084,6 @@ pygame 视角建议保留后车摄像头，同时 CARLA spectator 可以设置�
 - 右转弯非机动车转向避让策略。
 - 紧急制动灯显示控制。
 - 完整评价指标记录。
-- 前向摄像头目标分类（阶段三）。
-- 侧向雷达右侧目标替换（阶段四）。
-- 多传感器融合 + 卡尔曼跟踪（阶段五）。
 
 后续代码修改应围绕这些未完成项展开。
 
@@ -1835,8 +2249,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：基于当前 `route.py`、`perception.py`、`control.py`、`utils.py` 和 `guiji.py` 做代码阅读与公式对应检查；本次只修改 Markdown 文档，未运行 CARLA 仿真。
 - 未覆盖风险：未对公式进行独立数值单元测试；未运行仿真验证文档描述之外的控制效果；当前公式说明对应现有代码，后续如果控制算法改为 PID/LQR/纵向 MPC 或右转轨迹预测，需要再次同步更新。
 - 需要 reviewer 重点看的文件：`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 合并路线跟踪状态并保留多次避障
 
@@ -1846,8 +2260,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py`，语法检查通过；尚未运行 CARLA 场景仿真。
 - 未覆盖风险：未验证连续多次实际避障的动态效果；未处理同时出现前方风险和右侧目标风险时更复杂的优先级仲裁；HUD 中显示的状态名会从 `FOLLOW/LANE_KEEP` 变为 `ROUTE_FOLLOW`；`EMERGENCY_BRAKE` 恢复逻辑由后续记录补充。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 增加紧急制动恢复出口
 
@@ -1857,8 +2271,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py`，本次实景运行触发了两次 `AVOID`，但没有进入 `EMERGENCY_BRAKE`，因此恢复出口未被实景覆盖；运行最终在第二次 `AVOID` 后碰撞 `static.pole`，`Collisions: 1`。
 - 未覆盖风险：`EMERGENCY_BRAKE -> ROUTE_FOLLOW` 和 `EMERGENCY_BRAKE -> AVOID` 只完成代码路径添加，尚未在实景中触发验证；弯道/右转附近继续使用直线五次换道轨迹仍可能导致靠边或撞静态杆，需后续单独处理弯道避障限制。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
 
 ### 2026-06-05 - 将弯道避障改为真实路线叠加局部偏移轨迹
 
@@ -1868,30 +2282,63 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py`，日志显示第一次直道避障完成；第二辆慢车避障在 `17.85s` 触发，`start_offset=1.31m`、`target_offset=3.50m`，`20.70s` 退出 `AVOID`，随后保持 `ROUTE_FOLLOW` 且未在 `AVOID` 中原地停住；右侧非机动车/行人让行、路线终点保持均完成，最终 `Collisions: 0`。
 - 未覆盖风险：本次验证基于一次 CARLA 实景运行，未做多随机种子或不同慢车位置回归；新增的 `actor_id/actor_role` 目前仅用于诊断，尚未接入不同目标角色的差异化决策；右侧目标让行策略仍是低速/停车让行，尚未实现横向绕行。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交
-- PR/分支信息：尚未推送；当前为待提交代码与文档更新记录。
+- 提交代号/Commit ID：`ae73bf1`；合并提交 `aa5d44f`。
+- PR/分支信息：已通过 PR #5 从 `feature/decision-control` 合并到 `main`。
+
+### 2026-06-05 - 删除未使用的旧直线局部轨迹类
+
+- 本次目标：确认 `QuinticLaneChangeTrajectory` 是否仍被当前控制流程使用；如果未使用，则删除旧实现，降低控制模块维护成本。
+- 主要改动：从 `control.py` 删除未被调用的 `QuinticLaneChangeTrajectory`；从 `guiji.py` 删除对应导入，并把避障轨迹生成注释改为当前实际使用的路线相对避障轨迹；同步更新本文档主体中的控制模块职责、轨迹生成说明和 PR 记录。
+- 为什么这样改：当前 `AVOID` 和 `EMERGENCY_BRAKE -> AVOID` 都使用 `RouteOffsetLaneChangeTrajectory`，旧直线局部轨迹只会增加阅读成本，并可能让后续维护者误以为主流程仍存在两套路由。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `git -C dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；本次未重新运行完整 CARLA 场景。
+- 未覆盖风险：本次是死代码删除，未做完整实景回归；如果后续需要旧的固定直角坐标系直线换道对比实现，需要从 Git 历史恢复。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`9ee9d5d`。
+- PR/分支信息：推送到 `origin/feature/decision-control`，尚未创建新 PR。
+
+### 2026-06-06 - 增加多候选避障路径生成与选择
+
+- 本次目标：参考笔记中的路径生成、路径限制和最优路径选择思路，把前方避障从固定一条终点轨迹改为多条候选轨迹中筛选最优路径，同时忽略本地 PDF 资料文件。
+- 主要改动：在 `control.py` 新增 `AvoidancePathCandidate` 和 `select_best_route_offset_trajectory()`；围绕基础避障长度和目标邻道中心生成多组 `RouteOffsetLaneChangeTrajectory` 候选；按目标车道边界、最小轨迹长度、最大横向加速度和前向距离约束筛掉无效路径；用安全性、舒适性、跟踪难度和终点居中误差组成总代价并选择最优候选；`guiji.py` 的 `ROUTE_FOLLOW -> AVOID` 与 `EMERGENCY_BRAKE -> AVOID` 入口改为使用候选选择结果，若没有有效候选则进入或保持 `EMERGENCY_BRAKE`；删除 `SamplingMPCTracker` 中旧的非路线相对局部轨迹跟踪分支，当前控制器只接受路线相对轨迹；`guiji.py` 增加默认 1x 实时播放入口、`--playback-speed` 和 `--free-run` 参数；`.gitignore` 增加 `分布式驱动车轨迹跟踪13.pdf`；同步更新本文档中的状态切换、轨迹选择公式、MPC 公式和运行方式。
+- 为什么这样改：现有路线相对轨迹解决了弯道坐标系问题，但进入避障时仍相当于固定一条长度和终点都确定的轨迹。加入候选生成、约束筛选和代价选择后，可以表达“多路径规划，再选最优路径”的控制流程，也更贴近笔记中的路径限制和代价函数思想。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --help`，确认存在 `--playback-speed` 和 `--free-run` 入口；已运行默认 1x 入口 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py`，完整 CARLA 场景跑通，日志显示 `Playback mode: 1.0x realtime`，最终墙钟耗时 `70.1s`。第一次避障在 `6.65s` 触发，候选路径 `valid=10/12`，选择 `length=32.2m`、`target_offset=2.80m`、`ay=1.90m/s^2`、`cost=1.10`，并在 `12.25s` 完成；第二次避障在 `17.90s` 触发，候选路径 `valid=1/12`，选择 `length=16.9m`、`target_offset=2.80m`、`ay=3.52m/s^2`、`cost=4.72`，并在 `20.75s` 完成；右侧目标让行在 `37.70s` 触发并在 `55.20s` 完成；路线终点 `ROUTE_HOLD` 停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：当前是轻量候选路径选择，不是完整论文级分布式驱动车动力学规划；PDF 文本未在当前环境中成功抽取，第一版主要依据笔记和现有代码实现；本次只做了一次固定场景实景运行，未覆盖多随机种子、不同速度/距离组合或更多交通流密度；候选代价权重仍需要根据 pygame/CARLA 效果继续调参；1x 播放只保证同步仿真循环按墙钟等待，若 CARLA 服务端本身低于实时速度，画面仍会受机器性能限制。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/.gitignore`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-06 - 收敛右转让行硬刹与背景车追尾保护
+
+- 本次目标：确认右转避让处“启动后又停”的原因，并减少同一右转让行状态内的二次硬刹或背景车追尾风险。
+- 主要改动：`RightSideObjectReading` 新增 `actor_id`、`actor_role`、相对纵向距离和相对横向距离；`guiji.py` 在右侧目标让行开始、目标切换、硬刹激活和硬刹释放时输出诊断日志；`RIGHT_OBJECT_YIELD` 中新增 `right_object_stop_active`，使用 `RIGHT_OBJECT_STOP_DISTANCE = 13.0m` 和 `RIGHT_OBJECT_STOP_RELEASE_DISTANCE = 14.5m` 做硬刹滞回；背景路线车辆在后方接近自车到 `BACKGROUND_VEHICLE_EGO_CLEARANCE = 18.0m` 内时暂停脚本进度，避免长时间让行后被背景车硬追尾；同步更新本文档中的参数、背景交通说明和右侧让行状态公式。
+- 为什么这样改：实测日志显示右转让行不是重复进入 `RIGHT_OBJECT_YIELD`，而是在同一状态内右侧目标在自行车和两名行人之间切换，且硬刹释放条件过于保守会让自车长时间停留；长时间停留又会让按固定路线推进的背景车从后方追上。加入目标身份日志可以定位触发源，距离滞回可以避免阈值抖动，背景车后向保护可以让交通流不破坏核心避障演示。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；第一次 `--free-run` 验证显示 `Right object yield started` 只出现一次，但目标在 `right_side_pedestrian_1`、`right_side_pedestrian_2` 和 `right_side_bicycle` 间切换，随后因背景车 `background_vehicle_5` 追尾提前结束；修正后再次运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，日志显示右转让行在 `37.65s` 进入、硬刹在 `37.65s` 激活、`49.30s` 释放，释放后未再次硬刹，`54.95s` 完成右转让行；路线完成后进入 `ROUTE_HOLD`，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：本次只验证固定 Town10 起点、固定随机种子和 `--free-run` 运行；1x 实时播放视觉效果尚未重新人工确认；右转让行仍是低速/停车让行，没有实现右转横向绕行；目标切换日志用于诊断，尚未把不同角色接入差异化决策。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/perception.py`、`dazuoye/actors.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-06 - 增强感知数据结构与迁移风险评估至感知层
 
 - 本次目标：增强感知数据结构，将分散在 guiji.py 的风险判断逻辑迁移到 perception.py 的 assess_risk() 方法中，并在终端日志输出新感知字段。
 - 主要改动：FrontVehicleReading 新增 lane_relative_lateral、is_same_lane、risk_level 字段；RightSideObjectReading 新增 relative_longitudinal、relative_lateral、risk_level、predicted_ttc、object_type 等字段；新增 RiskAssessment 数据类，整合前车和右侧目标风险判断；VirtualGroundTruthSensor.front_vehicles() 返回 Top-K 前方车辆并区分车道归属；VirtualGroundTruthSensor.right_side_object() 增加连续帧确认、自车速度自适应检测距离、运动预测和目标类型区分；VirtualGroundTruthSensor.lane_clear() 放宽路口车道匹配并加入相对速度判断；新增 VirtualGroundTruthSensor.assess_risk() 统一风险评估入口；guiji.py 移除散落的风险布尔量计算，统一调用 sensor.assess_risk()；guiji.py 日志输出增加 object_type 和 predicted_ttc；移除对 RIGHT_OBJECT_DETECT_DISTANCE、RIGHT_OBJECT_TTC_THRESHOLD 的导入（已迁移至感知层）；移除 QuinticLaneChangeTrajectory 未使用导入；config.py 新增 8 个感知增强参数。
 - 为什么这样改：原 guiji.py 状态机中散落多处相同的风险计算逻辑，不利于维护。将这些逻辑集中到 assess_risk() 方法后，行为决策层只需读取 RiskAssessment 字段，新增目标角色或调整阈值时不影响主循环。感知数据增强也为后续更精细的决策（如同车道 vs 邻车道差异化制动、右转转向避让）提供信息基础。
-- 如何验证：已运行 python -m py_compile perception.py guiji.py config.py，语法检查通过。
-- 未覆盖风险：本次增强改变了感知层输出结构，但 front_vehicle() 保留旧接口兼容；RIGHT_OBJECT_YIELD 状态在 guiji.py 中仍使用 RIGHT_OBJECT_STOP_DISTANCE 和 RIGHT_OBJECT_YIELD_SPEED（未迁移）；RiskAssessment 中的 primary_risk_type/primary_risk_level 已定义但当前 guiji.py 尚未使用（保留给后续多风险优先级仲裁）。
-- 需要 reviewer 重点看的文件：dazuoye/perception.py、dazuoye/guiji.py、dazuoye/config.py、dazuoye/PROGRAM_FRAMEWORK.md。
-- 提交代号/Commit ID：c58c569
-- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
-
+- 
 ### 2026-06-06 - 虚拟传感器叠加噪声模拟层（阶段一）
 
 - 本次目标：在虚拟真值传感器 VirtualGroundTruthSensor 上叠加 FOV 限制、高斯距离/速度噪声和漏检概率模拟，使感知输出更接近真实传感器特性，同时保留零开销回退到虚拟真值的能力。
 - 主要改动：新增 7 个传感器噪声模拟参数 (DISTANCE_STD、SPEED_STD、FRONT_DETECTION_RANGE、FRONT_FOV_HALF_ANGLE_DEG、SIDE_DETECTION_RANGE、SIDE_FOV_HALF_ANGLE_DEG、MISS_DETECTION_PROB)；在 VirtualGroundTruthSensor 中新增 _add_noise() (Box-Muller 高斯)、_check_front_fov()、_check_side_fov()、_should_miss_detect() 四个辅助方法；front_vehicles() 和 _right_side_object_reading() 中集成噪声叠加逻辑；新增 lane_relative_lateral、is_adjacent_lane、actor_id、actor_role 字段到 FrontVehicleReading；统一风险等级计算逻辑 (0 安全 ~ 3 危险)；RightSideObjectReading 新增 predicted_ttc、risk_level、lateral_offset、longitudinal_offset 字段；assess_risk() 中前车紧急制动恢复判定增加滞回阈值。
-- 为什么这样改：全量虚拟真值感知与实际传感器有本质区别，加入 FOV 限制和测量噪声后，感知输出更接近真实毫米波雷达/激光雷达特性，方便后续直接用 CARLA 真实传感器替换时对比验证。保留 SENSOR_NOISE_ENABLED 开关可在实验调试时直接关闭噪声层。
-- 如何验证：已运行 python.exe -m py_compile config.py perception.py，语法检查通过；已运行完整 CARLA 仿真并完成一圈路线，碰撞次数为 0。
-- 未覆盖风险：噪声参数基于经验设置，未针对特定传感器标定；漏检模型简化为距离阈值 + 固定概率，未模拟雷达 RCS 衰减模型；新增字段目前仅用于诊断输出，尚未被决策层消费。
-- 需要 reviewer 重点看的文件：dazuoye/config.py、dazuoye/perception.py、dazuoye/PROGRAM_FRAMEWORK.md。
-- 提交代号/Commit ID：c392d1d
-- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+- 
+### 2026-06-07 - 调整右转冲突几何门限为右后方优先
+
+- 本次目标：让 `R344 -> R20` 右转让行的冲突区域更符合“自车右转切入右侧直行非机动车流”的实际场景。
+- 主要改动：在 `config.py` 中新增 `RIGHT_OBJECT_LONGITUDINAL_MIN/MAX` 和 `RIGHT_OBJECT_LATERAL_MIN/MAX`；将右侧目标几何门限从 `-8m <= longitudinal <= 34m`、`-14m <= lateral <= 18m` 调整为 `-30m <= longitudinal <= 12m`、`-3m <= lateral <= 20m`；`perception.py` 改为读取配置项，不再在感知函数里写死数字；同步更新本文档中的参数与几何门限公式。
+- 为什么这样改：当前右转冲突主要来自自车右侧或右后方沿 R344 直行的非机动车。远前方目标通常更可能已经先通过冲突区域，反而不是主要威胁；因此几何门限应以后方和右侧为主，并保留少量前方、左侧容错。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通，右侧目标让行在 `38.30s` 进入并在 `48.25s` 完成，路线终点 `ROUTE_HOLD` 停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：几何门限调整后的 pygame 画面观感仍需人工确认；如果目标生成位置或自车姿态变化较大，仍可能需要继续微调门限。
+- 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
 ### 2026-06-06 - 接入 CARLA 前向毫米波雷达，点云聚类替换虚拟真值（阶段二）
 
@@ -1902,6 +2349,105 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：雷达挂载位置 (前保险杠 (2.0, 0.5)) 和参数 (60deg FOV, 80m 范围) 可能需要在实景运行后微调；聚类半径 1.8m 和最少点数 3 是基于经验值，未针对 Town10 场景标定；雷达输出未与侧向右侧目标链路集成（阶段四任务）；guiji.py 中 radar_callback 使用闭包引用 sensor，在 finally 清理时需要确保 sensor 在雷达 actor 之后销毁。
 - 需要 reviewer 重点看的文件：dazuoye/config.py、dazuoye/perception.py、dazuoye/guiji.py、dazuoye/PROGRAM_FRAMEWORK.md。
 - 提交代号/Commit ID：1daf647
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+  
+### 2026-06-07 - 增加前视目标与候选避障轨迹可视化
+
+- 本次目标：在 pygame/CARLA 演示画面中标出自车当前跟踪目标和多条候选避障轨迹，便于观察避障规划是否符合预期。
+- 主要改动：在 `config.py` 中新增 `DEBUG_DRAW_TRAJECTORY`、`DEBUG_DRAW_LOOKAHEAD_DISTANCE`、`DEBUG_DRAW_TRAJECTORY_STEP` 和 `DEBUG_DRAW_LIFETIME`；在 `guiji.py` 中新增红色前视标记和绿色候选轨迹绘制函数；`plan_route_relative_avoidance()` 返回选中轨迹的同时返回候选轨迹列表；主循环在 `AVOID` 状态持续绘制有效候选轨迹，在 `ROUTE_FOLLOW` 状态绘制路线前视目标；避障完成后清空候选轨迹缓存；同步更新本文档的可视化说明。
+- 为什么这样改：当前已经有多候选路径生成与选择，但仅靠日志不方便判断轨迹在道路上的实际位置。把前视目标和候选轨迹画出来后，可以更直观看到自车正在跟踪哪条路线、候选轨迹是否过宽或偏离道路。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通，第一次避障在 `6.65s` 触发且候选 `valid=10/12`，第二次避障在 `18.15s` 触发且候选 `valid=1/12`，右侧目标让行完成，路线终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`；运行过程中未出现 `world.debug` 绘制相关异常。
+- 未覆盖风险：红色标记和绿色候选轨迹的画面效果仍需在 pygame/CARLA 窗口中人工确认；`world.debug` 绘制是调试可视化，不是真正的车辆灯光；如果调试线段过多，可能轻微影响画面性能。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-07 - 平滑弯道避障参考线显示
+
+- 本次目标：减少弯道避障轨迹在画面上的折线感，优先处理路线右向量和调试线采样，不调整候选路径筛选策略。
+- 主要改动：`RouteOffsetLaneChangeTrajectory` 中新增路线中心线浮点索引插值和前后差分右向量计算；轨迹生成、`to_local()` 横向投影、目标邻道中心偏移统一使用平滑右向量，不再直接使用单个 waypoint 的 `get_right_vector()`；曾将 `DEBUG_DRAW_TRAJECTORY_STEP` 调整为 `1.0m` 以观察更细轨迹，后续因 1x 播放性能压力恢复为 `2.0m`；同步更新本文档中的轨迹公式和可视化参数。
+- 为什么这样改：弯道处 waypoint 朝向可能变化不均匀，直接叠加每个 waypoint 自身右向量容易让路线相对避障轨迹出现视觉折线。用路线中心线前后差分得到切线，再由切线计算右向量，可以让横向偏移方向随中心线连续变化。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通，第一次避障 `valid=10/12` 并完成，第二次弯道避障 `valid=1/12` 并在 `21.10s` 完成，右侧目标让行和终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：本次没有改变“弯道只有一条有效候选轨迹”的筛选问题，也没有拉长弯道避障长度；第二次弯道避障仍为 `valid=1/12`，后续需要继续检查候选拒绝原因和前车距离约束；绿色轨迹是否真正更顺仍建议在 pygame/CARLA 画面中人工确认。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-07 - 降低避障轨迹调试绘制开销
+
+- 本次目标：解决 1x 播放模式下避障阶段明显变慢的问题。
+- 主要改动：新增 `DEBUG_DRAW_INTERVAL_FRAMES = 4`；候选避障轨迹和前视目标不再每帧重画，而是每 4 帧刷新一次；将 `DEBUG_DRAW_LIFETIME` 从 `0.12s` 调整为 `0.25s`，避免降频后线段闪烁；同步更新本文档中的 pygame/CARLA 可视化说明。
+- 为什么这样改：避障时可能存在多条有效候选轨迹，每条轨迹按 `1.0m` 采样绘制。如果每一帧都调用大量 `world.debug.draw_line()`，同步仿真单帧耗时会超过 `0.05s`，即使显示 `Playback mode: 1.0x realtime`，画面也会因为计算/渲染超时而变慢。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行默认 1x 入口 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py`，日志显示 `Playback mode: 1.0x realtime`，仿真运行到 `64s` 左右，最终墙钟耗时 `64.8s`，路线终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：如果机器渲染压力或 MPC 计算本身仍超过单帧预算，1x 仍可能在避障段短暂变慢；必要时可继续减少绘制内容，例如只画选中轨迹或关闭 `DEBUG_DRAW_TRAJECTORY`。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-07 - 使用路线弧线参考修正弯道前车识别
+
+- 本次目标：解决弯道上前车/慢车因为自车直角坐标横向投影偏差而被过晚识别，导致避障轨迹被压短、候选轨迹数量过少的问题。
+- 主要改动：`VirtualGroundTruthSensor` 增加 `loop_route` 参考线输入；`front_vehicle()` 支持路线参考线模式和自车坐标兜底模式；正常路线跟踪阶段把自车和目标投影到 `LoopRoute` 前方局部弧线，使用沿路线弧长距离和相对路线横向偏移判断同车道前车；`AVOID` 状态下继续使用自车坐标系前车读取，避免已经绕开的原车道目标继续触发制动；路线坐标系下同车道横向阈值收紧为 `0.45 * lane_width`；`guiji.py` 新增 `close_slow_front_vehicle` 避障触发项，使距离进入换道窗口且接近速度明显时可以提前进入 `AVOID`；同步更新本文档中的感知公式和风险触发条件。
+- 为什么这样改：弯道上两车都在同一车道时，两车连线不一定与自车当前朝向一致，旧的 `forward/right` 投影会把真实前车判断为横向偏离，直到距离很近才满足同车道条件。路线弧线参考更接近“车道线/导航参考线传感器”输出，可以更早得到合理的 $s,d$；同时避障过程中切回自车坐标兜底，避免绕开后仍盯着原车道障碍物。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通。第一次急停避障在 `6.20s` 触发，距离 `33.9m`，候选 `valid=10/12`，选择长度 `36.0m`；第二次弯道慢车避障在 `16.25s` 触发，距离 `33.7m`，候选 `valid=12/12`，选择长度 `36.0m`，相比原先约 `13m`、`valid=1/12` 明显提前；右侧目标让行、终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：本次仍使用虚拟路线参考线，等价于车道线/导航参考线真值，尚未加入噪声和延迟；路线参考模式下远距离前车日志偶尔会显示较大弧长距离，但当前触发仍受 `SAFE_DISTANCE` 和避障窗口约束；弯道轨迹视觉顺滑程度仍建议在 pygame/CARLA 窗口中人工确认。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-07 - 加入慢车位移预测与避障后制动收敛
+
+- 本次目标：针对弯道慢速前车继续前进导致避障轨迹纵向长度不足的问题，在不重写五次横向曲线的前提下，让候选避障长度和前向安全约束考虑目标车沿路线方向的预测位移；同时在自车已经横向绕开目标后减少不必要的大制动。
+- 主要改动：`FrontVehicleReading` 新增 `target_speed_along`，记录目标车沿自车坐标或路线参考线方向的速度；`plan_route_relative_avoidance()` 根据目标角色区分急刹前车和普通慢车，急刹前车按静止障碍处理，普通慢车使用 $v_{o,\mathrm{route}}$ 估计预测位移并动态拉伸基础避障长度；`select_best_route_offset_trajectory()` 把候选长度上限扩展到 `56m`，并在候选约束和安全代价中使用预测后的前向可用距离；`AVOID` 状态新增横向分离判定，车辆已经离开原车道目标且感知层不再认为有同车道前车时，将制动收敛到较小上限；同步更新本文档中的前方感知、风险判断、候选轨迹和制动收敛公式。
+- 为什么这样改：慢车不是静态障碍物，如果只用触发瞬间的前车距离限制候选长度，避障轨迹容易偏短，绕行结束时慢车仍在自车前方。用目标车路线方向速度做轻量预测，可以把“前车在换道期间继续前进的距离”反映到候选长度和安全代价中；横向分离后减小制动，则避免已经绕开目标还继续大力刹车。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通。第一次急停避障在 `6.20s` 触发，候选 `valid=10/12`，选择长度 `36.4m`，并在 `12.80s` 完成；第二次弯道慢车避障在 `16.10s` 触发，候选 `valid=12/12`，选择长度 `38.8m`，并在 `23.95s` 完成；避障后段日志显示制动收敛到 `0.15`，右侧目标让行和终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
+- 未覆盖风险：当前只是基于路线方向速度的一阶预测，不是完整时空 Lattice/动态障碍物规划；目标速度、路线投影仍来自虚拟真值感知，尚未加入传感器噪声和延迟；只做了一次固定场景 `--free-run` 验证，pygame 画面观感和不同速度组合仍需人工继续观察。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`5d326ea`。
+- PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
+
+### 2026-06-08 - 合并感知增强分支到决策控制分支
+
+- 本次目标：把 `origin/feature/perception-risk` 中的感知增强内容合并到当前决策控制分支，同时保留已经验证过的路线弧线前车识别、多候选避障、慢车位移预测和右转让行控制逻辑。
+- 主要改动：`perception.py` 重整为融合版，保留 `front_vehicle(use_route_reference=...)` 和 `target_speed_along`，新增 `front_vehicles()`、固定随机种子的距离/速度噪声、前向/侧向 FOV、远距离漏检、CARLA radar 点云输入和简单聚类；`RightSideObjectReading` 增加 `risk_level`、`predicted_ttc`、`object_type` 和连续帧确认；`guiji.py` 在配置开启时挂载前向雷达，并让右侧目标 `risk_level >= 2` 也能触发让行；`config.py` 新增感知增强和雷达配置，默认 `RADAR_ENABLED = False` 以保持主演示稳定；`.gitignore` 增加 `__pycache__/` 与 `*.pyc`，并从合并结果中移除远端误提交的 `.pyc` 文件。
+- 为什么这样改：感知分支提供了更接近传感器输出的噪声、视场、漏检和雷达点云能力，但直接覆盖当前分支会丢失弯道避障和慢车预测逻辑。因此本次采用“当前控制分支为主、感知增强移植进来”的方式合并。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check --cached`，无空白错误；已尝试运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，但 CARLA 服务端在 `localhost:2000` 等待 `120000ms` 后超时，未完成实景回归。
+- 未覆盖风险：当前尚未完成完整 CARLA 场景回归；雷达模式默认关闭，尚未验证 `RADAR_ENABLED = True` 时的点云聚类效果；噪声/FOV/漏检可能改变触发时机，必要时可临时关闭 `SENSOR_NOISE_ENABLED` 进行对照；需要在 CARLA 服务端已启动且地图可加载时再次运行 `--free-run`。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`、`dazuoye/.gitignore`。
+- 提交代号/Commit ID：`2de989b`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成合并提交；尚未推送。
+
+### 2026-06-08 - 精简感知合并后的未接入接口
+
+- 本次目标：在合并感知增强分支后进行剪枝收敛，减少当前主流程没有使用的临时接口和配置。
+- 主要改动：删除未接入主循环的 `RiskAssessment` 数据结构和 `VirtualGroundTruthSensor.assess_risk()` 包装函数；删除未使用的 `RIGHT_PREDICTION_SECONDS` 配置；同步收敛维护文档中关于统一风险评估入口的描述。
+- 为什么这样改：当前 `guiji.py` 状态机仍显式读取 `front_vehicle()` 和 `right_side_object()`，统一风险评估包装没有被调用，保留会增加维护者判断成本。先删掉未接入接口，可以让感知层聚焦在已经使用的噪声/FOV/雷达候选和右侧风险等级输出。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：本次为未接入接口删除，尚未重新完成 CARLA 实景回归；如果后续确实要把状态机改成统一风险评估，需要重新设计并接入该接口，而不是沿用这次删除的未验证包装。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`bb65888`。
+- PR/分支信息：已在本地 `feature/decision-control` 完成剪枝提交；尚未推送。
+
+### 2026-06-08 - 使用联合参考轨迹支持 AVOID 中再次避障判断
+
+- 本次目标：让前方风险判断跟随当前实际计划轨迹变化，避免旧目标被绕开后重复触发，同时在避障过程中仍能发现联合轨迹前方的新危险目标，并允许必要时重新规划。
+- 主要改动：`perception.py` 新增临时 `FrontReferencePath`，支持把车辆投影到“避障轨迹 + 后续路线延伸”的采样参考线上；`guiji.py` 在 `AVOID` 状态下每帧生成并设置联合参考轨迹，其他状态清空回原始 `LoopRoute`；新增 `AVOID_REPLAN_COOLDOWN_SECONDS`、`AVOID_REPLAN_MIN_PROGRESS` 和 `avoid_replan_needed()`，当联合轨迹上出现新目标或同目标仍然紧急时重规划，重规划失败且风险很近时切入 `EMERGENCY_BRAKE`；删除 `right_object_yield_done`，右侧目标风险解除后允许后续再次触发 `RIGHT_OBJECT_YIELD`；新增 `RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0s` 连续清空确认，避免右侧目标短暂丢失时过早起步；同步更新本文档中的前车感知参考线、状态切换条件和待提交记录。
+- 为什么这样改：只用原始路线投影会让避障过程中的“正在跟踪轨迹”和“风险判断轨迹”不一致；只用自车直线坐标又容易在弯道上误判。联合参考轨迹把当前 MPC 正在跟踪的避障路径作为感知参考，旧目标横向脱离后自然不再触发，而避障路径前方的新目标仍会被检测到。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile .\dazuoye\guiji.py .\dazuoye\control.py .\dazuoye\perception.py .\dazuoye\route.py .\dazuoye\actors.py`，语法检查通过；已运行 `git -C .\dazuoye diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；第一次 `--free-run` 调试发现右侧让行在目标短暂变为 `none` 后过早退出，随后与 `right_side_pedestrian_2` 碰撞；加入连续清空确认后再次运行 `E:/Anaconda_envs/envs/carla_env/python.exe .\dazuoye\guiji.py --free-run`，第一次急停避障在 `5.85s` 触发并于 `12.35s` 完成，第二次弯道避障在 `16.05s` 触发并于 `23.75s` 完成，右侧让行在 `41.30s` 触发、`49.00s` 完成，路线终点 `ROUTE_HOLD` 停车保持完成，最终 `Collisions: 0`、`Cleanup finished`。
+- 未覆盖风险：当前 `FrontReferencePath` 使用采样线段和车辆中心点投影，尚未投影车辆四角占据区域；AVOID 中途重规划虽然有冷却和最小进度限制，但本次固定场景没有出现 `Avoidance replanned` 日志，仍需要后续用更密集交通流验证重规划分支；雷达模式默认关闭，尚未验证雷达开启时与临时参考轨迹的关系；pygame 画面观感仍建议人工确认。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：`3c10c4a`。
+- PR/分支信息：本地待提交，尚未推送。
+
+### 2026-06-08 - 混合感知身份匹配、雷达杂波过滤与感知链路增强
+
+- 本次目标：解决 CARLA 毫米波雷达在 ~4.8m 处检测到地面杂波/自车反射导致虚假 AVOID 触发的问题；实现混合感知模式（雷达测距 + 上帝视角身份匹配）过滤幽灵目标；修复雷达结果为空时不回退虚拟真值导致的"盲开"；挂载侧向雷达和相机传感器硬件占位。
+- 主要改动：config.py 新增 `RADAR_MIN_DISTANCE=7.0`、`RADAR_FOV_VERTICAL_DEG=15.0`、`HYBRID_PERCEPTION_MODE=True`、`HYBRID_MATCH_RADIUS=3.0`；perception.py 新增 `set_side_radar_detections()` 占位方法、`set_camera_classifications()` 占位方法；`_process_radar_detections()` 中添加上帝视角身份匹配循环：匹配成功的聚类注入 `actor_id/actor_role`，匹配失败的聚类直接丢弃（杂波过滤）；聚类循环中添加 `RADAR_MIN_DISTANCE` 最小距离过滤；`front_vehicles()` 雷达模式添加空结果回退到虚拟真值的逻辑；guiji.py 挂载右侧毫米波雷达（150° FOV，30m 范围）、前向 RGB 相机和语义分割相机；初始化 AlphaBetaTracker 占位；新增 `right_object_type`、`right_risk_level`、`front_actor_role`、`front_risk_level` 到 telemetry；display.py 将 Front/Right 感知信息拆分为独立显示行，叠加彩色风险等级标签。
+- 为什么这样改：雷达原始点云在近场产生大量自车/地面反射点，聚类后形成幽灵目标，导致决策层频繁进入 AVOID 且速度降至 ~0.5 m/s。混合感知模式利用上帝视角做"身份认证"，确保只有真实车辆产生感知输出。雷达空结果回退保证前车超出 80m 或聚类失败时自车仍能基于虚拟真值正常行驶。
+- 如何验证：已运行 `python -m py_compile config.py perception.py guiji.py display.py`，语法检查通过；已运行完整 CARLA 实景仿真（32.4s），自车速度范围 3~8 m/s，顺利完成两次右侧行人 AVOID 让行，前车检测正常，路线终点停车正常，`Collisions: 0`。
+- 未覆盖风险：本次混合感知的身份匹配仅在雷达聚类输出端做后验过滤，尚未在跟踪器层面做时序一致性验证；侧向雷达和相机数据仅占位存储，未接入实际感知链路；AlphaBetaTracker 为占位实现，未输出稳定 track；语义分割相机回调中的 numpy 导入在 python 3.7 环境下未经长期稳定性验证；右转弯时行人避让仍存在盲区（已验证场景中仅避让自行车未避让行人导致碰撞，此问题未在本次修复范围内）。
+- 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：814c918
 - PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
 
 ### 2026-06-08 - 混合感知身份匹配、雷达杂波过滤与感知链路增强

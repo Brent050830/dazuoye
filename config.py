@@ -18,17 +18,11 @@ SAFE_DISTANCE = 34.0
 LANE_CLEAR_FRONT = 45.0
 LANE_CLEAR_REAR = 18.0
 
-# ========= 感知增强参数 =========
-FRONT_LANE_SAME_THRESHOLD = 0.4       # 同车道：|横向偏移| < 0.4 * 车道宽
-FRONT_LANE_ADJACENT_THRESHOLD = 1.2   # 邻车道：|横向偏移| < 1.2 * 车道宽
-FRONT_TOP_K = 2                       # 前方车辆最多返回数量
-RIGHT_CONFIRM_FRAMES = 3              # 右侧目标冲突连续确认帧数
-RIGHT_PREDICTION_SECONDS = 2.0        # 右侧目标位置预测时间（秒）
-RIGHT_CONFLICT_FRONT_ANGLE_DEG = 60.0 # 右侧冲突扇形区域半角（度）
-RIGHT_CONFLICT_MAX_DISTANCE = 30.0    # 右侧冲突最大检测距离（米）
-RIGHT_CONFLICT_MIN_LATERAL = 1.0      # 右侧冲突最小横向偏移（米）
-RIGHT_CONFLICT_MAX_LATERAL = 14.0     # 右侧冲突最大横向偏移（米）
-# ================================
+# ========= 前向/右侧感知增强参数 =========
+FRONT_LANE_SAME_THRESHOLD = 0.4
+FRONT_LANE_ADJACENT_THRESHOLD = 1.2
+FRONT_TOP_K = 2
+RIGHT_CONFIRM_FRAMES = 3
 
 LANE_CHANGE_LENGTH = 28.0
 MPC_HORIZON_STEPS = 18
@@ -57,7 +51,12 @@ ROUTE_COMPLETION_HOLD_SECONDS = 4.0
 RIGHT_OBJECT_TTC_THRESHOLD = 5.0
 RIGHT_OBJECT_DETECT_DISTANCE = 34.0
 RIGHT_OBJECT_STOP_DISTANCE = 13.0
+RIGHT_OBJECT_STOP_RELEASE_DISTANCE = 14.5
 RIGHT_OBJECT_YIELD_SPEED = 3.0
+RIGHT_OBJECT_LONGITUDINAL_MIN = -30.0
+RIGHT_OBJECT_LONGITUDINAL_MAX = 12.0
+RIGHT_OBJECT_LATERAL_MIN = -3.0
+RIGHT_OBJECT_LATERAL_MAX = 20.0
 RIGHT_OBJECT_TRIGGER_ROAD = 344
 RIGHT_OBJECT_EXIT_ROAD = 20
 RIGHT_OBJECT_TRIGGER_ROUTE_STEPS = 8  # 控制行人自行车开始运动
@@ -72,32 +71,33 @@ TRAFFIC_RANDOM_SEED = 20260602
 BACKGROUND_VEHICLE_ROUTE_INDICES = (32, 54, 76, 96, 108)
 BACKGROUND_VEHICLE_SPEED_MIN = 7.0
 BACKGROUND_VEHICLE_SPEED_MAX = 8.8
+BACKGROUND_VEHICLE_EGO_CLEARANCE = 18.0
 BACKGROUND_BICYCLE_FORWARD_OFFSETS = (-1.5,)  
 BACKGROUND_BICYCLE_RIGHT_OFFSETS = (4.6,)      
 BACKGROUND_BICYCLE_END_FORWARD_OFFSET = 48.0  
 BACKGROUND_BICYCLE_SPEED_MIN = 2.6
 BACKGROUND_BICYCLE_SPEED_MAX = 4.3
 
-RIGHT_PEDESTRIAN_FORWARD_OFFSETS = (-2.5, -3.2)  
+RIGHT_PEDESTRIAN_FORWARD_OFFSETS = (-2.2, -2.9)  
 RIGHT_PEDESTRIAN_RIGHT_OFFSETS = (3.0, 3.6)
 RIGHT_PEDESTRIAN_END_FORWARD_OFFSET = 38.0  # 
-RIGHT_PEDESTRIAN_SPEEDS = (2.0, 1.5)
+RIGHT_PEDESTRIAN_SPEEDS = (2.3, 2.5)
 
-SLOW_RIGHT_LANE_DISTANCE = 105.0  # 第二辆慢车出生点
-SLOW_RIGHT_LANE_SPEED = 7.0 #第二辆慢车速度
+SLOW_RIGHT_LANE_DISTANCE = 65.0  # 第二辆慢车出生点
+SLOW_RIGHT_LANE_SPEED = 6.5 #第二辆慢车速度
 SLOW_RIGHT_LANE_ROLE_NAME = "slow_right_lane_vehicle"
 
-# ========= 传感器模拟参数（阶段一：噪声叠加） =========
-SENSOR_NOISE_ENABLED = True           # 是否启用传感器噪声模拟
-FRONT_DETECTION_RANGE = 80.0          # 前向雷达最大检测距离 (米)
-SIDE_DETECTION_RANGE = 30.0           # 侧向检测最大距离 (米)
-FRONT_FOV_HALF_ANGLE_DEG = 60.0       # 前向 FOV 半角 (度)，±60° 即 120° 总视野
-SIDE_FOV_HALF_ANGLE_DEG = 75.0        # 侧向 FOV 半角 (度)
-DISTANCE_STD = 0.5                    # 距离测量噪声标准差 (米)
-SPEED_STD = 0.3                       # 速度测量噪声标准差 (m/s)
-MISS_DETECTION_PROB = 0.05            # 漏检概率 (0~1)，仅对超出 50m 的目标生效
+# ========= 传感器模拟参数 =========
+SENSOR_NOISE_ENABLED = True
+FRONT_DETECTION_RANGE = 80.0
+SIDE_DETECTION_RANGE = 30.0
+FRONT_FOV_HALF_ANGLE_DEG = 60.0
+SIDE_FOV_HALF_ANGLE_DEG = 75.0
+DISTANCE_STD = 0.5
+SPEED_STD = 0.3
+MISS_DETECTION_PROB = 0.05
 
-# ========= 传感器模拟参数（阶段二：CARLA 毫米波雷达） =========
+# ========= CARLA 毫米波雷达参数 =========
 RADAR_ENABLED = True                  # 是否启用 CARLA 前向毫米波雷达（False 时回退到虚拟真值+噪声）
 RADAR_RANGE = 80.0                    # 雷达最大检测距离 (米)
 RADAR_FOV_HORIZONTAL_DEG = 60.0       # 雷达水平 FOV (度)，±30° 即 60° 总视野
@@ -108,7 +108,12 @@ RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数，低于此数目忽�
 RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内的雷达检测（过滤地面杂波/自车反射）
 
 # ========= 混合感知参数 =========
-HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角识别；False: 纯雷达模式
+HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角身份匹配；False: 纯雷达模式
 HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配的最大欧氏距离 (米)
 # ====================================================
 
+DEBUG_DRAW_TRAJECTORY = True
+DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
+DEBUG_DRAW_TRAJECTORY_STEP = 2.0
+DEBUG_DRAW_INTERVAL_FRAMES = 4
+DEBUG_DRAW_LIFETIME = 0.25
