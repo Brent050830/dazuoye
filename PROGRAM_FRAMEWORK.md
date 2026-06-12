@@ -2277,7 +2277,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：本次未启动 CARLA 实景回归，replacement segment 覆盖/重规划的画面轨迹、候选冲突阈值、右侧让行与背景车交互仍需在 `guiji.py --free-run` 和 1x pygame 演示中继续观察；候选冲突检测仍是车辆中心点级简化包络，尚未投影车辆四角。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`ea38b26`
-- PR/分支信息：本地未推送。
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-12 - 避障段保持偏移并增加安全回归候选
 
@@ -2288,4 +2288,4 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：本次未启动 CARLA 实景回归；持续 offset 可能需要结合可视化继续调 `RETURN_TO_BASE_CLEARANCE`、回归长度和冲突包络余量；车辆包络仍按路线投影近似处理，未做完整多边形碰撞检测。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`ea38b26`
-- PR/分支信息：本地未推送。
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
