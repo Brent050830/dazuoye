@@ -2276,7 +2276,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已用 `rg` 检查当前代码中不再存在 `AVOID` 状态分支、`RIGHT_OBJECT_YIELD` 状态分支、`lane_clear()` 调用和旧临时路线切换接口。
 - 未覆盖风险：本次未启动 CARLA 实景回归，replacement segment 覆盖/重规划的画面轨迹、候选冲突阈值、右侧让行与背景车交互仍需在 `guiji.py --free-run` 和 1x pygame 演示中继续观察；候选冲突检测仍是车辆中心点级简化包络，尚未投影车辆四角。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
+- 提交代号/Commit ID：`ea38b26`
 - PR/分支信息：本地未推送。
 
 ### 2026-06-12 - 避障段保持偏移并增加安全回归候选
@@ -2287,5 +2287,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：本次未启动 CARLA 实景回归；持续 offset 可能需要结合可视化继续调 `RETURN_TO_BASE_CLEARANCE`、回归长度和冲突包络余量；车辆包络仍按路线投影近似处理，未做完整多边形碰撞检测。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
+- 提交代号/Commit ID：`ea38b26`
 - PR/分支信息：本地未推送。
