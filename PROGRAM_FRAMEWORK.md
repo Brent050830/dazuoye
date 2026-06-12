@@ -2265,8 +2265,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `git diff --check`；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py control.py perception.py route.py actors.py config.py utils.py`。
 - 未覆盖风险：本次尚未实跑 CARLA `--free-run`，只验证语法和 diff 空白；雷达开启模式仍保持原有优先级，未单独验证。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e52d4cc`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-12 - 用 replacement segments 合成路线收敛避障状态机
 
@@ -2298,8 +2298,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：尚未启动 CARLA 实景回归；切换控制器后需要观察正常直线居中、避障进入/退出瞬间转向是否平滑。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e52d4cc`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-12 - 加密小偏移候选并放松横向冲突余量
 
