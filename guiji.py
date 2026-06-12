@@ -258,13 +258,7 @@ def avoidance_target_passed(loop_route, ego_vehicle, target_actor, clearance=RET
         return True
 
     reference = smooth_reference_for(loop_route)
-    ego_center_s = loop_route.last_index * loop_route.step_distance
-    ego_projection = reference.project(
-        ego_vehicle.get_location(),
-        ego_center_s,
-        search_back=20.0,
-        search_ahead=40.0,
-    )
+    ego_projection = project_actor_to_base_route(loop_route, ego_vehicle)
     target_projection = reference.project(
         target_actor.get_location(),
         ego_projection["route_s"],
@@ -274,6 +268,17 @@ def avoidance_target_passed(loop_route, ego_vehicle, target_actor, clearance=RET
     ego_tail_s = ego_projection["route_s"] - vehicle_half_length(ego_vehicle)
     target_head_s = target_projection["route_s"] + vehicle_half_length(target_actor)
     return ego_tail_s > target_head_s + clearance
+
+
+def project_actor_to_base_route(loop_route, actor):
+    reference = smooth_reference_for(loop_route)
+    center_s = loop_route.last_index * loop_route.step_distance
+    return reference.project(
+        actor.get_location(),
+        center_s,
+        search_back=20.0,
+        search_ahead=40.0,
+    )
 
 
 def right_object_label(reading):
@@ -407,6 +412,7 @@ def main(args=None):
         last_plan_failure_log_time = -999.0
         avoidance_candidates = []
         active_avoidance_target = None
+        mpc_tracking_until_s = None
         obstacle_actors = [lead_vehicle] + [controller.actor for controller in background_vehicles]
 
         if args.free_run:
@@ -512,6 +518,7 @@ def main(args=None):
                         active_avoidance_target = make_avoidance_target(
                             front, obstacle_actors, best_candidate.target_offset
                         )
+                        mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                         route_changed_this_frame = True
                         state = "ROUTE_FOLLOW"
                         print(
@@ -538,6 +545,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None:
+                    mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
                         "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(
                             sim_time,
@@ -566,6 +574,7 @@ def main(args=None):
                     active_avoidance_target = make_avoidance_target(
                         front, obstacle_actors, best_candidate.target_offset
                     )
+                    mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     route_changed_this_frame = True
                 else:
                     if front_emergency_brake_needed(front):
@@ -627,7 +636,18 @@ def main(args=None):
                     target_speed = min(target_speed, RIGHT_OBJECT_YIELD_SPEED)
 
                 tracking_route = sensor.tracking_route()
-                if tracking_route is not None and tracking_route.is_valid:
+                base_route_s = project_actor_to_base_route(loop_route, ego_vehicle)["route_s"]
+                if mpc_tracking_until_s is not None and base_route_s > mpc_tracking_until_s:
+                    mpc_tracking_until_s = None
+                replacement_segment_active = mpc_tracking_until_s is not None
+                offset_route_active = abs(sensor.current_offset()) > 0.05
+                use_mpc_tracking = (
+                    tracking_route is not None
+                    and tracking_route.is_valid
+                    and (replacement_segment_active or offset_route_active)
+                )
+
+                if use_mpc_tracking:
                     ego_control = mpc.control(ego_vehicle, tracking_route, target_speed)
                 else:
                     throttle, brake = speed_control(ego_speed, target_speed)

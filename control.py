@@ -214,7 +214,7 @@ def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obsta
 def _candidate_lengths(base_length):
     """围绕基础避障长度生成候选纵向长度，避免只固定一条路径。"""
     values = []
-    for scale in (0.85, 1.0, 1.15, 1.30):
+    for scale in (0.85, 1.0, 1.15, 1.30): # 基于基础避障长度生成多个候选长度，通过乘以不同的缩放因子，形成一系列不同长度的换道路径，增加换道策略的多样性和适应性
         length = clamp(base_length * scale, 14.0, 56.0)
         if all(abs(length - existing) > 0.1 for existing in values):
             values.append(length)
@@ -223,9 +223,13 @@ def _candidate_lengths(base_length):
 
 def _candidate_target_offsets(start_offset, lane_width):
     """围绕当前路线左右生成候选峰值横向偏移。"""
-    offsets = (-1.20, -0.90, -0.60, -0.35, -0.20, 0.0, 0.20, 0.35, 0.60, 0.90, 1.20)
+    offsets = (
+        -1.20, -0.90, -0.70, -0.55, -0.45, -0.35, -0.25, -0.15,
+        0.0,
+        0.15, 0.25, 0.35, 0.45, 0.55, 0.70, 0.90, 1.20,
+    )
     values = []
-    for scale in offsets:
+    for scale in offsets: # 对于每个偏移量，计算对应的目标侧向偏移，并确保与现有候选值之间有足够的差距，避免生成过于相似的候选路径，增加换道策略的多样性和适应性
         target = start_offset + scale * lane_width
         if all(abs(target - existing) > 0.05 for existing in values):
             values.append(target)
@@ -330,7 +334,8 @@ def _candidate_collision_reason(trajectory, length, ego_speed, obstacle_actors, 
         actor_half_length, actor_half_width = _actor_half_extents(actor)
         is_front_actor = front_actor_id is not None and actor.id == front_actor_id
         longitudinal_buffer = ego_half_length + actor_half_length + (3.0 if is_front_actor else 2.0)
-        lateral_buffer = ego_half_width + actor_half_width + (1.0 if is_front_actor else 0.6)
+        lateral_margin = 0.35 if is_front_actor else 0.25
+        lateral_buffer = ego_half_width + actor_half_width + lateral_margin
 
         actor_loc = actor.get_location()
         projection = trajectory.route_reference.project(

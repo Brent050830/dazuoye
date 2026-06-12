@@ -169,7 +169,7 @@ dazuoye/display.py
 - 虚拟真值感知，并可选叠加噪声、FOV、漏检和前向毫米波雷达点云聚类。
 - TTC 计算。
 - 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的多候选避障轨迹。
-- 采样式 MPC 跟踪，当前主流程使用路线相对轨迹代价计算。
+- 采样式 MPC 只在避障 replacement、保持偏移或回归段活跃时跟踪合成路线；纯基础路线巡航使用 `LoopRoute.steer()` 前视控制。
 - Town10 固定起点。
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
@@ -543,7 +543,7 @@ RightSideObjectReading
 
 - `_base_tracking_route`：由 `LoopRoute` 包装出的原始基础路线，只作为不可整体替换的基础参考。
 - `_replacement_segments`：当前有效的局部替换段，每段只覆盖一个基础路线 $s$ 区间；新段与旧段重叠时，旧段会被移除后再合成，避免同一 $s$ 区间存在多个版本。
-- `_tracking_route`：由基础路线与 replacement segments 合成出的当前真实跟踪路线，前车投影、TTC、最近前车判断、MPC 跟踪前视点都基于这条路线。
+- `_tracking_route`：由基础路线与 replacement segments 合成出的当前真实跟踪路线，前车投影、TTC 和最近前车判断都基于这条路线；MPC 只在避障、保持偏移或回归段活跃时跟踪它。
 
 这样，如果触发避障的旧目标已经被 replacement segment 绕开，它相对当前合成路线的横向偏移会增大，不再反复触发同一碰撞走廊风险；如果避障偏移线前方又出现新的慢车/危险目标，仍会在当前合成路线坐标下被识别出来。避障段末尾不会立即拼回 $d=0$ 基础路线，而是继续沿 $C_{\mathrm{base}}(s)+d_{\mathrm{hold}}r(s)$ 行驶，直到回归段通过冲突检测。
 
@@ -1333,7 +1333,7 @@ $$
 \mathcal{D}
 =
 \{d_0+\alpha W_{\mathrm{lane}}\mid
-\alpha\in[-1.20,-0.90,-0.60,-0.35,-0.20,0,0.20,0.35,0.60,0.90,1.20]\}
+\alpha\in[-1.20,-0.90,-0.70,-0.55,-0.45,-0.35,-0.25,-0.15,0,0.15,0.25,0.35,0.45,0.55,0.70,0.90,1.20]\}
 $$
 
 对每一组 $(L,d_t)$，都构造一条 `RouteOffsetLaneChangeTrajectory`，段尾保持目标偏移。因此当前避障入口处理的是候选 replacement segment 集合：
@@ -1386,7 +1386,7 @@ $$
 \left|d_o-d_{\mathrm{avoid}}(s_j)\right| \le w_{\mathrm{ego}}+w_o+\Delta_w
 $$
 
-则该候选被标记为 `candidate conflicts with vehicle` 或 `candidate conflicts with front vehicle` 并直接剔除。当前采样步长为 `1.0m`；触发本次规划的前车使用更大的安全余量。候选长度相对前车可用距离不再作为硬拒绝条件，而是进入安全代价。候选路径代价由安全性、舒适性、跟踪难度和目标偏移代价组成：
+其中横向余量当前取 $\Delta_w=0.35\mathrm{m}$（触发本次规划的前车）或 $0.25\mathrm{m}$（其他车辆）。则该候选被标记为 `candidate conflicts with vehicle` 或 `candidate conflicts with front vehicle` 并直接剔除。当前采样步长为 `1.0m`；候选只有在纵向包络与横向包络同时重叠时才被判定为冲突。候选长度相对前车可用距离不再作为硬拒绝条件，而是进入安全代价。候选路径代价由安全性、舒适性、跟踪难度和目标偏移代价组成：
 
 $$
 J = 4.0J_s + 2.0J_c + J_t + 0.6J_d
@@ -1593,7 +1593,7 @@ $$
 N = \texttt{MPC\_HORIZON\_STEPS} = 18
 $$
 
-采样式 MPC 使用简化运动学自行车模型。历史上的非路线相对局部轨迹分支已从 `SamplingMPCTracker.control()` 中删除；当前控制器只接受带 `is_route_relative=True` 的路线相对对象，主流程传入的是基础路线与 replacement segments 合成后的 `TrackingRoute`。如果误传旧式轨迹，代码会直接抛出错误，避免静默走旧逻辑。
+采样式 MPC 使用简化运动学自行车模型。历史上的非路线相对局部轨迹分支已从 `SamplingMPCTracker.control()` 中删除；当前控制器只接受带 `is_route_relative=True` 的路线相对对象。主流程只有在 replacement segment 尚未走完、`current_offset` 非零，或正在执行回归段时，才把基础路线与 replacement segments 合成后的 `TrackingRoute` 传给 MPC；纯基础路线巡航则使用 `speed_control()` 加 `loop_route.steer()`。如果误传旧式轨迹，代码会直接抛出错误，避免静默走旧逻辑。
 
 当前轴距参数：
 
@@ -2289,3 +2289,25 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`ea38b26`
 - PR/分支信息：已推送至 `origin/feature/decision-control`。
+
+### 2026-06-12 - 正常巡航改回基础路线前视控制
+
+- 本次目标：解决完全直线、无避障时自车被采样式 MPC 带出车道中心的问题，让 MPC 专注于避障 replacement、保持 offset 和回归段。
+- 主要改动：`guiji.py` 新增基础路线投影 helper，并记录每次 replacement segment 需要 MPC 跟踪到的基础路线终点；主控制分支改为只有 replacement 段未走完、`sensor.current_offset()` 非零或回归段未完成时才调用 `mpc.control()`，纯基础路线巡航使用 `speed_control()` + `loop_route.steer()`。同步更新本文档中控制器使用范围说明。
+- 为什么这样改：正常巡航的目标是稳定贴近原车道中心，`LoopRoute.steer()` 的前视控制更直接；采样式 MPC 保留给横向偏移、回归和避障合成路线，避免无避障直线段因为简化模型误差产生稳定偏移。
+- 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：尚未启动 CARLA 实景回归；切换控制器后需要观察正常直线居中、避障进入/退出瞬间转向是否平滑。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：本地未提交。
+- PR/分支信息：本地未推送。
+
+### 2026-06-12 - 加密小偏移候选并放松横向冲突余量
+
+- 本次目标：缓解避障候选选择过于保守、经常选到过大 `target_offset` 的问题，让较小横向偏移有机会通过筛选。
+- 主要改动：`control.py` 将 `_candidate_target_offsets()` 的偏移尺度从 11 个扩展到 17 个，在 `±0.15`、`±0.25`、`±0.45`、`±0.55`、`±0.70` 等位置增加小/中等偏移候选；`_candidate_collision_reason()` 的横向安全余量改为前车 `0.35m`、其他车 `0.25m`，仍保持纵向包络和横向包络同时重叠才判定冲突；同步更新本文档中的候选集合和冲突包络说明。
+- 为什么这样改：原先候选间隔偏稀，且横向余量对前车额外加到 `1.0m`，容易把实际可行的小偏移路径提前剔除。加密候选并降低横向余量后，规划器仍保留硬碰撞筛选，但不会仅因小偏移就过度保守。
+- 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：尚未启动 CARLA 实景回归；横向余量放松后需要观察近距离前车急刹和弯道慢车场景中是否仍有足够视觉安全距离。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：本地未提交。
+- PR/分支信息：本地未推送。
