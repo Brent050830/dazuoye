@@ -12,7 +12,6 @@ from config import (
     FRONT_LANE_SAME_THRESHOLD,
     FRONT_TOP_K,
     LANE_CLEAR_FRONT,
-    LANE_CLEAR_REAR,
     MISS_DETECTION_PROB,
     RADAR_CLUSTER_RADIUS,
     RADAR_ENABLED,
@@ -33,7 +32,7 @@ from config import (
     TTC_AVOID_THRESHOLD,
     TTC_BRAKE_THRESHOLD,
 )
-from utils import SmoothRouteReference, dot_2d, same_direction_lane, smooth_reference_for, vector_length
+from utils import SmoothRouteReference, dot_2d, smooth_reference_for, vector_length
 
 
 # ===================== 感知数据结构 =====================
@@ -72,19 +71,148 @@ class RightSideObjectReading:
     object_type: str = ""
 
 
-class FrontReferencePath:
-    """A temporary path used by front-vehicle perception during avoidance."""
+@dataclass
+class ReplacementSegment:
+    """当前跟踪路线中替换基础路线的一段。"""
 
-    def __init__(self, points):
+    start_s: float
+    end_s: float
+    points: list
+    end_offset: float = 0.0
+
+
+class TrackingRoute:
+    """当前用于前车投影筛选的跟踪路线。"""
+
+    def __init__(
+        self,
+        points,
+        reference=None,
+        loop_route=None,
+        is_temporary=False,
+        ego_search_back=20.0,
+        ego_search_ahead=90.0,
+        target_search_back=12.0,
+        target_search_ahead=LANE_CLEAR_FRONT + 35.0,
+    ):
         self.points = list(points)
+        self.reference = reference
+        self.loop_route = loop_route
+        self.is_temporary = is_temporary
+        self.ego_search_back = ego_search_back
+        self.ego_search_ahead = ego_search_ahead
+        self.target_search_back = target_search_back
+        self.target_search_ahead = target_search_ahead
+        self.step_distance = loop_route.step_distance if loop_route is not None else 2.0
         self.cumulative = [0.0]
         for before, after in zip(self.points, self.points[1:]):
             self.cumulative.append(self.cumulative[-1] + before.distance(after))
-        self.reference = SmoothRouteReference(self) if len(self.points) >= 2 else None
+        if self.reference is None and len(self.points) >= 2:
+            self.reference = SmoothRouteReference(self)
+        self.length = self.reference.max_s if self.reference is not None else 0.0
+        self.is_route_relative = True
+
+    @classmethod
+    def from_loop_route(cls, loop_route):
+        if loop_route is None:
+            return None
+        step = max(loop_route.step_distance, 0.001)
+        return cls(
+            loop_route.points,
+            reference=smooth_reference_for(loop_route),
+            loop_route=loop_route,
+            ego_search_back=6.0 * step,
+            ego_search_ahead=18.0 * step,
+            target_search_back=3.0 * step,
+            target_search_ahead=(int((LANE_CLEAR_FRONT + 20.0) / step) + 8) * step,
+        )
+
+    @classmethod
+    def from_base_with_replacements(cls, base_route, segments):
+        if base_route is None:
+            return None
+        points = _compose_tracking_points(base_route, segments)
+        return cls(
+            points,
+            loop_route=base_route.loop_route,
+            is_temporary=bool(segments),
+            ego_search_back=base_route.ego_search_back,
+            ego_search_ahead=base_route.ego_search_ahead,
+            target_search_back=base_route.target_search_back,
+            target_search_ahead=base_route.target_search_ahead,
+        )
 
     @property
     def is_valid(self):
-        return len(self.points) >= 2 and self.cumulative[-1] > 0.1
+        return self.reference is not None and len(self.points) >= 2 and self.cumulative[-1] > 0.1
+
+    @property
+    def center_s(self):
+        if self.loop_route is None:
+            return 0.0
+        return self.loop_route.last_index * self.loop_route.step_distance
+
+    def location_at(self, s):
+        return self.reference.location_at_route_s(s)
+
+    def reference_yaw_at(self, s):
+        return self.reference.yaw_at_route_s(s)
+
+    def to_local(self, location):
+        projection = self.reference.project(
+            location,
+            self.center_s,
+            search_back=self.ego_search_back,
+            search_ahead=self.ego_search_ahead,
+        )
+        return projection["route_s"], projection["lateral"]
+
+
+def _compose_tracking_points(base_route, segments):
+    step = max(1.0, getattr(base_route, "step_distance", 2.0))
+    max_s = base_route.reference.max_s
+    sorted_segments = sorted(segments, key=lambda segment: segment.start_s)
+    points = []
+    cursor = 0.0
+    current_offset = 0.0
+
+    for segment in sorted_segments:
+        start_s = max(0.0, min(segment.start_s, max_s))
+        end_s = max(start_s, min(segment.end_s, max_s))
+        _append_base_samples(points, base_route, cursor, start_s, step, current_offset)
+        _append_points(points, segment.points)
+        cursor = end_s
+        current_offset = segment.end_offset
+
+    _append_base_samples(points, base_route, cursor, max_s, step, current_offset)
+    return points
+
+
+def _append_base_samples(points, route, start_s, end_s, step, lateral_offset=0.0):
+    if end_s < start_s:
+        return
+    sample_count = max(0, int(math.ceil((end_s - start_s) / step)))
+    for index in range(sample_count + 1):
+        s = min(end_s, start_s + index * step)
+        _append_point(points, _offset_route_location(route, s, lateral_offset))
+
+
+def _offset_route_location(route, route_s, lateral_offset):
+    location = route.reference.location_at_route_s(route_s)
+    if abs(lateral_offset) < 0.01:
+        return location
+    right = route.reference.right_at_route_s(route_s)
+    return location + carla.Location(x=right.x * lateral_offset, y=right.y * lateral_offset, z=0.0)
+
+
+def _append_points(points, new_points):
+    for point in new_points:
+        _append_point(points, point)
+
+
+def _append_point(points, point):
+    if not points or points[-1].distance(point) > 0.05:
+        points.append(point)
 
 
 # ===================== 虚拟/雷达融合感知模块 =====================
@@ -108,13 +236,14 @@ class VirtualGroundTruthSensor:
         self.lead = lead_vehicle
         self.front_extra_vehicles = front_extra_vehicles or []
         self.right_object_scenarios = right_object_scenarios or []
-        self.loop_route = loop_route
         self._right_confirm_count = 0
         self._right_confirm_frames = RIGHT_CONFIRM_FRAMES
         self._noise_rng = random.Random(20260606)
         self._radar_detections = []
-        self._front_reference_path = None
-        self._route_reference = smooth_reference_for(loop_route) if loop_route is not None else None
+        self._base_tracking_route = TrackingRoute.from_loop_route(loop_route)
+        self._replacement_segments = []
+        self._tracking_route = self._base_tracking_route
+        self._current_offset = 0.0
 
     def _empty_front(self):
         return FrontVehicleReading(float("inf"), 0.0, float("inf"), 0.0, False)
@@ -157,31 +286,45 @@ class VirtualGroundTruthSensor:
         """接收 CARLA radar callback 的原始点云。"""
         self._radar_detections = list(detections)
 
-    def set_front_reference_points(self, points):
-        """Set a temporary path for front-vehicle perception."""
-        path = FrontReferencePath(points)
-        self._front_reference_path = path if path.is_valid else None
+    def tracking_route(self):
+        return self._tracking_route
 
-    def clear_front_reference_points(self):
-        """Return front-vehicle perception to the normal route reference."""
-        self._front_reference_path = None
+    def replacement_segments(self):
+        return list(self._replacement_segments)
 
-    def front_vehicle(self, use_route_reference=True):
+    def current_offset(self):
+        return self._current_offset
+
+    def apply_replacement_segment(self, start_s, end_s, points, end_offset=0.0):
+        """用规划出的路径点替换基础路线上的一个 s 区间。"""
+        if self._base_tracking_route is None or end_s <= start_s:
+            return
+        segment = ReplacementSegment(start_s, end_s, list(points), end_offset)
+        self._replacement_segments = [
+            existing
+            for existing in self._replacement_segments
+            if existing.end_s <= segment.start_s or existing.start_s >= segment.end_s
+        ]
+        self._replacement_segments.append(segment)
+        self._current_offset = segment.end_offset
+        self._tracking_route = TrackingRoute.from_base_with_replacements(
+            self._base_tracking_route, self._replacement_segments
+        )
+
+    def front_vehicle(self):
         """兼容旧接口：返回前方最近同车道车辆。"""
-        readings = self.front_vehicles(use_route_reference=use_route_reference)
+        readings = self.front_vehicles()
         for reading in readings:
             if reading.is_front_vehicle and reading.is_same_lane:
                 return reading
         return self._empty_front()
 
-    def front_vehicles(self, use_route_reference=True):
-        """返回前方候选车辆列表，默认仍保留当前弧线参考逻辑。"""
-        if use_route_reference and self._front_reference_path is not None:
-            return self._reference_path_front_vehicles()
+    def front_vehicles(self):
+        """返回前方候选车辆列表。"""
+        if self._tracking_route is not None:
+            return self._tracking_route_front_vehicles()
         if RADAR_ENABLED and self._radar_detections:
             return self._radar_front_vehicles()
-        if use_route_reference and self.loop_route is not None:
-            return self._route_front_vehicles()
         return self._ego_frame_front_vehicles()
 
     def _ego_frame_front_vehicles(self):
@@ -225,24 +368,34 @@ class VirtualGroundTruthSensor:
         readings.sort(key=lambda reading: reading.distance)
         return readings[:FRONT_TOP_K]
 
-    def _route_front_vehicles(self):
-        """将车辆投影到当前路线局部弧线，用弧长 s 和横向 d 判断弯道前车。"""
+    def _tracking_route_front_vehicles(self):
+        """把车辆投影到当前跟踪路线，用弧长 s 和横向 d 判断前车。"""
+        route = self._tracking_route
+        if route is None or not route.is_valid:
+            return self._ego_frame_front_vehicles()
+
         ego_loc = self.ego.get_location()
-        ego_projection = self._project_to_route(ego_loc, self.loop_route.last_index, search_back=6, search_ahead=18)
+        ego_projection = self._project_to_tracking_route(
+            ego_loc,
+            route,
+            center_s=route.center_s,
+            search_back=route.ego_search_back,
+            search_ahead=route.ego_search_ahead,
+        )
         lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
-        ego_speed_along = self._speed_along_route(self.ego, ego_projection)
-        search_ahead = int((LANE_CLEAR_FRONT + 20.0) / self.loop_route.step_distance) + 8
+        ego_speed_along = self._speed_along_projection(self.ego, ego_projection)
 
         readings = []
         for vehicle in [self.lead] + self.front_extra_vehicles:
             if vehicle is None or not vehicle.is_alive:
                 continue
 
-            target_projection = self._project_to_route(
+            target_projection = self._project_to_tracking_route(
                 vehicle.get_location(),
-                ego_projection["raw_index"],
-                search_back=3,
-                search_ahead=search_ahead,
+                route,
+                center_s=ego_projection["route_s"],
+                search_back=route.target_search_back,
+                search_ahead=route.target_search_ahead,
             )
             longitudinal = target_projection["route_s"] - ego_projection["route_s"]
             lateral = target_projection["lateral"] - ego_projection["lateral"]
@@ -254,53 +407,7 @@ class VirtualGroundTruthSensor:
             if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
                 continue
 
-            target_speed_along = self._speed_along_route(vehicle, target_projection)
-            reading = self._make_front_reading(
-                distance=longitudinal,
-                closing_speed=ego_speed_along - target_speed_along,
-                lateral=lateral,
-                lane_relative=lane_relative,
-                is_same_lane=abs(lateral) < lane_width * 0.45,
-                actor_id=vehicle.id,
-                actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
-                target_speed_along=target_speed_along,
-            )
-            readings.append(reading)
-
-        readings.sort(key=lambda reading: reading.distance)
-        return readings[:FRONT_TOP_K]
-
-    def _reference_path_front_vehicles(self):
-        """Project front targets to the active path: avoidance path plus route continuation."""
-        path = self._front_reference_path
-        ego_loc = self.ego.get_location()
-        ego_projection = self._project_to_reference_path(ego_loc, path)
-        lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
-        ego_speed_along = self._speed_along_reference_path(self.ego, ego_projection)
-
-        readings = []
-        for vehicle in [self.lead] + self.front_extra_vehicles:
-            if vehicle is None or not vehicle.is_alive:
-                continue
-
-            target_projection = self._project_to_reference_path(
-                vehicle.get_location(),
-                path,
-                anchor_s=ego_projection["s"],
-                search_back=12.0,
-                search_ahead=LANE_CLEAR_FRONT + 35.0,
-            )
-            longitudinal = target_projection["s"] - ego_projection["s"]
-            lateral = target_projection["lateral"] - ego_projection["lateral"]
-            lane_relative = lateral / lane_width
-            if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
-                continue
-            if not self._check_front_fov(longitudinal, lateral):
-                continue
-            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
-                continue
-
-            target_speed_along = self._speed_along_reference_path(vehicle, target_projection)
+            target_speed_along = self._speed_along_projection(vehicle, target_projection)
             readings.append(
                 self._make_front_reading(
                     distance=longitudinal,
@@ -408,91 +515,20 @@ class VirtualGroundTruthSensor:
         readings.sort(key=lambda reading: reading.distance)
         return readings[:FRONT_TOP_K]
 
-    def _project_to_route(self, location, anchor_index, search_back=5, search_ahead=24):
-        """把位置投影到平滑路线局部窗口，返回弧长 s 和相对路线的横向偏移。"""
-        if self._route_reference is None:
-            return {
-                "route_s": 0.0,
-                "raw_index": 0.0,
-                "location": location,
-                "right": carla.Vector3D(x=1.0, y=0.0, z=0.0),
-                "lateral": 0.0,
-                "error": 0.0,
-            }
-
-        center_route_s = float(anchor_index) * self.loop_route.step_distance
-        projection = self._route_reference.project(
+    def _project_to_tracking_route(self, location, route, center_s, search_back, search_ahead):
+        """把位置投影到当前跟踪路线。"""
+        return route.reference.project(
             location,
-            center_route_s,
-            search_back=search_back * self.loop_route.step_distance,
-            search_ahead=search_ahead * self.loop_route.step_distance,
+            center_s,
+            search_back=search_back,
+            search_ahead=search_ahead,
         )
-        projection["raw_index"] = projection["route_s"] / max(self.loop_route.step_distance, 0.001)
-        return projection
 
-    def _project_to_reference_path(self, location, path, anchor_s=None, search_back=20.0, search_ahead=90.0):
-        """Project a location to the smooth active temporary reference path."""
-        if path.reference is not None:
-            center_s = anchor_s if anchor_s is not None else 0.0
-            projection = path.reference.project(
-                location,
-                center_s,
-                search_back=search_back,
-                search_ahead=search_ahead,
-            )
-            projection["s"] = projection["route_s"]
-            return projection
-
-        first = path.points[0]
-        second = path.points[1]
-        tangent = second - first
-        tangent_len = max(vector_length(tangent), 0.001)
-        tangent.x /= tangent_len
-        tangent.y /= tangent_len
-        right = carla.Vector3D(x=-tangent.y, y=tangent.x, z=0.0)
-        return {
-            "s": 0.0,
-            "location": first,
-            "right": right,
-            "lateral": dot_2d(location - first, right),
-            "error": first.distance(location),
-        }
-
-    def _speed_along_route(self, vehicle, projection):
+    def _speed_along_projection(self, vehicle, projection):
+        """计算车辆在投影参考线切线方向上的速度分量。"""
         right = projection["right"]
         tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
         return dot_2d(vehicle.get_velocity(), tangent)
-
-    def _speed_along_reference_path(self, vehicle, projection):
-        right = projection["right"]
-        tangent = carla.Vector3D(x=right.y, y=-right.x, z=0.0)
-        return dot_2d(vehicle.get_velocity(), tangent)
-
-    def lane_clear(self, side):
-        """检测指定侧邻道在前后安全范围内是否无车。"""
-        ego_wp = self.carla_map.get_waypoint(
-            self.ego.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
-        )
-        target_wp = ego_wp.get_left_lane() if side == "left" else ego_wp.get_right_lane()
-        if not same_direction_lane(ego_wp, target_wp):
-            return False
-
-        ego_tf = self.ego.get_transform()
-        ego_loc = ego_tf.location
-        forward = ego_tf.get_forward_vector()
-
-        for actor in self.world.get_actors().filter("vehicle.*"):
-            if actor.id == self.ego.id:
-                continue
-            actor_wp = self.carla_map.get_waypoint(
-                actor.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
-            )
-            if actor_wp.road_id != target_wp.road_id or actor_wp.lane_id != target_wp.lane_id:
-                continue
-            longitudinal = dot_2d(actor.get_location() - ego_loc, forward)
-            if -LANE_CLEAR_REAR <= longitudinal <= LANE_CLEAR_FRONT:
-                return False
-        return True
 
     def right_side_object(self, route_index):
         """读取右侧非机动车/行人目标，并判断其是否位于当前右转冲突窗口。"""
