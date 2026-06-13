@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import carla
 
-from config import MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间步长、预测时域步数和车辆轴距
+from config import FRONT_CONFLICT_LATERAL_MARGIN, MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间步长、预测时域步数和车辆轴距
 from utils import clamp, dot_2d, get_speed, normalize_angle, smooth_reference_for, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
 
 
@@ -15,6 +15,7 @@ class AvoidancePathCandidate:
 
     trajectory: object # 换道轨迹对象，包含计算轨迹坐标和参考航向的方法
     length: float # 换道长度，表示从起点到终点沿全局路径的纵向距离
+    transition_ratio: float # 横向偏移完成比例，表示在 length 的多少比例处完成侧向动作并开始保持目标偏移
     start_offset: float # 起始侧向偏移量，表示换道开始时相对于全局路径的横向位置
     target_offset: float # 目标侧向偏移量，表示换道结束时相对于全局路径的横向位置
     lateral_shift: float # 侧向位移，表示车辆在换道过程中的横向移动距离
@@ -32,13 +33,24 @@ class AvoidancePathCandidate:
 class RouteOffsetLaneChangeTrajectory:
     """基础路线上的局部偏移候选段，段尾保持目标偏移，不在本段内强制回到基础路线。"""
 
-    def __init__(self, loop_route, start_index, lateral_offset, length, start_offset=0.0, end_offset=None):
+    def __init__(
+        self,
+        loop_route,
+        start_index,
+        lateral_offset,
+        length,
+        start_offset=0.0,
+        end_offset=None,
+        transition_ratio=1.0,
+    ):
         self.loop_route = loop_route
         self.start_index = max(0, min(start_index, len(loop_route.points) - 1))
         self.start_offset = start_offset
         self.lateral_offset = lateral_offset # 目标侧向偏移；本段内只从起点平滑过渡到该偏移，不再回收到基础路线
         self.end_offset = end_offset if end_offset is not None else lateral_offset
         self.length = length
+        self.transition_ratio = clamp(transition_ratio, 0.05, 1.0)
+        self.transition_length = max(0.001, self.length * self.transition_ratio)
         self.step_distance = loop_route.step_distance
         self.route_reference = smooth_reference_for(loop_route) # 获取全局路径的平滑参考线对象，提供在全局路径上计算坐标和右向量的方法
         self.start_route_s = self.start_index * self.step_distance # 换道起点在全局路径上的纵向位置，基于起始索引和步距计算得到，表示换道开始时在全局路径上的位置，供后续计算使用
@@ -56,10 +68,10 @@ class RouteOffsetLaneChangeTrajectory:
         """计算纵向位置 s 处的侧向偏移量：从当前偏移平滑过渡到目标偏移并保持。"""
         if s <= 0.0:
             return self.start_offset # 如果 s 小于等于 0，直接返回起始侧向偏移量，表示换道开始时的横向位置
-        if s >= self.length:
-            return self.end_offset # 如果 s 大于等于换道长度，直接返回结束侧向偏移量，表示换道结束时的横向位置
+        if s >= self.transition_length:
+            return self.end_offset # 如果 s 大于等于横向过渡长度，直接保持结束侧向偏移量
 
-        tau = s / max(self.length, 0.001) # 计算当前 s 在换道长度中的归一化位置 tau，范围在 [0, 1] 之间，表示换道过程中的进度
+        tau = s / self.transition_length # 计算当前 s 在横向过渡长度中的归一化位置 tau，范围在 [0, 1] 之间
         return self._blend_offset(self.start_offset, self.end_offset, tau)
 
     def _blend_offset(self, start, end, tau):
@@ -68,12 +80,12 @@ class RouteOffsetLaneChangeTrajectory:
 
     def lateral_slope_at(self, s):
         """计算纵向位置 s 处的轨迹横向斜率（用于计算参考航向角）"""
-        if s <= 0.0 or s >= self.length:
+        if s <= 0.0 or s >= self.transition_length:
             return 0.0
-        tau = (s) / max(self.length, 0.001)
+        tau = s / self.transition_length
         offset_delta = self.end_offset - self.start_offset # 计算侧向偏移的总变化量，表示从换道开始到结束的横向移动距离
         blend_dot = 30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4 # 五次多项式的导数值，表示侧向偏移随纵向位置变化的斜率，影响参考航向角的计算
-        return offset_delta * blend_dot / max(self.length, 0.001) # 计算横向斜率，表示轨迹在当前 s 位置的横向变化率，供参考航向角计算使用
+        return offset_delta * blend_dot / self.transition_length # 计算横向斜率，表示轨迹在当前 s 位置的横向变化率，供参考航向角计算使用
 
     def location_at(self, s):
         """计算纵向位置 s 处的全局坐标，基于全局路径坐标加上侧向偏移"""
@@ -133,36 +145,46 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
     front_target_speed = max(0.0, getattr(front, "target_speed_along", 0.0))
     front_actor_id = getattr(front, "actor_id", None)
 
-    length_values = _candidate_lengths(base_length)
+    min_avoidance_length = front_distance if math.isfinite(front_distance) else 14.0
+    length_values = _candidate_lengths(base_length, min_length=min_avoidance_length)
     target_values = _candidate_target_offsets(start_offset, lane_width)
+    transition_values = _avoidance_transition_ratios()
 
     candidates = []
     for length in length_values: # 对于每个候选换道长度，生成多条候选轨迹，每条轨迹对应一个候选目标侧向偏移，并计算每条轨迹的约束满足情况和代价，最后从有效的候选中选取总代价最低的一条作为最终的换道轨迹
         for target_offset in target_values:
-            trajectory = RouteOffsetLaneChangeTrajectory( # 创建一条基于全局路径的换道轨迹，输入参数包括固定路线、起始索引、自车初始变换、目标侧向偏移、换道长度和起始侧向偏移
-                loop_route, route_index, target_offset, length, start_offset, end_offset=target_offset
-            )
-            candidates.append(
-                _score_avoidance_candidate( # 计算每条候选避障路径的约束满足情况和代价，输入轨迹对象、换道长度、起始偏移、目标偏移、目标中心偏移、车道宽度、自车速度、前车距离和前车TTC，输出一个包含轨迹和相关信息的AvoidancePathCandidate对象
-                    trajectory,
+            ratios = (1.0,) if abs(target_offset - start_offset) < 0.05 else transition_values
+            for transition_ratio in ratios:
+                trajectory = RouteOffsetLaneChangeTrajectory( # 创建一条基于全局路径的换道轨迹，输入参数包括固定路线、起始索引、自车初始变换、目标侧向偏移、换道长度和起始侧向偏移
+                    loop_route,
+                    route_index,
+                    target_offset,
                     length,
                     start_offset,
-                    target_offset,
-                    lane_width,
-                    ego_speed,
-                    front_distance,
-                    front_ttc,
-                    front_target_speed,
-                    obstacle_actors or [],
-                    ego_vehicle,
-                    front_actor_id,
+                    end_offset=target_offset,
+                    transition_ratio=transition_ratio,
                 )
-            )
+                candidates.append(
+                    _score_avoidance_candidate( # 计算每条候选避障路径的约束满足情况和代价，输入轨迹对象、换道长度、起始偏移、目标偏移、目标中心偏移、车道宽度、自车速度、前车距离和前车TTC，输出一个包含轨迹和相关信息的AvoidancePathCandidate对象
+                        trajectory,
+                        length,
+                        start_offset,
+                        target_offset,
+                        lane_width,
+                        ego_speed,
+                        front_distance,
+                        front_ttc,
+                        front_target_speed,
+                        obstacle_actors or [],
+                        ego_vehicle,
+                        front_actor_id,
+                    )
+                )
 
     valid_candidates = [candidate for candidate in candidates if candidate.is_valid]
     if not valid_candidates:
         return None, candidates
-    return min(valid_candidates, key=lambda candidate: candidate.total_cost), candidates
+    return _select_preferred_avoidance_candidate(valid_candidates), candidates
 
 
 def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obstacle_actors=None):
@@ -180,30 +202,32 @@ def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obsta
     ego_speed = max(get_speed(ego_vehicle), 4.0)
     candidates = []
     for length in _candidate_lengths(base_length):
-        trajectory = RouteOffsetLaneChangeTrajectory(
-            loop_route,
-            route_index,
-            0.0,
-            length,
-            start_offset,
-            end_offset=0.0,
-        )
-        candidates.append(
-            _score_avoidance_candidate(
-                trajectory,
+        for transition_ratio in _return_transition_ratios():
+            trajectory = RouteOffsetLaneChangeTrajectory(
+                loop_route,
+                route_index,
+                0.0,
                 length,
                 start_offset,
-                0.0,
-                lane_width,
-                ego_speed,
-                float("inf"),
-                float("inf"),
-                0.0,
-                obstacle_actors or [],
-                ego_vehicle,
-                None,
+                end_offset=0.0,
+                transition_ratio=transition_ratio,
             )
-        )
+            candidates.append(
+                _score_avoidance_candidate(
+                    trajectory,
+                    length,
+                    start_offset,
+                    0.0,
+                    lane_width,
+                    ego_speed,
+                    float("inf"),
+                    float("inf"),
+                    0.0,
+                    obstacle_actors or [],
+                    ego_vehicle,
+                    None,
+                )
+            )
 
     valid_candidates = [candidate for candidate in candidates if candidate.is_valid]
     if not valid_candidates:
@@ -211,22 +235,50 @@ def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obsta
     return min(valid_candidates, key=lambda candidate: candidate.total_cost), candidates
 
 
-def _candidate_lengths(base_length):
+def _select_preferred_avoidance_candidate(valid_candidates):
+    """普通避障优先选择向右偏移的安全候选；右侧无安全候选时再选左侧。"""
+    right_candidates = [
+        candidate for candidate in valid_candidates
+        if candidate.target_offset > candidate.start_offset + 0.05
+    ]
+    if right_candidates:
+        return min(right_candidates, key=lambda candidate: candidate.total_cost)
+
+    left_candidates = [
+        candidate for candidate in valid_candidates
+        if candidate.target_offset < candidate.start_offset - 0.05
+    ]
+    if left_candidates:
+        return min(left_candidates, key=lambda candidate: candidate.total_cost)
+
+    return min(valid_candidates, key=lambda candidate: candidate.total_cost)
+
+
+def _candidate_lengths(base_length, min_length=14.0):
     """围绕基础避障长度生成候选纵向长度，避免只固定一条路径。"""
     values = []
-    for scale in (0.85, 1.0, 1.15, 1.30): # 基于基础避障长度生成多个候选长度，通过乘以不同的缩放因子，形成一系列不同长度的换道路径，增加换道策略的多样性和适应性
-        length = clamp(base_length * scale, 14.0, 56.0)
+    lower_bound = clamp(min_length, 14.0, 56.0)
+    for scale in (0.50, 0.60, 0.70, 0.80, 0.90, 1.0, 1.15, 1.30):
+        length = clamp(base_length * scale, lower_bound, 56.0)
         if all(abs(length - existing) > 0.1 for existing in values):
             values.append(length)
     return values
 
 
+def _avoidance_transition_ratios():
+    return (0.75, 0.85, 1.0)
+
+
+def _return_transition_ratios():
+    return (0.85, 1.0)
+
+
 def _candidate_target_offsets(start_offset, lane_width):
     """围绕当前路线左右生成候选峰值横向偏移。"""
     offsets = (
-        -1.20, -0.90, -0.70, -0.55, -0.45, -0.35, -0.25, -0.15,
+        -1.20, -1.10, -1.05, -1.00, -0.90, -0.70, -0.55, -0.45, -0.35, -0.25, -0.15,
         0.0,
-        0.15, 0.25, 0.35, 0.45, 0.55, 0.70, 0.90, 1.20,
+        0.15, 0.25, 0.35, 0.45, 0.55, 0.70, 0.90, 1.00, 1.05, 1.10, 1.20,
     )
     values = []
     for scale in offsets: # 对于每个偏移量，计算对应的目标侧向偏移，并确保与现有候选值之间有足够的差距，避免生成过于相似的候选路径，增加换道策略的多样性和适应性
@@ -251,7 +303,9 @@ def _score_avoidance_candidate( # 计算每条候选避障路径的约束满足�
     front_actor_id,
 ):
     lateral_shift = target_offset - start_offset # 计算侧向位移，表示车辆在换道过程中的横向移动距离，即目标偏移与起始偏移之间的差值
-    maneuver_time = length / ego_speed # 估算换道所需时间，基于换道长度和自车速度计算得到，表示完成换道所需的时间
+    transition_length = getattr(trajectory, "transition_length", length)
+    transition_ratio = getattr(trajectory, "transition_ratio", 1.0)
+    maneuver_time = transition_length / ego_speed # 横向动作实际完成时间，必须按过渡长度而不是整段长度计算
     lateral_accel = 10.0 * math.sqrt(3.0) * abs(lateral_shift) / (3.0 * max(maneuver_time * maneuver_time, 0.01))
     max_lateral_accel = 3.8
     reject_reason = ""
@@ -282,6 +336,7 @@ def _score_avoidance_candidate( # 计算每条候选避障路径的约束满足�
     return AvoidancePathCandidate( # 创建一个AvoidancePathCandidate对象，包含轨迹对象、换道长度、起始偏移、目标偏移、侧向位移、侧向加速度、安全代价、舒适代价、跟踪代价、总代价、有效性标志和拒绝原因等信息，供后续选择和分析使用
         trajectory=trajectory,
         length=length,
+        transition_ratio=transition_ratio,
         start_offset=start_offset,
         target_offset=target_offset,
         lateral_shift=lateral_shift,
@@ -325,16 +380,17 @@ def _candidate_collision_reason(trajectory, length, ego_speed, obstacle_actors, 
     ego_actor_id = getattr(ego_vehicle, "id", None)
     ego_half_length, ego_half_width = _actor_half_extents(ego_vehicle)
     sample_step = 1.0
-    sample_count = max(1, int(math.ceil(length / sample_step)))
+    check_length = length + 2.0
+    sample_count = max(1, int(math.ceil(check_length / sample_step)))
 
     for actor in obstacle_actors:
-        if actor is None or not actor.is_alive or actor.id == ego_actor_id:
+        if actor is None or not actor.is_alive or actor.id == ego_actor_id: # 如果障碍物列表中的某个actor无效（None或已销毁）或者是自车本身，直接跳过该actor，不进行碰撞检查，避免无效数据导致错误的碰撞判断
             continue
 
-        actor_half_length, actor_half_width = _actor_half_extents(actor)
-        is_front_actor = front_actor_id is not None and actor.id == front_actor_id
-        longitudinal_buffer = ego_half_length + actor_half_length + (3.0 if is_front_actor else 2.0)
-        lateral_margin = 0.35 if is_front_actor else 0.25
+        actor_half_length, actor_half_width = _actor_half_extents(actor) # 获取当前actor的半长和半宽，用于后续计算安全缓冲区，确保在换道过程中与该actor保持足够的距离，减少碰撞风险
+        is_front_actor = front_actor_id is not None and actor.id == front_actor_id # 判断当前actor是否是前车，通过比较actor的ID与前车ID来确定，如果是前车，后续计算中会使用更大的安全缓冲区，以反映与前车潜在的更高风险
+        longitudinal_buffer = ego_half_length + actor_half_length + (3.0 if is_front_actor else 2.0) # 计算纵向安全缓冲区，基于自车和actor的半长以及一个额外的安全距离（前车更大），确保在换道过程中与其他车辆保持足够的纵向距离，减少碰撞风险
+        lateral_margin = FRONT_CONFLICT_LATERAL_MARGIN if is_front_actor else 0.25
         lateral_buffer = ego_half_width + actor_half_width + lateral_margin
 
         actor_loc = actor.get_location()
@@ -342,7 +398,7 @@ def _candidate_collision_reason(trajectory, length, ego_speed, obstacle_actors, 
             actor_loc,
             trajectory.start_route_s,
             search_back=15.0,
-            search_ahead=length + longitudinal_buffer + 30.0,
+            search_ahead=check_length + longitudinal_buffer + 2.0,
         )
         actor_route_s = projection["route_s"]
         actor_lateral = projection["lateral"]
@@ -351,17 +407,25 @@ def _candidate_collision_reason(trajectory, length, ego_speed, obstacle_actors, 
         if getattr(actor, "attributes", {}).get("role_name", "") == "lead":
             actor_speed_along = 0.0
 
-        for index in range(sample_count + 1):
-            local_s = min(length, index * length / sample_count)
-            route_s = trajectory.start_route_s + local_s
+        for index in range(sample_count + 1): # 遍历采样点
+            local_s = min(check_length, index * check_length / sample_count)
+            route_s = trajectory.start_route_s + local_s # 计算当前采样点在全局路径上的纵向位置，基于换道起点位置和当前采样点的局部纵向位置计算得到，表示当前采样点在全局路径上的位置，供后续预测使用
             time_to_sample = local_s / max(ego_speed, 0.1)
-            predicted_actor_s = actor_route_s + actor_speed_along * time_to_sample
+            predicted_actor_s = actor_route_s + actor_speed_along * time_to_sample # 预测actor在当前采样点时间点的纵向位置，基于actor当前在全局路径上的位置和沿切线方向的速度预测得到，表示在换道过程中与该actor可能发生交互的时间点，供后续碰撞检查使用
             longitudinal_gap = predicted_actor_s - route_s
             if abs(longitudinal_gap) > longitudinal_buffer:
                 continue
             lateral_gap = actor_lateral - trajectory.avoidance_delta_at(local_s)
             if abs(lateral_gap) <= lateral_buffer:
-                return "candidate conflicts with front vehicle" if is_front_actor else "candidate conflicts with vehicle"
+                role_name = getattr(actor, "attributes", {}).get("role_name", actor.type_id)
+                return "{}: actor={}, local_s={:.1f}, longitudinal_gap={:.1f}, lateral_gap={:.2f}, lateral_buffer={:.2f}".format(
+                    "candidate conflicts with front vehicle" if is_front_actor else "candidate conflicts with vehicle",
+                    role_name,
+                    local_s,
+                    longitudinal_gap,
+                    lateral_gap,
+                    lateral_buffer,
+                )
     return ""
 
 

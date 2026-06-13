@@ -6,10 +6,10 @@ import carla
 
 from config import (
     DISTANCE_STD,
+    FRONT_CONFLICT_LATERAL_MARGIN,
     FRONT_DETECTION_RANGE,
     FRONT_FOV_HALF_ANGLE_DEG,
     FRONT_LANE_ADJACENT_THRESHOLD,
-    FRONT_LANE_SAME_THRESHOLD,
     FRONT_TOP_K,
     LANE_CLEAR_FRONT,
     MISS_DETECTION_PROB,
@@ -24,15 +24,21 @@ from config import (
     RIGHT_OBJECT_LONGITUDINAL_MIN,
     RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_OBJECT_TTC_THRESHOLD,
-    SAFE_DISTANCE,
     SENSOR_NOISE_ENABLED,
     SIDE_DETECTION_RANGE,
     SIDE_FOV_HALF_ANGLE_DEG,
     SPEED_STD,
     TTC_AVOID_THRESHOLD,
-    TTC_BRAKE_THRESHOLD,
 )
 from utils import SmoothRouteReference, dot_2d, smooth_reference_for, vector_length
+
+
+def _actor_half_width(actor, default_width=0.95):
+    bbox = getattr(actor, "bounding_box", None)
+    extent = getattr(bbox, "extent", None)
+    if extent is None:
+        return default_width
+    return max(0.1, float(extent.y))
 
 
 # ===================== 感知数据结构 =====================
@@ -51,7 +57,6 @@ class FrontVehicleReading:
     target_speed_along: float = 0.0
     lane_relative_lateral: float = 0.0
     is_same_lane: bool = True
-    risk_level: int = 0
 
 
 @dataclass
@@ -315,17 +320,17 @@ class VirtualGroundTruthSensor:
         """兼容旧接口：返回前方最近同车道车辆。"""
         readings = self.front_vehicles()
         for reading in readings:
-            if reading.is_front_vehicle and reading.is_same_lane:
+            if reading.is_front_vehicle and reading.is_same_lane: # 在前车列表中找到第一个既是前车又在同车道的目标，返回其感知数据；如果没有找到符合条件的目标，则返回一个距离为无穷大、速度为0、TTC为无穷大的默认感知数据，表示没有有效的前车
                 return reading
         return self._empty_front()
 
     def front_vehicles(self):
         """返回前方候选车辆列表。"""
-        if self._tracking_route is not None:
+        if self._tracking_route is not None: # 如果存在有效的跟踪路线，则基于跟踪路线进行前车投影筛选，返回前方候选车辆列表；如果没有有效的跟踪路线但启用了雷达且有雷达点云数据，则基于雷达点云进行前车检测，返回前方候选车辆列表；否则基于自车当前直角坐标系读取前方车辆，作为无路线参考时的兜底方案，返回前方候选车辆列表
             return self._tracking_route_front_vehicles()
-        if RADAR_ENABLED and self._radar_detections:
+        if RADAR_ENABLED and self._radar_detections: # 如果启用了雷达且有雷达点云数据，则基于雷达点云进行前车检测，返回前方候选车辆列表；否则基于自车当前直角坐标系读取前方车辆，作为无路线参考时的兜底方案，返回前方候选车辆列表
             return self._radar_front_vehicles()
-        return self._ego_frame_front_vehicles()
+        return self._ego_frame_front_vehicles() # 如果没有有效的跟踪路线但启用了雷达且有雷达点云数据，则基于雷达点云进行前车检测，返回前方候选车辆列表；否则基于自车当前直角坐标系读取前方车辆，作为无路线参考时的兜底方案，返回前方候选车辆列表
 
     def _ego_frame_front_vehicles(self):
         """用自车当前直角坐标系读取前方车辆，作为无路线参考时的兜底方案。"""
@@ -335,6 +340,7 @@ class VirtualGroundTruthSensor:
         right = ego_tf.get_right_vector()
         lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
         ego_speed_along = dot_2d(self.ego.get_velocity(), forward)
+        ego_half_width = _actor_half_width(self.ego)
 
         readings = []
         for vehicle in [self.lead] + self.front_extra_vehicles:
@@ -353,12 +359,13 @@ class VirtualGroundTruthSensor:
                 continue
 
             target_speed_along = dot_2d(vehicle.get_velocity(), forward)
+            is_same_lane = self._front_lateral_conflict(lateral, ego_half_width, _actor_half_width(vehicle))
             reading = self._make_front_reading(
                 distance=longitudinal,
                 closing_speed=ego_speed_along - target_speed_along,
                 lateral=lateral,
                 lane_relative=lane_relative,
-                is_same_lane=abs(lane_relative) < 0.65,
+                is_same_lane=is_same_lane,
                 actor_id=vehicle.id,
                 actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
                 target_speed_along=target_speed_along,
@@ -384,6 +391,7 @@ class VirtualGroundTruthSensor:
         )
         lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
         ego_speed_along = self._speed_along_projection(self.ego, ego_projection)
+        ego_half_width = _actor_half_width(self.ego)
 
         readings = []
         for vehicle in [self.lead] + self.front_extra_vehicles:
@@ -398,23 +406,25 @@ class VirtualGroundTruthSensor:
                 search_ahead=route.target_search_ahead,
             )
             longitudinal = target_projection["route_s"] - ego_projection["route_s"]
-            lateral = target_projection["lateral"] - ego_projection["lateral"]
-            lane_relative = lateral / lane_width
+            path_lateral = target_projection["lateral"]
+            ego_relative_lateral = path_lateral - ego_projection["lateral"]
+            lane_relative = path_lateral / lane_width
             if longitudinal <= 0.0 or abs(lane_relative) >= FRONT_LANE_ADJACENT_THRESHOLD:
                 continue
-            if not self._check_front_fov(longitudinal, lateral):
+            if not self._check_front_fov(longitudinal, ego_relative_lateral):
                 continue
-            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + lateral * lateral)):
+            if self._should_miss_detect(math.sqrt(longitudinal * longitudinal + ego_relative_lateral * ego_relative_lateral)):
                 continue
 
             target_speed_along = self._speed_along_projection(vehicle, target_projection)
+            is_same_lane = self._front_lateral_conflict(path_lateral, ego_half_width, _actor_half_width(vehicle))
             readings.append(
                 self._make_front_reading(
                     distance=longitudinal,
                     closing_speed=ego_speed_along - target_speed_along,
-                    lateral=lateral,
+                    lateral=path_lateral,
                     lane_relative=lane_relative,
-                    is_same_lane=abs(lateral) < lane_width * 0.45,
+                    is_same_lane=is_same_lane,
                     actor_id=vehicle.id,
                     actor_role=vehicle.attributes.get("role_name", vehicle.type_id),
                     target_speed_along=target_speed_along,
@@ -423,6 +433,15 @@ class VirtualGroundTruthSensor:
 
         readings.sort(key=lambda reading: reading.distance)
         return readings[:FRONT_TOP_K]
+
+    def _front_lateral_conflict(self, lateral_gap, ego_half_width=None, actor_half_width=None, default_actor_width=0.95):
+        """用候选轨迹硬约束同款横向包络判断当前路线是否与前车冲突。"""
+        if ego_half_width is None:
+            ego_half_width = _actor_half_width(self.ego)
+        if actor_half_width is None:
+            actor_half_width = default_actor_width
+        lateral_buffer = ego_half_width + actor_half_width + FRONT_CONFLICT_LATERAL_MARGIN
+        return abs(lateral_gap) <= lateral_buffer
 
     def _make_front_reading(
         self,
@@ -438,14 +457,6 @@ class VirtualGroundTruthSensor:
         noisy_distance = max(0.1, self._add_noise(distance, DISTANCE_STD))
         noisy_closing_speed = self._add_noise(closing_speed, SPEED_STD)
         ttc = noisy_distance / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
-        risk_level = 0
-        if is_same_lane and noisy_distance < SAFE_DISTANCE:
-            if ttc < TTC_AVOID_THRESHOLD:
-                risk_level = 3
-            elif ttc < TTC_BRAKE_THRESHOLD:
-                risk_level = 2
-            elif noisy_distance < SAFE_DISTANCE * 0.6:
-                risk_level = 1
         return FrontVehicleReading(
             distance=noisy_distance,
             closing_speed=noisy_closing_speed,
@@ -457,16 +468,15 @@ class VirtualGroundTruthSensor:
             target_speed_along=target_speed_along,
             lane_relative_lateral=lane_relative,
             is_same_lane=is_same_lane,
-            risk_level=risk_level,
         )
 
     def _radar_front_vehicles(self):
         """将 CARLA 雷达原始点云聚类为前方候选目标。"""
         ego_tf = self.ego.get_transform()
         ego_loc = ego_tf.location
-        right = ego_tf.get_right_vector()
         lane_width = max(self.carla_map.get_waypoint(ego_loc).lane_width, 2.5)
         ego_speed_along = dot_2d(self.ego.get_velocity(), ego_tf.get_forward_vector())
+        ego_half_width = _actor_half_width(self.ego)
 
         clusters = []
         for detection in self._radar_detections:
@@ -500,13 +510,18 @@ class VirtualGroundTruthSensor:
                 continue
             closing_speed = max(0.0, -cluster["velocity"])
             target_speed_along = max(0.0, ego_speed_along - closing_speed)
+            is_same_lane = self._front_lateral_conflict(
+                cluster["lateral"],
+                ego_half_width,
+                default_actor_width=RADAR_CLUSTER_RADIUS * 0.5,
+            )
             readings.append(
                 self._make_front_reading(
                     distance=cluster["longitudinal"],
                     closing_speed=closing_speed,
                     lateral=cluster["lateral"],
                     lane_relative=lane_relative,
-                    is_same_lane=abs(lane_relative) < FRONT_LANE_SAME_THRESHOLD,
+                    is_same_lane=is_same_lane,
                     actor_role="radar_cluster",
                     target_speed_along=target_speed_along,
                 )
