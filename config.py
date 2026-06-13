@@ -15,14 +15,14 @@ LEAD_TARGET_SPEED = 13.0
 TTC_BRAKE_THRESHOLD = 4.5
 TTC_AVOID_THRESHOLD = 3.6
 SAFE_DISTANCE = 34.0
-LANE_CLEAR_FRONT = 45.0
-LANE_CLEAR_REAR = 18.0
+LANE_CLEAR_FRONT = 32.0  # 邻道只看近距离，避免远处车辆导致过度保守
+LANE_CLEAR_REAR = 14.0
 
 # ========= 前向/右侧感知增强参数 =========
-FRONT_LANE_SAME_THRESHOLD = 0.4
-FRONT_LANE_ADJACENT_THRESHOLD = 1.2
+FRONT_LANE_SAME_THRESHOLD = 0.38  # 前车必须足够接近本车道中心线
+FRONT_LANE_ADJACENT_THRESHOLD = 0.75  # 邻道目标不参与前车风险，只保留近邻候选
 FRONT_TOP_K = 2
-RIGHT_CONFIRM_FRAMES = 3
+RIGHT_CONFIRM_FRAMES = 2
 
 LANE_CHANGE_LENGTH = 28.0
 MPC_HORIZON_STEPS = 18
@@ -49,7 +49,7 @@ TOWN10_RIGHT_TURN_PREPARE_HEADING_TOLERANCE = 15.0
 ROUTE_COMPLETION_HOLD_SECONDS = 4.0
 
 RIGHT_OBJECT_TTC_THRESHOLD = 5.0
-RIGHT_OBJECT_DETECT_DISTANCE = 34.0
+RIGHT_OBJECT_DETECT_DISTANCE = 24.0  # 右转让行只在靠近冲突区时触发
 RIGHT_OBJECT_STOP_DISTANCE = 13.0
 RIGHT_OBJECT_STOP_RELEASE_DISTANCE = 14.5
 RIGHT_OBJECT_YIELD_SPEED = 3.0
@@ -91,21 +91,33 @@ SLOW_RIGHT_LANE_ROLE_NAME = "slow_right_lane_vehicle"
 SENSOR_NOISE_ENABLED = True
 FRONT_DETECTION_RANGE = 80.0
 SIDE_DETECTION_RANGE = 30.0
-FRONT_FOV_HALF_ANGLE_DEG = 60.0
+FRONT_FOV_HALF_ANGLE_DEG = 28.0  # 前向虚拟感知收窄，减少邻道误检
 SIDE_FOV_HALF_ANGLE_DEG = 75.0
 DISTANCE_STD = 0.5
 SPEED_STD = 0.3
 MISS_DETECTION_PROB = 0.05
 
+
+# ========= 左侧传感器/侧向切入监测参数 =========
+# 只用于监测和 HUD 展示，不直接让主车减速，避免邻道车导致过度保守。
+LEFT_SENSOR_ENABLED = True
+LEFT_SENSOR_LONGITUDINAL_BACK = 12.0
+LEFT_SENSOR_LONGITUDINAL_FRONT = 22.0
+LEFT_SENSOR_LATERAL_MIN = 0.4
+LEFT_SENSOR_LATERAL_MAX = 4.8
+LEFT_SENSOR_WARN_DISTANCE = 3.2
+LEFT_SENSOR_DANGER_DISTANCE = 1.4
+LEFT_SENSOR_TTC_THRESHOLD = 2.5
+
 # ========= CARLA 毫米波雷达参数 =========
 RADAR_ENABLED = True                  # 是否启用 CARLA 前向毫米波雷达（False 时回退到虚拟真值+噪声）
 RADAR_RANGE = 80.0                    # 雷达最大检测距离 (米)
-RADAR_FOV_HORIZONTAL_DEG = 60.0       # 雷达水平 FOV (度)，±30° 即 60° 总视野
+RADAR_FOV_HORIZONTAL_DEG = 35.0       # 雷达水平 FOV (度)，±30° 即 60° 总视野
 RADAR_FOV_VERTICAL_DEG = 15.0         # 雷达垂直 FOV (度)
 RADAR_POINTS_PER_SECOND = 1500        # 雷达每秒输出点云数量
 RADAR_CLUSTER_RADIUS = 1.8            # 点云聚类半径 (米)，低于此距离的点归为同一目标
-RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数，低于此数目忽略
-RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内的雷达检测（过滤地面杂波/自车反射）
+RADAR_MIN_POINTS_PER_CLUSTER = 2      # 聚类最少点数，低于此数目忽略
+RADAR_MIN_DISTANCE = 4.0              # 忽略前方 7 米内的雷达检测（过滤地面杂波/自车反射）
 
 # ========= 混合感知参数 =========
 HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角身份匹配；False: 纯雷达模式
@@ -114,6 +126,25 @@ HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配
 
 DEBUG_DRAW_TRAJECTORY = True
 DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
-DEBUG_DRAW_TRAJECTORY_STEP = 2.0
-DEBUG_DRAW_INTERVAL_FRAMES = 4
-DEBUG_DRAW_LIFETIME = 0.25
+DEBUG_DRAW_TRAJECTORY_STEP = 3.0  # 轨迹点间距，保持稀疏，避免整屏发光
+DEBUG_DRAW_INTERVAL_FRAMES = 4  # 每约0.2s刷新一次轨迹，减少闪烁但不过亮
+DEBUG_DRAW_LIFETIME = 0.28  # 生命周期略大于刷新间隔，保证连续显示
+
+
+
+# ========= 传感器可视化参数 =========
+# 线段/文字都由当帧感知结果驱动，只用于展示，不参与控制。
+DEBUG_DRAW_SENSOR_READINGS = True        # 在 CARLA 世界中绘制 3D 感知线
+DEBUG_DRAW_SENSOR_OVERLAY = True         # 在 pygame 画面中绘制 2D 感知示意
+DEBUG_DRAW_SENSOR_IDLE_RAYS = False      # 默认不画空闲射线，避免整屏发光；HUD 仍显示 clear
+DEBUG_DRAW_SENSOR_INTERVAL_FRAMES = 2  # 每约0.1s刷新一次传感器线，避免一闪一闪
+DEBUG_DRAW_SENSOR_LIFETIME = 0.22  # 生命周期略大于刷新间隔，显示更连续
+DEBUG_DRAW_SENSOR_Z_OFFSET = 0.42
+DEBUG_DRAW_SENSOR_IDLE_LENGTH = 5.0
+DEBUG_DRAW_SENSOR_WORLD_LABELS = False     # 3D 世界里不画文字标签，避免遮挡；右下角 HUD 负责文字说明
+
+# ========= 传感器接入开关 =========
+# 目前决策只使用前向雷达融合；侧向雷达和语义相机先关闭，避免占位数据影响演示。
+SIDE_RADAR_ENABLED = False
+CAMERA_ENABLED = False
+TRACKER_ENABLED = False

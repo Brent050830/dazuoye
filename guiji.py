@@ -256,22 +256,22 @@ def draw_debug_marker(world, location, color, life_time=DEBUG_DRAW_LIFETIME):
     """在 CARLA 世界中画一个醒目的短生命周期目标点。"""
     marker_base = carla.Location(location.x, location.y, location.z + 0.35)
     marker_top = carla.Location(location.x, location.y, location.z + 2.0)
-    world.debug.draw_point(marker_base, size=0.18, color=color, life_time=life_time)
-    world.debug.draw_line(marker_base, marker_top, thickness=0.08, color=color, life_time=life_time)
+    world.debug.draw_point(marker_base, size=0.07, color=color, life_time=life_time)
+    world.debug.draw_line(marker_base, marker_top, thickness=0.020, color=color, life_time=life_time)
 
 
 def draw_route_lookahead_marker(world, loop_route, lookahead_distance=DEBUG_DRAW_LOOKAHEAD_DISTANCE):
     """在正常路线前方约 lookahead_distance 处画红色目标标记。"""
     lookahead_steps = max(1, int(lookahead_distance / loop_route.step_distance))
     target_index = min(loop_route.last_index + lookahead_steps, len(loop_route.points) - 1)
-    draw_debug_marker(world, loop_route.points[target_index], carla.Color(255, 0, 0))
+    draw_debug_marker(world, loop_route.points[target_index], carla.Color(145, 35, 25))
 
 
 def draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory, lookahead_distance=DEBUG_DRAW_LOOKAHEAD_DISTANCE):
     """在当前避障轨迹前方约 lookahead_distance 处画红色目标标记。"""
     progress, _ = trajectory.to_local(ego_vehicle.get_location())
     target_s = min(trajectory.length + lookahead_distance, progress + lookahead_distance)
-    draw_debug_marker(world, trajectory.location_at(target_s), carla.Color(255, 0, 0))
+    draw_debug_marker(world, trajectory.location_at(target_s), carla.Color(145, 35, 25))
 
 
 def draw_avoidance_candidates(world, candidates, selected_trajectory):
@@ -283,8 +283,8 @@ def draw_avoidance_candidates(world, candidates, selected_trajectory):
             continue
         trajectory = candidate.trajectory
         is_selected = trajectory is selected_trajectory
-        color = carla.Color(0, 255, 40) if is_selected else carla.Color(0, 170, 0)
-        thickness = 0.08 if is_selected else 0.04
+        color = carla.Color(0, 120, 38) if is_selected else carla.Color(0, 72, 25)
+        thickness = 0.030 if is_selected else 0.016
         s = 0.0
         previous = trajectory.location_at(s) + carla.Location(z=0.18)
         while s < trajectory.length:
@@ -305,6 +305,103 @@ def draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, can
         draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory)
     elif state == "ROUTE_FOLLOW":
         draw_route_lookahead_marker(world, loop_route)
+
+
+
+def _sensor_distance_ok(value):
+    return value is not None and math.isfinite(value) and value < 98.0
+
+
+def _sensor_color(risk_level, active=False):
+    """传感器可视化颜色：绿=检测到低风险，黄/橙=注意，红=当前状态触发。"""
+    if active or risk_level >= 3:
+        return carla.Color(185, 38, 28)
+    if risk_level == 2:
+        return carla.Color(185, 95, 12)
+    if risk_level == 1:
+        return carla.Color(170, 145, 12)
+    return carla.Color(0, 125, 68)
+
+
+def _relative_sensor_point(ego_tf, longitudinal, lateral, z_offset):
+    forward = ego_tf.get_forward_vector()
+    right = ego_tf.get_right_vector()
+    return ego_tf.location + carla.Location(
+        x=forward.x * longitudinal + right.x * lateral,
+        y=forward.y * longitudinal + right.y * lateral,
+        z=z_offset,
+    )
+
+
+def _draw_sensor_ray(world, start, end, label, color, life_time):
+    # 传感器线只做低亮度状态提示；文字交给 pygame HUD，避免 3D 画面光污染。
+    world.debug.draw_line(start, end, thickness=0.030, color=color, life_time=life_time)
+    world.debug.draw_point(end, size=0.075, color=color, life_time=life_time)
+    if getattr(config, "DEBUG_DRAW_SENSOR_WORLD_LABELS", False):
+        world.debug.draw_string(
+            end + carla.Location(z=0.28),
+            label,
+            draw_shadow=False,
+            color=color,
+            life_time=life_time,
+        )
+
+
+def draw_sensor_debug(world, ego_vehicle, state, front, left_side, right_object, frame):
+    """根据当帧 FRONT/LEFT/RIGHT reading 绘制传感器线，避免固定摆样子。"""
+    if not getattr(config, "DEBUG_DRAW_SENSOR_READINGS", True):
+        return
+    interval = max(1, int(getattr(config, "DEBUG_DRAW_SENSOR_INTERVAL_FRAMES", 2)))
+    if frame % interval != 0:
+        return
+
+    life_time = getattr(config, "DEBUG_DRAW_SENSOR_LIFETIME", 0.35)
+    z_offset = getattr(config, "DEBUG_DRAW_SENSOR_Z_OFFSET", 0.75)
+    idle_length = getattr(config, "DEBUG_DRAW_SENSOR_IDLE_LENGTH", 8.0)
+    draw_idle = getattr(config, "DEBUG_DRAW_SENSOR_IDLE_RAYS", True)
+
+    ego_tf = ego_vehicle.get_transform()
+    origin = ego_tf.location + carla.Location(z=z_offset)
+
+    # FRONT：长度来自前向感知距离；AVOID/EMERGENCY_BRAKE 时高亮为红色。
+    front_active = state in ("AVOID", "EMERGENCY_BRAKE") and getattr(front, "is_front_vehicle", False)
+    if getattr(front, "is_front_vehicle", False) and _sensor_distance_ok(front.distance):
+        end = _relative_sensor_point(ego_tf, front.distance, getattr(front, "lateral_offset", 0.0), z_offset)
+        color = _sensor_color(getattr(front, "risk_level", 0), front_active)
+        ttc = front.ttc if math.isfinite(front.ttc) else 99.9
+        _draw_sensor_ray(world, origin, end, "FRONT {:.1f}m TTC {:.1f}".format(front.distance, ttc), color, life_time)
+    elif draw_idle:
+        end = _relative_sensor_point(ego_tf, idle_length, 0.0, z_offset)
+        _draw_sensor_ray(world, origin, end, "FRONT clear", carla.Color(25, 75, 115), life_time)
+
+    # LEFT：只展示左侧监测结果，不直接触发控制。
+    if _sensor_distance_ok(getattr(left_side, "distance", float("inf"))):
+        end = _relative_sensor_point(
+            ego_tf,
+            getattr(left_side, "longitudinal", 0.0),
+            -abs(getattr(left_side, "distance", 0.0)),
+            z_offset,
+        )
+        color = _sensor_color(getattr(left_side, "risk_level", 0), False)
+        _draw_sensor_ray(world, origin, end, "LEFT {:.1f}m".format(left_side.distance), color, life_time)
+    elif draw_idle:
+        end = _relative_sensor_point(ego_tf, 0.0, -idle_length * 0.55, z_offset)
+        _draw_sensor_ray(world, origin, end, "LEFT clear", carla.Color(35, 80, 115), life_time)
+
+    # RIGHT：长度来自右侧目标 reading；RIGHT_OBJECT_YIELD 时高亮为红色。
+    right_active = state == "RIGHT_OBJECT_YIELD" or getattr(right_object, "risk_level", 0) >= 2
+    if _sensor_distance_ok(getattr(right_object, "distance", float("inf"))):
+        end = _relative_sensor_point(
+            ego_tf,
+            getattr(right_object, "longitudinal", 0.0),
+            abs(getattr(right_object, "lateral", right_object.distance)),
+            z_offset,
+        )
+        color = _sensor_color(getattr(right_object, "risk_level", 0), right_active)
+        _draw_sensor_ray(world, origin, end, "RIGHT {:.1f}m".format(right_object.distance), color, life_time)
+    elif draw_idle:
+        end = _relative_sensor_point(ego_tf, 0.0, idle_length * 0.55, z_offset)
+        _draw_sensor_ray(world, origin, end, "RIGHT clear", carla.Color(35, 105, 105), life_time)
 
 
 def main(args=None):
@@ -405,7 +502,7 @@ def main(args=None):
 
             def side_radar_callback(data):
                 """Side radar callback."""
-                sensor._side_radar_detections = data
+                sensor.set_side_radar_detections(data)
 
             side_radar.listen(side_radar_callback)
             print("Side radar sensor mounted: range={:.0f}m, fov={:.0f}deg".format(
@@ -569,7 +666,8 @@ def main(args=None):
                 sensor.clear_front_reference_points()
 
             front = sensor.front_vehicle(use_route_reference=True) # 获取前车的感知信息；ROUTE_FOLLOW 使用原路线弧线参考，AVOID 使用避障轨迹加后续路线的联合参考
-            right_object = sensor.right_side_object(loop_route.last_index) # 获取右侧过街物体的感知信息，调用传感器的 right_side_object 方法获取当前右侧过街物体的距离、TTC 等信息，供控制决策使用
+            right_object = sensor.right_side_object(loop_route.last_index) # 获取右侧过街物体的感知信息，供右转让行使用
+            left_side = sensor.side_vehicle("left") # 左侧邻车监测：只用于显示和逻辑完整性，不直接影响当前控制
             ego_speed = get_speed(ego_vehicle)
 
             close_slow_front_vehicle = (
@@ -602,7 +700,7 @@ def main(args=None):
 
             """以下的if语句为状态切换逻辑，根据当前状态和感知信息判断是否需要切换到避障状态、紧急制动状态或右侧物体避让状态，并设置相应的状态变量和输出相关信息"""
 
-            if state == "ROUTE_FOLLOW" and emergency_needed:
+            if state == "ROUTE_FOLLOW" and emergency_needed and not right_object_risk:
                 """从路线跟踪状态切换到避障状态，调用 choose_avoidance_side 函数根据邻道净空状况选择避障换道方向；避障/让行完成后仍回到 ROUTE_FOLLOW，允许再次触发前方避障。"""
                 avoidance_side = choose_avoidance_side(sensor)
                 if avoidance_side is not None:
@@ -843,15 +941,20 @@ def main(args=None):
 
             draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, avoidance_candidates, frame)
 
+            draw_sensor_debug(world, ego_vehicle, state, front, left_side, right_object, frame)
+
             if frame % int(1.0 / FIXED_DELTA_SECONDS) == 0:
                 """每秒输出一次当前状态和关键信息，包括仿真时间、当前状态、前车距离和TTC、右侧物体距离和TTC、自车速度、前车速度、控制命令等，供调试和分析使用"""
                 print(
                     "t={:05.2f}s state={:<18} dist={:05.1f}m ttc={:05.2f}s "
-                    "right={:05.1f}m r_ttc={:05.2f}s ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
+                    "left={:04.1f}m Lrisk={} right={:05.1f}m r_ttc={:05.2f}s "
+                    "ego={:04.1f}m/s lead={:04.1f}m/s steer={:+.2f} brake={:.2f}".format(
                         sim_time,
                         state,
                         front.distance,
                         front.ttc if math.isfinite(front.ttc) else 99.99,
+                        left_side.distance if math.isfinite(left_side.distance) else 99.9,
+                        left_side.risk_level,
                         right_object.distance if math.isfinite(right_object.distance) else 99.9,
                         right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
                         ego_speed,
@@ -880,6 +983,11 @@ def main(args=None):
                     "right_object_ttc": right_object.ttc,
                     "right_object_type": right_object.object_type,
                     "right_risk_level": right_object.risk_level,
+                    "left_side_distance": left_side.distance,
+                    "left_side_ttc": left_side.ttc,
+                    "left_side_role": left_side.actor_role,
+                    "left_side_risk_level": left_side.risk_level,
+                    "sensor_overlay_enabled": getattr(config, "DEBUG_DRAW_SENSOR_OVERLAY", True),
                     "steer": ego_control.steer,
                     "throttle": ego_control.throttle,
                     "brake": ego_control.brake,
