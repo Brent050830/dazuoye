@@ -2385,8 +2385,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：本次尚未启动 CARLA 实景回归；右侧优先可能让规划器在代价略高但安全的右偏候选和更低代价左偏候选之间选择右偏，需在 pygame/CARLA 画面中确认视觉路径符合预期。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e870854`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-13 - 前车规划触发改为极限距离并统一横向包络
 
@@ -2396,8 +2396,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：尚未启动 CARLA 实景回归；极限距离参数初值可能需要根据急停前车和弯道慢车画面继续调参；候选冲突检测仍是简化包络，不是车辆多边形精确碰撞。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e870854`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-13 - 剪枝前车 TTC 风险等级和旧安全距离配置
 
@@ -2407,8 +2407,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
 - 未覆盖风险：右侧目标仍保留 `risk_level` 和 TTC 触发，本次没有改右侧让行逻辑；历史 PR 记录中的旧 TTC/SAFE_DISTANCE 描述保留为历史上下文。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/config.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e870854`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-13 - 加密短避障长度并保留段内硬筛
 
@@ -2418,8 +2418,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py` 和 `git diff --check`；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`。加入最小长度下限和拒绝诊断后完整跑完一圈，第一段普通避障 `valid=2/102`、`length=28.0m`、`target_offset=4.20m`，较小右偏样例显示 `target=0.53/0.88/1.23/1.58/1.93m` 均在 `local_s=14.9m` 处与前车横向包络冲突，`lateral_buffer=2.35m`。
 - 未覆盖风险：短 length 候选已经存在，但当前段内硬筛后仍只剩少数有效候选，第一段仍选大右偏 `4.20m`；若要进一步减小偏移，需要继续调整横向硬筛余量、右侧优先策略或偏移代价，而不是只增加短 length。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e870854`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-13 - 增加中等右偏与可变横向过渡比例
 
@@ -2429,5 +2429,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile guiji.py control.py perception.py route.py actors.py display.py utils.py config.py` 和 `git diff --check`；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完整跑完 Town10 固定路线一圈，最终 `Collisions: 0`、`Cleanup finished`。第一次急停前车避障在 `6.40s` 规划，候选 `valid=8/402`，选择 `length=32.2m`、`target_offset=3.85m`、`transition_ratio=0.85`、`ay=3.62m/s^2`，未再选择 `4.20m`。
 - 未覆盖风险：候选总数增加到数百级，当前 `--free-run` 可跑通，但 1x pygame 演示中的帧耗时仍需观察；`transition_ratio=0.75` 在近距离大偏移时多被横向加速度硬约束拒绝，后续若还想更激进，需要同步调低速度或调整最大横向加速度参数；回归阻塞期间仍可能打印较多聚合日志。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：本地未提交。
-- PR/分支信息：本地未推送。
+- 提交代号/Commit ID：`e870854`
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
