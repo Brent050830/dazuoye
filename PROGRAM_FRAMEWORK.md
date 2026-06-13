@@ -2396,7 +2396,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile config.py utils.py route.py actors.py perception.py control.py display.py guiji.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已用 `rg` 检查当前代码中恢复了 `FrontLimitDecision`、`ReplacementSegment`、`_base_tracking_route`、`_replacement_segments`、`transition_ratio` 等 #11 关键符号，且未发现 `lane_clear`、`choose_avoidance_side` 或显式 `AVOID` 状态分支；已尝试运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，但 CARLA 服务端 `localhost:2000` 连接等待 120s 超时，未进入仿真回归。
 - 未覆盖风险：本次尚未完成 CARLA 实景 `--free-run` 回归，仍需在 simulator 启动后观察急停前车、弯道慢车和右转右侧目标场景；保留的左侧侧向监测只进入 HUD，不参与控制，若后续要把真实雷达/侧向传感器接入决策，需要另起任务契约；仓库仍有历史遗留的已跟踪 `__pycache__` 文件，编译时会被弄脏，需要避免混入提交。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/config.py`、`dazuoye/utils.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：`8d72709`。
+- 提交代号/Commit ID：`764b197`。
 - PR/分支信息：本地恢复中，尚未推送。
 
 ### 2026-06-13 - 前车规划触发改为极限距离并统一横向包络
