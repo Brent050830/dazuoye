@@ -250,6 +250,33 @@ DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
 DEBUG_DRAW_TRAJECTORY_STEP = 2.0
 DEBUG_DRAW_INTERVAL_FRAMES = 4
 DEBUG_DRAW_LIFETIME = 0.25
+# 传感器模拟参数（阶段一：噪声叠加层）
+SENSOR_NOISE_ENABLED = True
+FRONT_DETECTION_RANGE = 80.0          # 前向雷达最大检测距离 (米)
+SIDE_DETECTION_RANGE = 30.0           # 侧向检测最大距离 (米)
+FRONT_FOV_HALF_ANGLE_DEG = 60.0       # 前向 FOV 半角 (度)
+SIDE_FOV_HALF_ANGLE_DEG = 75.0        # 侧向 FOV 半角 (度)
+DISTANCE_STD = 0.5                    # 距离测量噪声标准差 (米)
+SPEED_STD = 0.3                       # 速度测量噪声标准差 (m/s)
+MISS_DETECTION_PROB = 0.05            # 漏检概率 (0~1)
+
+# 传感器模拟参数（阶段二：CARLA 毫米波雷达）
+RADAR_ENABLED = True                  # 是否启用 CARLA 前向毫米波雷达
+RADAR_RANGE = 80.0                    # 雷达最大检测距离 (米)
+RADAR_FOV_HORIZONTAL_DEG = 60.0       # 雷达水平 FOV (度)
+RADAR_FOV_VERTICAL_DEG = 15.0         # 雷达垂直 FOV (度)
+RADAR_CLUSTER_RADIUS = 1.8            # 点云聚类半径 (米)
+RADAR_MIN_POINTS_PER_CLUSTER = 3      # 聚类最少点数
+RADAR_MIN_DISTANCE = 7.0              # 忽略前方 7 米内雷达检测（过滤地面杂波/自车反射）
+
+# 混合感知参数
+HYBRID_PERCEPTION_MODE = True         # True: 雷达测距 + 上帝视角身份匹配；False: 纯雷达模式
+HYBRID_MATCH_RADIUS = 3.0             # 雷达聚类与上帝视角 Actor 匹配的最大欧氏距离 (米)
+DEBUG_DRAW_TRAJECTORY = True
+DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
+DEBUG_DRAW_TRAJECTORY_STEP = 2.0
+DEBUG_DRAW_INTERVAL_FRAMES = 4
+DEBUG_DRAW_LIFETIME = 0.25
 ```
 
 后续加入场景开关时，可以再增加：
@@ -866,6 +893,71 @@ d_{\mathrm{right}} = \operatorname{dot}_{2D}(\Delta p,\ r_e)
 $$
 
 如果存在多个右侧目标，当前优先返回处于冲突窗口内且 TTC/距离更危险的目标；否则返回最近的非冲突目标用于显示。
+
+### 8.3 传感器噪声模拟层（阶段一）
+
+`VirtualGroundTruthSensor` 在虚拟真值基础上叠加了传感器噪声模拟，用于模拟真实传感器的 FOV 限制、距离/速度测量误差和漏检。
+
+噪声模型使用固定种子（`20260606`）的 Box-Muller 高斯随机数生成器，不依赖 numpy。当 `SENSOR_NOISE_ENABLED=False` 时所有噪声辅助方法退化回虚拟真值，实现零开销回退。
+
+**辅助方法：**
+
+- `_add_noise(value, std)`：用 Box-Muller 方法生成高斯噪声，返回 `value + noise * std`。
+- `_check_front_fov(longitudinal, lateral)`：检查目标是否在前向 FOV（±60°，120° 总视野，80m 检测距离）内。
+- `_check_side_fov(longitudinal, lateral)`：检查目标是否在侧向 FOV（±75°，仅检测 `lateral > 0` 右侧目标，30m 检测距离）内。
+- `_should_miss_detect(distance)`：对超出 50m 的目标以 5% 概率漏检。
+
+**噪声叠加策略：**
+
+- `front_vehicles()`（虚拟真值模式）：对纵向距离叠加 `DISTANCE_STD=0.5m` 高斯噪声，对接近速度叠加 `SPEED_STD=0.3m/s` 高斯噪声；几何门限和车道判断使用去噪原始纵向/横向位置，TTC 和风险等级基于噪声后的距离。
+- `_right_side_object_reading()`：同样叠加噪声；`predicted_ttc` 叠加标准差 0.3s 的高斯噪声；所有 FOV 和漏检均生效。
+
+### 8.4 CARLA 毫米波雷达传感器（阶段二）
+
+当 `RADAR_ENABLED=True` 时，`guiji.py` 在自车前保险杠处挂载 CARLA `sensor.other.radar`，每帧输出约 1500 个 `RadarDetection` 点云。`VirtualGroundTruthSensor` 通过 `set_radar_detections()` 接收原始点云，由 `_process_radar_detections()` 完成点云→目标聚类→`FrontVehicleReading` 列表的转换。
+
+**雷达参数：**
+
+- 水平 FOV: `RADAR_FOV_HORIZONTAL_DEG = 60°`（±30°）
+- 最大检测距离: `RADAR_RANGE = 80m`
+- 点云每秒: 1500 点
+- 挂载位置: 自车前保险杠 `(x=2.0, z=0.5)`，前向
+
+**聚类算法（无需 numpy）：**
+
+1. 将每个 `RadarDetection` 按方位角 `azimuth` 和径向距离 `depth` 转换为自车坐标系 `(longitudinal, lateral, radial_velocity)`。
+2. 按纵向距离升序排序。
+3. 使用欧氏距离聚类：对每个点，找最近的聚类中心，若距离 < `RADAR_CLUSTER_RADIUS=1.8m` 则合并，否则新建聚类。
+4. 过滤点数不足 `RADAR_MIN_POINTS_PER_CLUSTER=3` 的聚类（减少噪点虚警）。
+5. 每个聚类取中心位置和平均径向速度，计算车道归属、接近速度和 TTC，输出 `FrontVehicleReading`。
+
+**雷达 vs 虚拟真值切换：**
+
+`front_vehicles()` 在 `RADAR_ENABLED=True` 且 `_radar_detections` 非空时优先调用 `_process_radar_detections()`；若雷达聚类结果为空（前车超出稳定聚类范围或杂波被全部过滤），则自动回退到虚拟真值 + 阶段一噪声模拟。输出格式 (`FrontVehicleReading`) 不变，`guiji.py` 行为决策层无需任何改动。
+
+**混合感知模式（身份匹配与杂波过滤）：**
+
+当 `HYBRID_PERCEPTION_MODE=True` 时，`_process_radar_detections()` 在聚类完成后额外执行：
+1. 收集场景中所有上帝视角 vehicle 在前方 FOV 内的真实位置；
+2. 将每个雷达聚类中心与最近的上帝视角 Actor 做欧氏距离匹配（阈值 `HYBRID_MATCH_RADIUS=3.0m`）；
+3. 匹配成功的聚类用上帝视角 Actor 的 `id` 和 `role_name` 填充 `actor_id`/`actor_role`；
+4. **匹配失败的聚类视为地面杂波/自车反射，直接丢弃**，避免幽灵目标触发虚假避障。
+
+**雷达最小距离过滤：**
+
+聚类循环中，`avg_long < RADAR_MIN_DISTANCE` 的聚类被直接跳过，过滤掉自车前方 7m 内的地面杂波和自车反射。
+
+**侧向雷达挂载与回调（阶段四占位）：**
+
+`guiji.py` 在自车右侧挂载第二个 CARLA `sensor.other.radar`（水平 FOV=150°，范围 30m，yaw=90°），`VirtualGroundTruthSensor` 通过 `set_side_radar_detections()` 接收原始点云。当前该数据仅存储为占位符，尚未接入右侧目标感知链路。
+
+**前向 RGB + 语义分割相机挂载（阶段三）：**
+
+`guiji.py` 在自车前方挂载一个 RGB 相机和一个语义分割相机，语义分割相机通过 `set_camera_classifications()` 将 CityScapes 语义标签传给 sensor。当前相机数据仅存储，尚未接入视觉感知链路。
+
+**Alpha-Beta 跟踪器（阶段五占位）：**
+
+`guiji.py` 中初始化 `AlphaBetaTracker`（当 `TRACKER_ENABLED=True`），每帧收集所有动态 Actor 作为检测输入，调用 `tracker.predict()` 和 `tracker.update()`。当前跟踪器为占位实现，尚未输出稳定 track 供决策层使
 
 ## 9. 风险评估层
 
@@ -2212,6 +2304,17 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 提交代号/Commit ID：`5d326ea`。
 - PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
+### 2026-06-06 - 增强感知数据结构与迁移风险评估至感知层
+
+- 本次目标：增强感知数据结构，将分散在 guiji.py 的风险判断逻辑迁移到 perception.py 的 assess_risk() 方法中，并在终端日志输出新感知字段。
+- 主要改动：FrontVehicleReading 新增 lane_relative_lateral、is_same_lane、risk_level 字段；RightSideObjectReading 新增 relative_longitudinal、relative_lateral、risk_level、predicted_ttc、object_type 等字段；新增 RiskAssessment 数据类，整合前车和右侧目标风险判断；VirtualGroundTruthSensor.front_vehicles() 返回 Top-K 前方车辆并区分车道归属；VirtualGroundTruthSensor.right_side_object() 增加连续帧确认、自车速度自适应检测距离、运动预测和目标类型区分；VirtualGroundTruthSensor.lane_clear() 放宽路口车道匹配并加入相对速度判断；新增 VirtualGroundTruthSensor.assess_risk() 统一风险评估入口；guiji.py 移除散落的风险布尔量计算，统一调用 sensor.assess_risk()；guiji.py 日志输出增加 object_type 和 predicted_ttc；移除对 RIGHT_OBJECT_DETECT_DISTANCE、RIGHT_OBJECT_TTC_THRESHOLD 的导入（已迁移至感知层）；移除 QuinticLaneChangeTrajectory 未使用导入；config.py 新增 8 个感知增强参数。
+- 为什么这样改：原 guiji.py 状态机中散落多处相同的风险计算逻辑，不利于维护。将这些逻辑集中到 assess_risk() 方法后，行为决策层只需读取 RiskAssessment 字段，新增目标角色或调整阈值时不影响主循环。感知数据增强也为后续更精细的决策（如同车道 vs 邻车道差异化制动、右转转向避让）提供信息基础。
+- 
+### 2026-06-06 - 虚拟传感器叠加噪声模拟层（阶段一）
+
+- 本次目标：在虚拟真值传感器 VirtualGroundTruthSensor 上叠加 FOV 限制、高斯距离/速度噪声和漏检概率模拟，使感知输出更接近真实传感器特性，同时保留零开销回退到虚拟真值的能力。
+- 主要改动：新增 7 个传感器噪声模拟参数 (DISTANCE_STD、SPEED_STD、FRONT_DETECTION_RANGE、FRONT_FOV_HALF_ANGLE_DEG、SIDE_DETECTION_RANGE、SIDE_FOV_HALF_ANGLE_DEG、MISS_DETECTION_PROB)；在 VirtualGroundTruthSensor 中新增 _add_noise() (Box-Muller 高斯)、_check_front_fov()、_check_side_fov()、_should_miss_detect() 四个辅助方法；front_vehicles() 和 _right_side_object_reading() 中集成噪声叠加逻辑；新增 lane_relative_lateral、is_adjacent_lane、actor_id、actor_role 字段到 FrontVehicleReading；统一风险等级计算逻辑 (0 安全 ~ 3 危险)；RightSideObjectReading 新增 predicted_ttc、risk_level、lateral_offset、longitudinal_offset 字段；assess_risk() 中前车紧急制动恢复判定增加滞回阈值。
+- 
 ### 2026-06-07 - 调整右转冲突几何门限为右后方优先
 
 - 本次目标：让 `R344 -> R20` 右转让行的冲突区域更符合“自车右转切入右侧直行非机动车流”的实际场景。
@@ -2223,6 +2326,17 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 提交代号/Commit ID：`5d326ea`。
 - PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
+### 2026-06-06 - 接入 CARLA 前向毫米波雷达，点云聚类替换虚拟真值（阶段二）
+
+- 本次目标：在自车前保险杠挂载 CARLA sensor.other.radar，通过欧氏距离聚类将原始 RadarDetection 点云转换为 FrontVehicleReading 目标列表，使 front_vehicles() 在 RADAR_ENABLED=True 时使用真实雷达数据源。
+- 主要改动：新增 5 个雷达参数 (RADAR_ENABLED、RADAR_RANGE、RADAR_FOV_HORIZONTAL_DEG、RADAR_CLUSTER_RADIUS、RADAR_MIN_POINTS_PER_CLUSTER)；在 VirtualGroundTruthSensor 中新增 set_radar_detections() 和 _process_radar_detections() 两个方法；_process_radar_detections() 实现无需 numpy 的欧氏距离聚类：点云->自车坐标系转换->排序->聚类->过滤->生成 FrontVehicleReading 列表；front_vehicles() 增加雷达/虚拟真值分支切换；在 guiji.py 中新增雷达 sensor 挂载和 radar_callback，将每帧检测点注入 sensor.set_radar_detections()。
+- 为什么这样改：虚拟真值 + 噪声是第一阶段过渡方案，真实传感器接入后才能验证感知链路在实际场景中的表现。雷达点云聚类输出格式 (FrontVehicleReading) 与虚拟真值完全一致，guiji.py 行为决策层零代码改动即可完成数据源切换。
+- 如何验证：已运行 python -m py_compile config.py perception.py guiji.py，语法检查通过。尚未启动 CARLA 实景运行验证雷达物理挂载和聚类效果。
+- 未覆盖风险：雷达挂载位置 (前保险杠 (2.0, 0.5)) 和参数 (60deg FOV, 80m 范围) 可能需要在实景运行后微调；聚类半径 1.8m 和最少点数 3 是基于经验值，未针对 Town10 场景标定；雷达输出未与侧向右侧目标链路集成（阶段四任务）；guiji.py 中 radar_callback 使用闭包引用 sensor，在 finally 清理时需要确保 sensor 在雷达 actor 之后销毁。
+- 需要 reviewer 重点看的文件：dazuoye/config.py、dazuoye/perception.py、dazuoye/guiji.py、dazuoye/PROGRAM_FRAMEWORK.md。
+- 提交代号/Commit ID：1daf647
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+  
 ### 2026-06-07 - 增加前视目标与候选避障轨迹可视化
 
 - 本次目标：在 pygame/CARLA 演示画面中标出自车当前跟踪目标和多条候选避障轨迹，便于观察避障规划是否符合预期。
@@ -2311,6 +2425,27 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 提交代号/Commit ID：`3c10c4a`。
 - PR/分支信息：本地待提交，尚未推送。
 
+### 2026-06-08 - 混合感知身份匹配、雷达杂波过滤与感知链路增强
+
+- 本次目标：解决 CARLA 毫米波雷达在 ~4.8m 处检测到地面杂波/自车反射导致虚假 AVOID 触发的问题；实现混合感知模式（雷达测距 + 上帝视角身份匹配）过滤幽灵目标；修复雷达结果为空时不回退虚拟真值导致的"盲开"；挂载侧向雷达和相机传感器硬件占位。
+- 主要改动：config.py 新增 `RADAR_MIN_DISTANCE=7.0`、`RADAR_FOV_VERTICAL_DEG=15.0`、`HYBRID_PERCEPTION_MODE=True`、`HYBRID_MATCH_RADIUS=3.0`；perception.py 新增 `set_side_radar_detections()` 占位方法、`set_camera_classifications()` 占位方法；`_process_radar_detections()` 中添加上帝视角身份匹配循环：匹配成功的聚类注入 `actor_id/actor_role`，匹配失败的聚类直接丢弃（杂波过滤）；聚类循环中添加 `RADAR_MIN_DISTANCE` 最小距离过滤；`front_vehicles()` 雷达模式添加空结果回退到虚拟真值的逻辑；guiji.py 挂载右侧毫米波雷达（150° FOV，30m 范围）、前向 RGB 相机和语义分割相机；初始化 AlphaBetaTracker 占位；新增 `right_object_type`、`right_risk_level`、`front_actor_role`、`front_risk_level` 到 telemetry；display.py 将 Front/Right 感知信息拆分为独立显示行，叠加彩色风险等级标签。
+- 为什么这样改：雷达原始点云在近场产生大量自车/地面反射点，聚类后形成幽灵目标，导致决策层频繁进入 AVOID 且速度降至 ~0.5 m/s。混合感知模式利用上帝视角做"身份认证"，确保只有真实车辆产生感知输出。雷达空结果回退保证前车超出 80m 或聚类失败时自车仍能基于虚拟真值正常行驶。
+- 如何验证：已运行 `python -m py_compile config.py perception.py guiji.py display.py`，语法检查通过；已运行完整 CARLA 实景仿真（32.4s），自车速度范围 3~8 m/s，顺利完成两次右侧行人 AVOID 让行，前车检测正常，路线终点停车正常，`Collisions: 0`。
+- 未覆盖风险：本次混合感知的身份匹配仅在雷达聚类输出端做后验过滤，尚未在跟踪器层面做时序一致性验证；侧向雷达和相机数据仅占位存储，未接入实际感知链路；AlphaBetaTracker 为占位实现，未输出稳定 track；语义分割相机回调中的 numpy 导入在 python 3.7 环境下未经长期稳定性验证；右转弯时行人避让仍存在盲区（已验证场景中仅避让自行车未避让行人导致碰撞，此问题未在本次修复范围内）。
+- 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：814c918
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
+
+### 2026-06-08 - 混合感知身份匹配、雷达杂波过滤与感知链路增强
+
+- 本次目标：解决 CARLA 毫米波雷达在 ~4.8m 处检测到地面杂波/自车反射导致虚假 AVOID 触发的问题；实现混合感知模式（雷达测距 + 上帝视角身份匹配）过滤幽灵目标；修复雷达结果为空时不回退虚拟真值导致的"盲开"；挂载侧向雷达和相机传感器硬件占位。
+- 主要改动：config.py 新增 `RADAR_MIN_DISTANCE=7.0`、`RADAR_FOV_VERTICAL_DEG=15.0`、`HYBRID_PERCEPTION_MODE=True`、`HYBRID_MATCH_RADIUS=3.0`；perception.py 新增 `set_side_radar_detections()` 占位方法、`set_camera_classifications()` 占位方法；`_process_radar_detections()` 中添加上帝视角身份匹配循环：匹配成功的聚类注入 `actor_id/actor_role`，匹配失败的聚类直接丢弃（杂波过滤）；聚类循环中添加 `RADAR_MIN_DISTANCE` 最小距离过滤；`front_vehicles()` 雷达模式添加空结果回退到虚拟真值的逻辑；guiji.py 挂载右侧毫米波雷达（150° FOV，30m 范围）、前向 RGB 相机和语义分割相机；初始化 AlphaBetaTracker 占位；新增 `right_object_type`、`right_risk_level`、`front_actor_role`、`front_risk_level` 到 telemetry；display.py 将 Front/Right 感知信息拆分为独立显示行，叠加彩色风险等级标签。
+- 为什么这样改：雷达原始点云在近场产生大量自车/地面反射点，聚类后形成幽灵目标，导致决策层频繁进入 AVOID 且速度降至 ~0.5 m/s。混合感知模式利用上帝视角做"身份认证"，确保只有真实车辆产生感知输出。雷达空结果回退保证前车超出 80m 或聚类失败时自车仍能基于虚拟真值正常行驶。
+- 如何验证：已运行 `python -m py_compile config.py perception.py guiji.py display.py`，语法检查通过；已运行完整 CARLA 实景仿真（32.4s），自车速度范围 3~8 m/s，顺利完成两次右侧行人 AVOID 让行，前车检测正常，路线终点停车正常，`Collisions: 0`。
+- 未覆盖风险：本次混合感知的身份匹配仅在雷达聚类输出端做后验过滤，尚未在跟踪器层面做时序一致性验证；侧向雷达和相机数据仅占位存储，未接入实际感知链路；AlphaBetaTracker 为占位实现，未输出稳定 track；语义分割相机回调中的 numpy 导入在 python 3.7 环境下未经长期稳定性验证；右转弯时行人避让仍存在盲区（已验证场景中仅避让自行车未避让行人导致碰撞，此问题未在本次修复范围内）。
+- 需要 reviewer 重点看的文件：`dazuoye/config.py`、`dazuoye/perception.py`、`dazuoye/guiji.py`、`dazuoye/display.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：814c918
+- PR/分支信息：直接推送到 origin/feature/perception-risk，未创建独立 PR。
 ### 2026-06-10 - 使用样条平滑路线与轨迹投影
 
 - 本次目标：减少弯道避障轨迹由离散 waypoint 和分段线性参考线造成的折线感，并让车辆在路线/轨迹坐标中的位置确定也统一使用平滑参考线投影。

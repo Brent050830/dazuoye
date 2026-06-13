@@ -120,6 +120,79 @@ class DemoHUD:
             return fallback
         return ("{:.%df}" % precision).format(value)
 
+
+    @staticmethod
+    def _finite_distance(value):
+        return value is not None and isinstance(value, (int, float)) and math.isfinite(value) and value < 98.0
+
+    @staticmethod
+    def _sensor_color(risk_level, active=False):
+        if active or risk_level >= 3:
+            return (190, 70, 60)
+        if risk_level == 2:
+            return (205, 130, 35)
+        if risk_level == 1:
+            return (190, 170, 45)
+        return (70, 170, 100)
+
+    def _draw_ray_2d(self, display, origin, end, color, label):
+        pygame.draw.line(display, color, origin, end, 3)
+        pygame.draw.circle(display, color, end, 4)
+        text = self.font.render(label, True, color)
+        display.blit(text, (end[0] + 8, end[1] - 10))
+
+    def _draw_sensor_overlay(self, display, telemetry):
+        """在 pygame 画面叠加前/左/右传感器示意；长度和颜色来自当前 telemetry。"""
+        if not telemetry.get("sensor_overlay_enabled", True):
+            return
+
+        base_x = self.width - 190
+        base_y = 610
+        max_len = 135
+        max_dist = 40.0
+        pygame.draw.rect(display, (25, 25, 25), (base_x - 110, base_y - 185, 260, 215), border_radius=8)
+        panel = pygame.Surface((260, 215))
+        panel.set_alpha(90)
+        panel.fill((0, 0, 0))
+        display.blit(panel, (base_x - 110, base_y - 185))
+
+        title = self.font.render("SENSOR READINGS", True, (230, 230, 230))
+        display.blit(title, (base_x - 95, base_y - 178))
+        pygame.draw.rect(display, (60, 115, 180), (base_x - 16, base_y - 16, 32, 32), 2)
+        pygame.draw.circle(display, (60, 115, 180), (base_x, base_y), 4)
+
+        state = telemetry.get("state", "")
+        front_dist = telemetry.get("front_distance")
+        right_dist = telemetry.get("right_object_distance")
+        left_dist = telemetry.get("left_side_distance")
+        front_risk = int(telemetry.get("front_risk_level", 0) or 0)
+        right_risk = int(telemetry.get("right_risk_level", 0) or 0)
+        left_risk = int(telemetry.get("left_side_risk_level", 0) or 0)
+
+        # FRONT：AVOID / EMERGENCY_BRAKE 高亮；无目标时显示 clear 短线。
+        if self._finite_distance(front_dist):
+            length = max(20, min(max_len, int(max_len * min(front_dist, max_dist) / max_dist)))
+            color = self._sensor_color(front_risk, state in ("AVOID", "EMERGENCY_BRAKE"))
+            self._draw_ray_2d(display, (base_x, base_y), (base_x, base_y - length), color, "F {:.1f}m".format(front_dist))
+        else:
+            self._draw_ray_2d(display, (base_x, base_y), (base_x, base_y - 55), (65, 120, 180), "F clear")
+
+        # LEFT：只显示左侧传感器检测，不让它直接影响主车控制。
+        if self._finite_distance(left_dist):
+            length = max(25, min(90, int(90 * min(left_dist, 12.0) / 12.0)))
+            color = self._sensor_color(left_risk, False)
+            self._draw_ray_2d(display, (base_x, base_y), (base_x - length, base_y), color, "L {:.1f}m".format(left_dist))
+        else:
+            self._draw_ray_2d(display, (base_x, base_y), (base_x - 50, base_y), (75, 125, 180), "L clear")
+
+        # RIGHT：RIGHT_OBJECT_YIELD 高亮。
+        if self._finite_distance(right_dist):
+            length = max(25, min(90, int(90 * min(right_dist, 12.0) / 12.0)))
+            color = self._sensor_color(right_risk, state == "RIGHT_OBJECT_YIELD")
+            self._draw_ray_2d(display, (base_x, base_y), (base_x + length, base_y), color, "R {:.1f}m".format(right_dist))
+        else:
+            self._draw_ray_2d(display, (base_x, base_y), (base_x + 50, base_y), (75, 165, 165), "R clear")
+
     def draw(self, display, telemetry):
         sim_time = telemetry.get("sim_time")
         state = telemetry.get("state", "--")
@@ -128,13 +201,30 @@ class DemoHUD:
         lead_speed = telemetry.get("lead_speed")
         front_distance = telemetry.get("front_distance")
         front_ttc = telemetry.get("front_ttc")
+        front_actor_role = telemetry.get("front_actor_role", "--")
+        front_risk_level = telemetry.get("front_risk_level", 0)
         right_distance = telemetry.get("right_object_distance")
         right_ttc = telemetry.get("right_object_ttc")
+        right_object_type = telemetry.get("right_object_type", "--")
+        right_risk_level = telemetry.get("right_risk_level", 0)
+        left_distance = telemetry.get("left_side_distance")
+        left_ttc = telemetry.get("left_side_ttc")
+        left_role = telemetry.get("left_side_role", "--")
+        left_risk_level = telemetry.get("left_side_risk_level", 0)
         steer = telemetry.get("steer")
         throttle = telemetry.get("throttle")
         brake = telemetry.get("brake")
         collision_count = telemetry.get("collision_count", 0)
         lap_distance = telemetry.get("lap_distance")
+
+        risk_labels = {0: "安全", 1: "注意", 2: "警告", 3: "危险"}
+        risk_colors = {0: (0, 180, 0), 1: (200, 200, 0), 2: (255, 140, 0), 3: (255, 50, 50)}
+        front_role_short = front_actor_role if len(front_actor_role) <= 24 else front_actor_role[:21] + "..."
+        right_type_short = right_object_type if right_object_type else "--"
+        left_role_short = left_role if len(left_role) <= 24 else left_role[:21] + "..."
+        front_risk_color = risk_colors.get(front_risk_level, (200, 200, 200))
+        right_risk_color = risk_colors.get(right_risk_level, (200, 200, 200))
+        left_risk_color = risk_colors.get(left_risk_level, (200, 200, 200))
 
         lines = [
             "t={}s  state={}  scenario={}  collisions={}".format(
@@ -152,9 +242,20 @@ class DemoHUD:
                 self._format_number(throttle, 2),
                 self._format_number(brake, 2),
             ),
-            "right_object_dist={}m  right_object_TTC={}s".format(
+            "FRONT: {} | dist={}m  TTC={}s".format(
+                front_role_short,
+                self._format_number(front_distance, 1),
+                self._format_number(front_ttc, 2),
+            ),
+            "RIGHT: {} | dist={}m  TTC={}s".format(
+                right_type_short,
                 self._format_number(right_distance, 1),
                 self._format_number(right_ttc, 2),
+            ),
+            "LEFT:  {} | side_dist={}m  TTC={}s".format(
+                left_role_short,
+                self._format_number(left_distance, 1),
+                self._format_number(left_ttc, 2),
             ),
             "lap_distance={}m / target={}m".format(
                 self._format_number(lap_distance, 1),
@@ -162,7 +263,7 @@ class DemoHUD:
             ),
         ]
 
-        panel_height = 104
+        panel_height = 152
         background = pygame.Surface((self.width, panel_height))
         background.set_alpha(165)
         background.fill((0, 0, 0))
@@ -171,6 +272,20 @@ class DemoHUD:
         for index, line in enumerate(lines):
             text_surface = self.font.render(line, True, (255, 255, 255))
             display.blit(text_surface, (12, 8 + index * 24))
+
+        # 用彩色文字叠加风险等级（覆盖在 FRONT/RIGHT 行末尾）
+        risk_overlays = [
+            (2, risk_labels.get(front_risk_level, "?"), front_risk_color),
+            (3, risk_labels.get(right_risk_level, "?"), right_risk_color),
+            (4, risk_labels.get(left_risk_level, "?"), left_risk_color),
+        ]
+        for line_idx, label, color in risk_overlays:
+            risk_text = self.font.render(label, True, color)
+            x_pos = self.width - 72
+            y_pos = 8 + line_idx * 24
+            display.blit(risk_text, (x_pos, y_pos))
+
+        self._draw_sensor_overlay(display, telemetry)
 
 
 class PygameDemoDisplay:
