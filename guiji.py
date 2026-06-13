@@ -2,6 +2,7 @@ import argparse
 import math
 import random
 import time
+from dataclasses import dataclass
 
 import carla
 
@@ -14,7 +15,7 @@ from actors import ( # 场景中涉及的各种演员生成函数，包括自车
     spawn_slow_right_lane_vehicle, # 生成右侧慢速车辆，增加右侧物体避让的复杂性
 )
 
-from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、换道长度、安全距离、碰撞和避让的 TTC 阈值等
+from config import ( # 仿真参数配置，包括服务器连接、仿真时间、车辆目标速度、避障触发和右侧让行阈值等
     CLIENT_TIMEOUT,
     DEBUG_DRAW_INTERVAL_FRAMES, # 调试绘制的帧间隔，控制仿真中轨迹和目标点的绘制频率，避免过于密集导致画面混乱
     DEBUG_DRAW_LIFETIME,
@@ -23,6 +24,14 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     DEBUG_DRAW_TRAJECTORY_STEP,
     EGO_TARGET_SPEED,
     FIXED_DELTA_SECONDS,
+    FRONT_BRAKE_MAX_DECEL,
+    FRONT_BRAKE_REACTION_TIME,
+    FRONT_BRAKE_RELEASE_MARGIN,
+    FRONT_BRAKE_SAFE_DISTANCE,
+    FRONT_CONFLICT_LATERAL_MARGIN,
+    FRONT_PLANNING_RETRY_SPEED_DROP,
+    FRONT_STEER_MAX_LATERAL_ACCEL,
+    FRONT_STEER_SAFE_DISTANCE,
     HOST,
     LANE_CHANGE_LENGTH,
     LEAD_BRAKE_TIME,
@@ -40,25 +49,32 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     RIGHT_OBJECT_TTC_THRESHOLD,
     RIGHT_OBJECT_YIELD_SPEED,
     ROUTE_COMPLETION_HOLD_SECONDS,
-    SAFE_DISTANCE,
     SIM_SECONDS,
     TRAFFIC_RANDOM_SEED,
-    TTC_AVOID_THRESHOLD,
-    TTC_BRAKE_THRESHOLD,
 )
 import config
 from control import SamplingMPCTracker # MPC 控制器实现
-from control import select_best_route_offset_trajectory
+from control import select_best_route_offset_trajectory, select_return_to_base_trajectory
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
-from utils import clamp
-from utils import get_speed, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
+from utils import get_speed, smooth_reference_for, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
 
-POST_AVOID_LANE_HOLD_SECONDS = 1.0
-AVOID_REPLAN_COOLDOWN_SECONDS = 1.2
-AVOID_REPLAN_MIN_PROGRESS = 4.0
 RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0
+PLAN_RETRY_LOG_INTERVAL = 1.0
+RETURN_TO_BASE_CLEARANCE = 2.0
+
+
+@dataclass
+class FrontLimitDecision:
+    front_conflict: bool = False
+    planning_needed: bool = False
+    emergency_brake_needed: bool = False
+    s_clear: float = float("inf")
+    d_steer: float = 0.0
+    d_brake: float = 0.0
+    delta_d_min: float = 0.0
+
 
 # ===================== 仿真世界初始化 =====================
 
@@ -131,118 +147,247 @@ def set_spectator(world, ego_vehicle):
     )
 
 
-def choose_avoidance_side(sensor):
-    """根据邻道净空状况选择避障换道方向：优先左转，其次右转，无道则返回 None"""
-    if sensor.lane_clear("left"): # 调用传感器的 lane_clear 方法检查左侧邻道是否在前后安全范围内无车，如果左侧邻道清空，则选择左换道避障
-        return "left"
-    if sensor.lane_clear("right"):
-        return "right"
-    return None
-
-
-def lane_label(waypoint):
-    """格式化路点的道路和车道编号，供避障诊断日志使用。"""
-    if waypoint is None:
-        return "None"
-    return "road={}, lane={}, yaw={:.1f}".format(
-        waypoint.road_id,
-        waypoint.lane_id,
-        waypoint.transform.rotation.yaw,
-    )
-
-
-def print_avoidance_lane_choice(carla_map, ego_vehicle, avoidance_side, sim_time):
-    """打印本次避障选择的当前车道和目标邻道，便于判断弯道避障是否选错方向。"""
-    current_wp = carla_map.get_waypoint(
-        ego_vehicle.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving
-    )
-    target_wp = current_wp.get_left_lane() if avoidance_side == "left" else current_wp.get_right_lane()
-    print(
-        "Avoidance lane choice at {:.2f}s: side={}, current=[{}], target=[{}]".format(
-            sim_time,
-            avoidance_side,
-            lane_label(current_wp),
-            lane_label(target_wp),
-        )
-    )
-    return current_wp, target_wp
-
-
-def plan_route_relative_avoidance(carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time):
-    """打印邻道选择、生成多候选路线相对避障轨迹，并返回最佳候选轨迹。"""
-    current_wp, target_wp = print_avoidance_lane_choice(
-        carla_map, ego_vehicle, avoidance_side, sim_time
-    )
+def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_time):
+    """生成一个可替换当前基础路线 s 区间的避障路径段。"""
     target_speed = 0.0 if front.actor_role == "lead" else max(0.0, getattr(front, "target_speed_along", 0.0))
     predicted_motion = target_speed * min(3.0, max(1.0, front.distance / max(front.closing_speed, 0.1)))
     base_length = max(14.0, min(52.0, LANE_CHANGE_LENGTH + predicted_motion))
     best_candidate, candidates = select_best_route_offset_trajectory(
-        loop_route, ego_vehicle, target_wp, front, base_length
+        loop_route, ego_vehicle, front, base_length, obstacle_actors=obstacle_actors
     )
-    print_avoidance_candidate_summary(best_candidate, candidates)
+    print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=True) # 打印候选路径数量、筛选结果和最终选中的关键参数，便于分析避障轨迹的生成和选择过程
     selected_trajectory = best_candidate.trajectory if best_candidate is not None else None
-    return selected_trajectory, candidates
+    if selected_trajectory is not None:
+        print(
+            "Route replacement planned at {:.2f}s: s={:.1f}-{:.1f}, peak_offset={:.2f}m, transition_ratio={:.2f}, target={}, distance={:.1f}m, TTC={:.2f}s".format(
+                sim_time,
+                best_candidate.start_route_s,
+                best_candidate.end_route_s,
+                best_candidate.target_offset,
+                best_candidate.transition_ratio,
+                right_object_label(front),
+                front.distance,
+                front.ttc if math.isfinite(front.ttc) else 99.99,
+            )
+        )
+    return best_candidate, candidates
 
 
-def print_avoidance_candidate_summary(best_candidate, candidates):
+def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time):
+    """生成从当前偏移回到基础路线的候选段。"""
+    best_candidate, candidates = select_return_to_base_trajectory(
+        loop_route, ego_vehicle, LANE_CHANGE_LENGTH, obstacle_actors=obstacle_actors
+    )
+    print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=False)
+    if best_candidate is not None:
+        print(
+            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, length={:.1f}m, transition_ratio={:.2f}.".format(
+                sim_time,
+                best_candidate.start_route_s,
+                best_candidate.end_route_s,
+                best_candidate.start_offset,
+                best_candidate.length,
+                best_candidate.transition_ratio,
+            )
+        )
+    return best_candidate, candidates
+
+
+def print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=False):
     """打印候选路径数量、筛选结果和最终选中的关键参数。"""
     valid_count = sum(1 for candidate in candidates if candidate.is_valid)
     if best_candidate is None:
         reasons = {}
+        samples = []
         for candidate in candidates:
-            reasons[candidate.reject_reason] = reasons.get(candidate.reject_reason, 0) + 1
+            reason_key = candidate.reject_reason.split(":", 1)[0] if candidate.reject_reason else "unknown"
+            reasons[reason_key] = reasons.get(reason_key, 0) + 1
+            if show_rejection_samples and candidate.reject_reason and len(samples) < 5:
+                samples.append(
+                    "L={:.1f}, target={:.2f}, ratio={:.2f}, reason={}".format(
+                        candidate.length,
+                        candidate.target_offset,
+                        candidate.transition_ratio,
+                        candidate.reject_reason,
+                    )
+                )
         print("Avoidance candidates rejected: total={}, reasons={}.".format(len(candidates), reasons))
+        for sample in samples:
+            print("  rejected sample: {}".format(sample))
         return
 
     print(
-        "Best avoidance candidate: valid={}/{}, length={:.1f}m, start_offset={:.2f}m, target_offset={:.2f}m, ay={:.2f}m/s^2, cost={:.2f}.".format(
+        "Best avoidance candidate: valid={}/{}, length={:.1f}m, transition_ratio={:.2f}, start_offset={:.2f}m, target_offset={:.2f}m, ay={:.2f}m/s^2, cost={:.2f}.".format(
             valid_count,
             len(candidates),
             best_candidate.length,
+            best_candidate.transition_ratio,
             best_candidate.start_offset,
             best_candidate.target_offset,
             best_candidate.lateral_accel,
             best_candidate.total_cost,
         )
     )
+    diagnostic_samples = [
+        candidate for candidate in candidates
+        if (
+            not candidate.is_valid
+            and candidate.reject_reason
+            and candidate.target_offset > candidate.start_offset + 0.05
+            and 2.5 <= abs(candidate.target_offset) <= 4.0
+        )
+    ]
+    if not diagnostic_samples:
+        diagnostic_samples = [
+            candidate for candidate in candidates
+            if (
+                not candidate.is_valid
+                and candidate.reject_reason
+                and candidate.target_offset > candidate.start_offset + 0.05
+                and abs(candidate.target_offset) < abs(best_candidate.target_offset) - 0.05
+            )
+        ]
+    if show_rejection_samples:
+        for candidate in diagnostic_samples[:5]:
+            print(
+                "  right-offset rejected: L={:.1f}, target={:.2f}, ratio={:.2f}, ay={:.2f}, reason={}".format(
+                    candidate.length,
+                    candidate.target_offset,
+                    candidate.transition_ratio,
+                    candidate.lateral_accel,
+                    candidate.reject_reason,
+                )
+            )
 
 
-def avoidance_laterally_separated(trajectory, lateral):
-    """判断避障过程中自车是否已经横向脱离原车道风险区。"""
-    lateral_shift = abs(trajectory.lateral_offset - trajectory.start_offset)
-    if lateral_shift < 0.1:
+def front_limit_decision(front, ego_vehicle, obstacle_actors):
+    """基于极限转向/制动距离判断当前前车冲突是否需要规划或急刹。"""
+    if not front.is_front_vehicle or not math.isfinite(front.distance):
+        return FrontLimitDecision()
+
+    front_actor = find_actor_by_id(obstacle_actors, front.actor_id)
+    ego_half_length, ego_half_width = vehicle_half_extents(ego_vehicle)
+    front_half_length, front_half_width = vehicle_half_extents(front_actor)
+    s_clear = max(0.0, front.distance - ego_half_length - front_half_length)
+
+    v_ego = max(0.0, get_speed(ego_vehicle))
+    v_front = max(0.0, getattr(front, "target_speed_along", 0.0))
+    v_rel = max(0.0, v_ego - v_front)
+
+    delta_d_min = max(
+        0.0,
+        ego_half_width + front_half_width + FRONT_CONFLICT_LATERAL_MARGIN - abs(front.lateral_offset),
+    )
+    if delta_d_min > 0.0:
+        t_steer_min = math.sqrt(
+            10.0 * math.sqrt(3.0) * delta_d_min / (3.0 * max(FRONT_STEER_MAX_LATERAL_ACCEL, 0.1))
+        )
+    else:
+        t_steer_min = 0.0
+    d_steer = v_rel * t_steer_min + FRONT_STEER_SAFE_DISTANCE
+
+    brake_energy = max(0.0, v_ego * v_ego - v_front * v_front)
+    d_brake = (
+        v_rel * FRONT_BRAKE_REACTION_TIME
+        + brake_energy / (2.0 * max(FRONT_BRAKE_MAX_DECEL, 0.1))
+        + FRONT_BRAKE_SAFE_DISTANCE
+    )
+
+    return FrontLimitDecision(
+        front_conflict=True,
+        planning_needed=s_clear <= d_steer,
+        emergency_brake_needed=s_clear <= d_brake,
+        s_clear=s_clear,
+        d_steer=d_steer,
+        d_brake=d_brake,
+        delta_d_min=delta_d_min,
+    )
+
+
+def front_planning_needed(front_decision):
+    return front_decision.front_conflict and front_decision.planning_needed
+
+
+def front_emergency_brake_needed(front_decision):
+    return front_decision.front_conflict and front_decision.emergency_brake_needed
+
+
+def apply_route_replacement(sensor, candidate):
+    if candidate is None or candidate.trajectory is None:
+        return None
+    trajectory = candidate.trajectory
+    sensor.apply_replacement_segment(
+        candidate.start_route_s,
+        candidate.end_route_s,
+        trajectory.replacement_points(DEBUG_DRAW_TRAJECTORY_STEP),
+        end_offset=candidate.target_offset,
+    )
+    return trajectory
+
+
+def make_avoidance_target(front, obstacle_actors, target_offset):
+    return {
+        "actor_id": front.actor_id,
+        "actor_role": front.actor_role,
+        "actor": find_actor_by_id(obstacle_actors, front.actor_id),
+        "target_offset": target_offset,
+    }
+
+
+def active_avoidance_covers_front(front, active_avoidance_target, route_offset_active):
+    if active_avoidance_target is None or not route_offset_active:
         return False
-    completed_shift = abs(lateral - trajectory.start_offset)
-    return completed_shift > min(1.4, lateral_shift * 0.55)
+    return front.actor_id is not None and front.actor_id == active_avoidance_target.get("actor_id")
 
 
-def build_avoidance_front_reference_points(trajectory, ego_vehicle):
-    """Build the active front-perception path: current avoidance path plus route continuation."""
-    progress, _ = trajectory.to_local(ego_vehicle.get_location())
-    start_s = max(0.0, progress - 8.0)
-    end_s = max(trajectory.length + SAFE_DISTANCE + 18.0, progress + SAFE_DISTANCE + 28.0)
-    step = max(1.0, DEBUG_DRAW_TRAJECTORY_STEP)
-    points = []
-    sample_count = int(math.ceil((end_s - start_s) / step))
-    for sample in range(sample_count + 1):
-        s = min(end_s, start_s + sample * step)
-        points.append(trajectory.location_at(s))
-    return points
+def find_actor_by_id(actors, actor_id):
+    if actor_id is None:
+        return None
+    for actor in actors:
+        if actor is not None and getattr(actor, "id", None) == actor_id:
+            return actor
+    return None
 
 
-def avoid_replan_needed(front, current_target_actor_id, progress, sim_time, last_replan_time):
-    """Return True when the active avoidance path sees a new or still-dangerous front risk."""
-    if not front.is_front_vehicle:
-        return False
-    if not math.isfinite(front.distance):
-        return False
-    if progress < AVOID_REPLAN_MIN_PROGRESS:
-        return False
-    if sim_time - last_replan_time < AVOID_REPLAN_COOLDOWN_SECONDS:
-        return False
-    new_target = front.actor_id is not None and front.actor_id != current_target_actor_id
-    urgent_same_target = front.ttc < TTC_BRAKE_THRESHOLD or front.distance < max(12.0, LANE_CHANGE_LENGTH * 0.55)
-    return new_target or urgent_same_target
+def vehicle_half_extents(actor, default_length=2.4, default_width=0.95):
+    bbox = getattr(actor, "bounding_box", None)
+    extent = getattr(bbox, "extent", None)
+    if extent is None:
+        return default_length, default_width
+    return max(0.1, float(extent.x)), max(0.1, float(extent.y))
+
+
+def vehicle_half_length(actor, default_length=2.4):
+    return vehicle_half_extents(actor, default_length=default_length)[0]
+
+
+def avoidance_target_passed(loop_route, ego_vehicle, target_actor, clearance=RETURN_TO_BASE_CLEARANCE):
+    """判断是否满足“自车车尾超过障碍物车头”。"""
+    if target_actor is None or not target_actor.is_alive:
+        return True
+
+    reference = smooth_reference_for(loop_route)
+    ego_projection = project_actor_to_base_route(loop_route, ego_vehicle)
+    target_projection = reference.project(
+        target_actor.get_location(),
+        ego_projection["route_s"],
+        search_back=60.0,
+        search_ahead=80.0,
+    )
+    ego_tail_s = ego_projection["route_s"] - vehicle_half_length(ego_vehicle)
+    target_head_s = target_projection["route_s"] + vehicle_half_length(target_actor)
+    return ego_tail_s > target_head_s + clearance
+
+
+def project_actor_to_base_route(loop_route, actor):
+    reference = smooth_reference_for(loop_route)
+    center_s = loop_route.last_index * loop_route.step_distance
+    return reference.project(
+        actor.get_location(),
+        center_s,
+        search_back=20.0,
+        search_ahead=40.0,
+    )
 
 
 def right_object_label(reading):
@@ -272,6 +417,13 @@ def draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory, lookahead_di
     progress, _ = trajectory.to_local(ego_vehicle.get_location())
     target_s = min(trajectory.length + lookahead_distance, progress + lookahead_distance)
     draw_debug_marker(world, trajectory.location_at(target_s), carla.Color(145, 35, 25))
+def draw_tracking_route_lookahead_marker(world, ego_vehicle, tracking_route, lookahead_distance=DEBUG_DRAW_LOOKAHEAD_DISTANCE):
+    """在当前合成跟踪路线前方画红色目标标记。"""
+    if tracking_route is None or not tracking_route.is_valid:
+        return
+    progress, _ = tracking_route.to_local(ego_vehicle.get_location())
+    target_s = min(tracking_route.length, progress + lookahead_distance)
+    draw_debug_marker(world, tracking_route.location_at(target_s), carla.Color(255, 0, 0))
 
 
 def draw_avoidance_candidates(world, candidates, selected_trajectory):
@@ -294,17 +446,14 @@ def draw_avoidance_candidates(world, candidates, selected_trajectory):
             previous = current
 
 
-def draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, candidates, frame):
-    """统一绘制路线/避障前视点和避障候选轨迹。"""
+def draw_trajectory_debug(world, ego_vehicle, tracking_route, selected_trajectory, candidates, frame):
+    """统一绘制当前跟踪路线前视点和最近一次候选轨迹。"""
     if not DEBUG_DRAW_TRAJECTORY:
         return
     if frame % max(1, DEBUG_DRAW_INTERVAL_FRAMES) != 0:
         return
-    if state == "AVOID" and trajectory is not None:
-        draw_avoidance_candidates(world, candidates, trajectory)
-        draw_avoidance_lookahead_marker(world, ego_vehicle, trajectory)
-    elif state == "ROUTE_FOLLOW":
-        draw_route_lookahead_marker(world, loop_route)
+    draw_avoidance_candidates(world, candidates, selected_trajectory)
+    draw_tracking_route_lookahead_marker(world, ego_vehicle, tracking_route)
 
 
 
@@ -564,11 +713,11 @@ def main(args=None):
         right_object_stop_active = False
         last_right_object_actor_id = None
         right_object_clear_since = None
-        post_avoid_lane_hold_until = None
-        active_avoid_target_actor_id = None
-        last_avoid_replan_time = -999.0
-
+        last_plan_failure_log_time = -999.0
         avoidance_candidates = []
+        active_avoidance_target = None
+        mpc_tracking_until_s = None
+        obstacle_actors = [lead_vehicle] + [controller.actor for controller in background_vehicles]
 
         if args.free_run:
             print("Playback mode: free-run.")
@@ -670,26 +819,23 @@ def main(args=None):
             left_side = sensor.side_vehicle("left") # 左侧邻车监测：只用于显示和逻辑完整性，不直接影响当前控制
             ego_speed = get_speed(ego_vehicle)
 
-            close_slow_front_vehicle = (
-                front.is_front_vehicle
-                and front.distance < LANE_CHANGE_LENGTH + 6.0
-                and front.closing_speed > 2.0
+            base_route_s_for_decision = project_actor_to_base_route(loop_route, ego_vehicle)["route_s"]
+            if mpc_tracking_until_s is not None and base_route_s_for_decision > mpc_tracking_until_s:
+                mpc_tracking_until_s = None
+            route_offset_active_for_planning = abs(sensor.current_offset()) > 0.05 or mpc_tracking_until_s is not None
+            front_limit = front_limit_decision(front, ego_vehicle, obstacle_actors)
+            planning_needed = front_planning_needed(front_limit)
+            if (
+                active_avoidance_covers_front(front, active_avoidance_target, route_offset_active_for_planning)
+                and not front_emergency_brake_needed(front_limit)
+            ):
+                planning_needed = False
+            front_slowdown_needed = False
+            emergency_recovered = (
+                not front_limit.front_conflict
+                or front_limit.s_clear > front_limit.d_brake + FRONT_BRAKE_RELEASE_MARGIN
             )
-            emergency_needed = ( # 判断是否需要进行紧急避障，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于避障阈值，则认为需要进行紧急避障
-                front.is_front_vehicle # 从感知信息中获取前车是否确认为正前方车辆的布尔值（也就是返回是否存在一个正前方车辆）
-                and front.distance < SAFE_DISTANCE # 存在正前方车辆的话，这里是最近的一个，判断其距离是否小于安全距离
-                and (front.ttc < TTC_AVOID_THRESHOLD or close_slow_front_vehicle)
-            )
-            brake_needed = ( # 定义是否需要制动的条件，基于前车的感知信息进行判断，如果前车确认为正前方车辆，并且距离小于安全距离，并且 TTC 小于制动阈值，则认为需要进行制动
-                front.is_front_vehicle
-                and front.ttc < TTC_BRAKE_THRESHOLD
-            )
-            emergency_recovered = ( # 紧急制动恢复条件：前方目标消失、距离重新拉开，或 TTC 恢复到制动阈值以上，避免 EMERGENCY_BRAKE 成为永久状态
-                not front.is_front_vehicle
-                or front.distance > SAFE_DISTANCE + 8.0
-                or front.ttc > TTC_BRAKE_THRESHOLD + 1.0
-            )
-            right_object_risk = ( # 定义右侧物体是否构成风险的条件，基于右侧过街物体的感知信息进行判断，如果右侧物体确认为冲突对象，并且 TTC 小于右侧物体风险阈值或者距离小于右侧物体检测距离，则认为构成风险
+            right_object_risk = ( # 判断右侧过街物体是否构成风险，基于物体是否为避让对象，以及其 TTC、距离和风险等级等信息来决定，如果物体是需要避让的，并且 TTC 或距离 低于设定的阈值，或者风险等级较高，则认为存在风险，需要进行避让
                 right_object.is_conflict_object
                 and (
                     right_object.risk_level >= 2
@@ -698,7 +844,7 @@ def main(args=None):
                 )
             )
 
-            """以下的if语句为状态切换逻辑，根据当前状态和感知信息判断是否需要切换到避障状态、紧急制动状态或右侧物体避让状态，并设置相应的状态变量和输出相关信息"""
+            route_changed_this_frame = False
 
             if state == "ROUTE_FOLLOW" and emergency_needed and not right_object_risk:
                 """从路线跟踪状态切换到避障状态，调用 choose_avoidance_side 函数根据邻道净空状况选择避障换道方向；避障/让行完成后仍回到 ROUTE_FOLLOW，允许再次触发前方避障。"""
@@ -742,141 +888,162 @@ def main(args=None):
                             front.ttc if math.isfinite(front.ttc) else 99.99,
                         )
                     )
-                elif emergency_needed:
-                    avoidance_side = choose_avoidance_side(sensor)
-                    if avoidance_side is not None:
-                        selected_trajectory, avoidance_candidates = plan_route_relative_avoidance(
-                            carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time
-                        )
-                        if selected_trajectory is not None:
-                            trajectory = selected_trajectory
-                            active_avoid_target_actor_id = front.actor_id
-                            last_avoid_replan_time = sim_time
-                            state = "AVOID"
-                            print(
-                                "Emergency brake switched to avoidance at {:.2f}s: side={}, distance={:.1f}m, TTC={:.2f}s".format(
-                                    sim_time, avoidance_side, front.distance, front.ttc
-                                )
-                            )
-
-            if state == "ROUTE_FOLLOW" and right_object_risk: # 从路线跟踪状态切换到右侧物体避让状态；右侧物体再次达到风险条件时也允许重新触发避让
-                state = "RIGHT_OBJECT_YIELD" # 设置状态为 RIGHT_OBJECT_YIELD 进行右侧物体避让
-                right_object_stop_active = False
-                last_right_object_actor_id = right_object.actor_id
-                right_object_clear_since = None
-                print(
-                    "Right object yield started at {:.2f}s: target={}, distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
-                        sim_time,
-                        right_object_label(right_object),
-                        right_object.distance,
-                        right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
-                        loop_route.last_index,
+                elif planning_needed: # 如果仍然需要规划避障，则尝试生成替换路线，如果成功生成则切换回正常跟随状态并应用替换路线，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
+                    best_candidate, avoidance_candidates = plan_route_replacement(
+                        loop_route, ego_vehicle, front, obstacle_actors, sim_time
                     )
-                )
-
-            if route_completion_time is not None:
-                """如果已经完成固定路线一圈，并且继续运行的时间超过预设的保持时间，则提前终止仿真"""
-                state = "ROUTE_HOLD"
-                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-
-            elif state == "AVOID" and trajectory is not None:
-                """在避障状态下，使用 MPC 控制器跟踪避障换道轨迹，计算所需的控制命令，并应用控制；如果需要制动则增加制动值；如果当前轨迹点已经完成并且接近目标车道，则切换回车道保持状态"""
-                target_speed = min(EGO_TARGET_SPEED, max(8.0, ego_speed))
-                progress, lateral = trajectory.to_local(ego_vehicle.get_location())
-                lateral_separated = avoidance_laterally_separated(trajectory, lateral)
-                if emergency_needed and avoid_replan_needed(
-                    front, active_avoid_target_actor_id, progress, sim_time, last_avoid_replan_time
-                ):
-                    avoidance_side = choose_avoidance_side(sensor)
-                    if avoidance_side is not None:
-                        selected_trajectory, avoidance_candidates = plan_route_relative_avoidance(
-                            carla_map, loop_route, ego_vehicle, front, avoidance_side, sim_time
+                    selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
+                    if selected_plan_trajectory is not None:
+                        active_avoidance_target = make_avoidance_target(
+                            front, obstacle_actors, best_candidate.target_offset
                         )
-                        if selected_trajectory is not None:
-                            trajectory = selected_trajectory
-                            active_avoid_target_actor_id = front.actor_id
-                            last_avoid_replan_time = sim_time
-                            progress, lateral = trajectory.to_local(ego_vehicle.get_location())
-                            lateral_separated = avoidance_laterally_separated(trajectory, lateral)
-                            print(
-                                "Avoidance replanned at {:.2f}s: target={}, side={}, distance={:.1f}m, TTC={:.2f}s".format(
-                                    sim_time,
-                                    right_object_label(front),
-                                    avoidance_side,
-                                    front.distance,
-                                    front.ttc if math.isfinite(front.ttc) else 99.99,
-                                )
-                            )
-                        elif front.ttc < TTC_BRAKE_THRESHOLD or front.distance < 10.0:
-                            state = "EMERGENCY_BRAKE"
-                            trajectory = None
-                            avoidance_candidates = []
-                            active_avoid_target_actor_id = None
-                            print(
-                                "Avoidance replanning failed at {:.2f}s: braking for target={}, distance={:.1f}m, TTC={:.2f}s".format(
-                                    sim_time,
-                                    right_object_label(front),
-                                    front.distance,
-                                    front.ttc if math.isfinite(front.ttc) else 99.99,
-                                )
-                            )
-                    elif front.ttc < TTC_BRAKE_THRESHOLD or front.distance < 10.0:
-                        state = "EMERGENCY_BRAKE"
-                        trajectory = None
-                        avoidance_candidates = []
-                        active_avoid_target_actor_id = None
+                        mpc_tracking_until_s = best_candidate.end_route_s + 2.0
+                        route_changed_this_frame = True
+                        state = "ROUTE_FOLLOW"
                         print(
-                            "Avoidance replanning blocked at {:.2f}s: no adjacent lane for target={}, distance={:.1f}m, TTC={:.2f}s".format(
+                            "Emergency brake switched back to route follow with replacement at {:.2f}s: target={}, distance={:.1f}m, TTC={:.2f}s".format(
                                 sim_time,
                                 right_object_label(front),
                                 front.distance,
                                 front.ttc if math.isfinite(front.ttc) else 99.99,
                             )
                         )
-                if state == "EMERGENCY_BRAKE":
-                    ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-                else:
-                    ego_control = mpc.control(ego_vehicle, trajectory, target_speed) # 在避障状态下，使用 MPC 控制器跟踪避障换道轨迹，计算所需的控制命令，基于当前自车状态、预生成的换道轨迹和目标速度进行计算，供后续应用控制命令使用
-                if state == "AVOID" and brake_needed and not lateral_separated:
-                    """如果需要制动则增加制动值，基于前车的感知信息判断是否需要增加制动值，如果需要则将油门设置为0，并且将制动值增加到至少0.20，以增强避障时的安全性"""
-                    ego_control.brake = max(ego_control.brake, 0.20)
-                    ego_control.throttle = 0.0
-                elif state == "AVOID" and lateral_separated and not front.is_front_vehicle:
-                    ego_control.brake = min(ego_control.brake, 0.15)
 
-                if state == "AVOID" and progress > trajectory.length + 2.0 and abs(lateral - trajectory.lateral_offset) < 0.65: # 如果当前轨迹点已经完成并且接近目标车道，则切换回路线跟踪状态
-                    state = "ROUTE_FOLLOW"
-                    avoidance_candidates = []
-                    active_avoid_target_actor_id = None
-                    post_avoid_lane_hold_until = sim_time + POST_AVOID_LANE_HOLD_SECONDS
-                    print("Avoidance completed at {:.2f}s.".format(sim_time))
-
-            elif state == "EMERGENCY_BRAKE":
-                """在紧急制动状态下，直接应用全制动控制命令，油门为0，制动为1，方向盘不转动，最大限度地减小与前车的碰撞风险"""
-                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
-
-            elif state == "RIGHT_OBJECT_YIELD":
-                if right_object.actor_id != last_right_object_actor_id:
+            if (
+                state == "ROUTE_FOLLOW"
+                and active_avoidance_target is not None
+                and not route_changed_this_frame
+                and avoidance_target_passed(loop_route, ego_vehicle, active_avoidance_target.get("actor"))
+            ):
+                active_target_label = "{}#{}".format(
+                    active_avoidance_target.get("actor_role") or "actor",
+                    active_avoidance_target.get("actor_id"),
+                )
+                best_candidate, avoidance_candidates = plan_return_to_base(
+                    loop_route, ego_vehicle, obstacle_actors, sim_time
+                )
+                selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
+                if selected_plan_trajectory is not None: # 如果成功生成返回基础路线的替换路径段，则应用该路径段作为新的跟踪路线，同时清除当前的避让目标，更新 MPC 跟踪的截止点，并打印相关日志；如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
+                    mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
-                        "Right yield target changed at {:.2f}s: {} -> {}, distance={:.1f}m, TTC={:.2f}s.".format(
+                        "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(
                             sim_time,
-                            last_right_object_actor_id if last_right_object_actor_id is not None else "none",
+                            active_target_label,
+                            sensor.current_offset(),
+                        )
+                    )
+                    active_avoidance_target = None
+                    route_changed_this_frame = True
+                elif sim_time - last_plan_failure_log_time >= PLAN_RETRY_LOG_INTERVAL: # 如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
+                    print(
+                        "Return planning blocked at {:.2f}s: keep offset={:.2f}m, target={}.".format(
+                            sim_time,
+                            sensor.current_offset(),
+                            active_target_label,
+                        )
+                    )
+                    last_plan_failure_log_time = sim_time
+
+            if state == "ROUTE_FOLLOW" and planning_needed and not route_changed_this_frame: # 如果当前状态是正常跟随，并且需要进行前车避障规划，并且当前帧还没有进行路线切换，则尝试生成替换路线，如果成功生成则应用替换路线并更新相关状态和日志，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
+                best_candidate, avoidance_candidates = plan_route_replacement(
+                    loop_route, ego_vehicle, front, obstacle_actors, sim_time
+                )
+                selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
+                if selected_plan_trajectory is not None: # 如果成功生成替换路线，则应用替换路线并更新相关状态和日志；否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
+                    active_avoidance_target = make_avoidance_target(
+                        front, obstacle_actors, best_candidate.target_offset
+                    )
+                    mpc_tracking_until_s = best_candidate.end_route_s + 2.0
+                    route_changed_this_frame = True
+                else: # 如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
+                    if front_emergency_brake_needed(front_limit):
+                        state = "EMERGENCY_BRAKE"
+                        print(
+                            "Emergency brake at {:.2f}s: no collision-free replacement, target={}, S_clear={:.1f}m, D_brake={:.1f}m.".format(
+                                sim_time,
+                                right_object_label(front),
+                                front_limit.s_clear,
+                                front_limit.d_brake,
+                            )
+                        )
+                    else:
+                        front_slowdown_needed = True
+                        if sim_time - last_plan_failure_log_time >= PLAN_RETRY_LOG_INTERVAL:
+                            print(
+                                "Replacement planning failed at {:.2f}s: slow down and retry, target={}, S_clear={:.1f}m, D_steer={:.1f}m, D_brake={:.1f}m.".format(
+                                    sim_time,
+                                    right_object_label(front),
+                                    front_limit.s_clear,
+                                    front_limit.d_steer,
+                                    front_limit.d_brake,
+                                )
+                            )
+                            last_plan_failure_log_time = sim_time
+
+            if right_object_risk: # 如果右侧过街物体构成风险，首先判断是否发生了目标切换，如果发生了目标切换则打印相关日志；然后重置右侧物体清除计时器；如果右侧过街物体不再构成风险但之前存在一个有效的目标，则启动清除计时器，如果清除计时器达到设定的保持时间，则认为避让完成，重置相关状态并打印完成日志
+                if last_right_object_actor_id != right_object.actor_id:
+                    action = "started" if last_right_object_actor_id is None else "target changed"
+                    print(
+                        "Right object yield {} at {:.2f}s: target={}, distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
+                            action,
+                            sim_time,
                             right_object_label(right_object),
-                            right_object.distance if math.isfinite(right_object.distance) else 99.9,
+                            right_object.distance,
                             right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
+                            loop_route.last_index,
                         )
                     )
                     last_right_object_actor_id = right_object.actor_id
-
-                """在右侧物体避让状态下，降低目标速度以增加与右侧过街物体的安全距离；风险解除后回到路线跟踪，后续可再次触发避让"""
-                if right_object_risk:
-                    right_object_clear_since = None
-                elif right_object_clear_since is None:
+                right_object_clear_since = None
+            elif last_right_object_actor_id is not None:
+                if right_object_clear_since is None:
                     right_object_clear_since = sim_time
+                elif sim_time - right_object_clear_since >= RIGHT_OBJECT_CLEAR_HOLD_SECONDS:
+                    right_object_stop_active = False
+                    last_right_object_actor_id = None
+                    right_object_clear_since = None
+                    print("Right object yield completed at {:.2f}s.".format(sim_time))
 
-                target_speed = RIGHT_OBJECT_YIELD_SPEED # 在右侧物体避让状态下，降低目标速度以增加与右侧过街物体的安全距离，这里直接使用预设的 RIGHT_OBJECT_YIELD_SPEED 作为目标速度，供后续计算控制命令使用
-                throttle, brake = speed_control(ego_speed, target_speed) # 使用 speed_control 函数计算所需的油门和制动值，基于当前自车速度和降低后的目标速度进行计算，供后续应用控制命令使用
-                if not right_object_stop_active and right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
+            if route_completion_time is not None: # 如果已经完成了一圈路线，则保持在原地等待，应用全制动控制命令，油门为0，制动为1，方向盘不转动
+                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+
+            elif state == "EMERGENCY_BRAKE":
+                ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+
+            else:
+                target_speed = EGO_TARGET_SPEED
+                if front_slowdown_needed:
+                    target_speed = min(target_speed, max(0.0, ego_speed - FRONT_PLANNING_RETRY_SPEED_DROP))
+                if right_object_risk or right_object_clear_since is not None or right_object_stop_active:
+                    target_speed = min(target_speed, RIGHT_OBJECT_YIELD_SPEED)
+
+                tracking_route = sensor.tracking_route()
+                base_route_s = project_actor_to_base_route(loop_route, ego_vehicle)["route_s"]
+                if mpc_tracking_until_s is not None and base_route_s > mpc_tracking_until_s:
+                    mpc_tracking_until_s = None
+                replacement_segment_active = mpc_tracking_until_s is not None
+                offset_route_active = abs(sensor.current_offset()) > 0.05
+                use_mpc_tracking = (
+                    tracking_route is not None
+                    and tracking_route.is_valid
+                    and (replacement_segment_active or offset_route_active)
+                )
+
+                if use_mpc_tracking:
+                    ego_control = mpc.control(ego_vehicle, tracking_route, target_speed)
+                else:
+                    throttle, brake = speed_control(ego_speed, target_speed)
+                    ego_control = carla.VehicleControl(
+                        throttle=throttle,
+                        brake=brake,
+                        steer=loop_route.steer(ego_vehicle),
+                    )
+
+                if front_slowdown_needed:
+                    ego_control.brake = max(ego_control.brake, 0.20)
+                    ego_control.throttle = 0.0
+
+                if right_object_risk and not right_object_stop_active and right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
                     right_object_stop_active = True
                     print(
                         "Right object hard stop engaged at {:.2f}s: target={}, distance={:.1f}m.".format(
@@ -900,46 +1067,18 @@ def main(args=None):
                     and sim_time - right_object_clear_since < RIGHT_OBJECT_CLEAR_HOLD_SECONDS
                 )
                 if right_object_stop_active or clear_waiting:
-                    """如果右侧过街物体距离小于预设的停止距离，则认为需要紧急避让，增加制动值并将油门设置为0，以最大限度地减小与右侧过街物体的碰撞风险"""
-                    throttle = 0.0
-                    brake = max(brake, 0.85)
-                ego_control = carla.VehicleControl( # 创建控制命令，基于计算得到的油门和制动值，以及航向控制值（这里直接使用当前路线点的航向进行控制），供后续应用控制命令使用
-                    throttle=throttle,
-                    brake=brake,
-                    steer=loop_route.steer(ego_vehicle),
-                )
-                right_object_clear_confirmed = (
-                    right_object_clear_since is not None
-                    and sim_time - right_object_clear_since >= RIGHT_OBJECT_CLEAR_HOLD_SECONDS
-                )
-                if right_object_clear_confirmed:
-                    """如果右侧物体风险已经解除，则切换回路线跟踪状态；后续再次达到风险条件时可重新进入避让"""
-                    state = "ROUTE_FOLLOW"
-                    right_object_stop_active = False
-                    last_right_object_actor_id = None
-                    right_object_clear_since = None
-                    print("Right object yield completed at {:.2f}s.".format(sim_time))
-
-            else: # 在 ROUTE_FOLLOW 状态下保持路线跟踪控制，如果需要制动则降低目标速度
-                if brake_needed:
-                    target_speed = min(EGO_TARGET_SPEED, max(0.0, ego_speed - 5.0))
-                else:
-                    target_speed = EGO_TARGET_SPEED
-                throttle, brake = speed_control(ego_speed, target_speed)
-                if post_avoid_lane_hold_until is not None and sim_time < post_avoid_lane_hold_until:
-                    route_steer = clamp(waypoint_steer(ego_vehicle, carla_map), -0.25, 0.25)
-                else:
-                    post_avoid_lane_hold_until = None
-                    route_steer = loop_route.steer(ego_vehicle)
-                ego_control = carla.VehicleControl(
-                    throttle=throttle,
-                    brake=brake,
-                    steer=route_steer,
-                )
-
+                    ego_control.throttle = 0.0
+                    ego_control.brake = max(ego_control.brake, 0.85)
             ego_vehicle.apply_control(ego_control) # 应用控制命令，控制自车的油门、制动和转向，根据当前状态和感知信息计算得到的控制命令进行应用，实现跟车、避障、右侧物体避让等行为
 
-            draw_trajectory_debug(world, loop_route, ego_vehicle, state, trajectory, avoidance_candidates, frame)
+            draw_trajectory_debug(
+                world,
+                ego_vehicle,
+                sensor.tracking_route(),
+                selected_plan_trajectory,
+                avoidance_candidates,
+                frame,
+            )
 
             draw_sensor_debug(world, ego_vehicle, state, front, left_side, right_object, frame)
 
