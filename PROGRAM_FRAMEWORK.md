@@ -2532,5 +2532,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile control.py guiji.py perception.py config.py utils.py route.py actors.py display.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次运行普通避障在 `6.40s` 规划，回归在 `10.80s` 规划，右侧目标让行在 `35.35s` 触发并于 `40.70s` 完成，路线终点停车保持后正常清理。
 - 未覆盖风险：当前 LTV 实现仍是在目标函数内滚动动力学预测，尚未拆成显式线性化 `A_k/B_k` 与 QP 求解；动力学参数是第一版保守近似值，未做系统辨识；只验证了当前固定 `--free-run` 场景，pygame 画面观感仍建议人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
-- PR/分支信息：本地修改中，尚未推送。
+- 提交代号/Commit ID：`9112b5c`。
+- PR/分支信息：本地提交，尚未推送。
