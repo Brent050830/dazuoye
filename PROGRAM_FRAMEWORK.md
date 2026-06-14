@@ -169,7 +169,7 @@ dazuoye/display.py
 - 虚拟真值感知，并可选叠加噪声、FOV、漏检和前向毫米波雷达点云聚类。
 - TTC 计算。
 - 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的多候选避障轨迹。
-- 采样式 MPC 只在避障 replacement、保持偏移或回归段活跃时跟踪合成路线；纯基础路线巡航使用 `LoopRoute.steer()` 前视控制。
+- LTV-MPC 只在避障 replacement、保持偏移或回归段活跃时跟踪合成路线；纯基础路线巡航使用 `LoopRoute.steer()` 前视控制，LTV 求解失败时退回采样式动力学 MPC。
 - Town10 固定起点。
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
@@ -189,7 +189,7 @@ dazuoye/display.py
 config.py       场景、路线、风险阈值和控制参数
 utils.py        通用数学、车辆速度、平滑参考线投影和道路辅助函数
 perception.py   虚拟真值/雷达融合感知、基于平滑参考线的前车读取与右侧目标风险读取
-control.py      平滑路线叠加局部五次偏移候选轨迹、路径约束/代价选择和采样式 MPC 跟踪
+control.py      平滑路线叠加局部五次偏移候选轨迹、路径约束/代价选择、LTV-MPC 跟踪与采样式 fallback
 route.py        Town10 固定短路线、路线进度和转弯事件检测
 actors.py       自车、前车、背景车辆和非机动车生成与运动
 display.py      碰撞监测、CARLA 摄像头、pygame HUD 和显示窗口
@@ -1165,6 +1165,7 @@ route_finished_hold
 
 ```python
 RouteOffsetLaneChangeTrajectory
+LTVMPCTracker
 SamplingMPCTracker
 ```
 
@@ -1182,7 +1183,7 @@ SamplingMPCTracker
 
 当前已使用 waypoint 前视控制，公式见 `6.1 当前路径生成与路线跟踪公式`。
 
-后续可统一交给 MPC 跟踪。
+后续如果需要统一控制器口径，可再评估是否把纯基础路线巡航交给 MPC；当前为了直线居中稳定，仍保留 waypoint 前视控制。
 
 ### 11.2 前车急停避障轨迹
 
@@ -1629,66 +1630,131 @@ SmoothRouteReference 平滑路线 + 连续道路右方向五次横向增量
 
 ### 11.4 MPC 跟踪公式
 
-当前 `SamplingMPCTracker` 是采样式滚动优化控制器，不求解连续优化问题，而是枚举有限个转向和加速度候选，在预测时域内选择总代价最低的动作。
+当前主流程使用 `LTVMPCTracker` 跟踪避障 replacement、保持 offset 和回归段；纯基础路线巡航仍使用 `LoopRoute.steer()` 前视控制。`SamplingMPCTracker` 保留为 fallback：当 `scipy` 不可用、LTV 求解失败、超时或预测状态不稳定时，仍可用同一 `control(self, ego_vehicle, trajectory, target_speed)` 接口输出 CARLA 控制量。
 
-当前候选转向：
-
-$$
-\delta \in \delta_{\mathrm{prev}}
-+ \{-0.45,\ -0.32,\ -0.20,\ -0.10,\ 0,\ 0.10,\ 0.20,\ 0.32,\ 0.45\}
-$$
-
-$$
-\delta = \operatorname{clamp}(\delta,\ -0.65,\ 0.65)
-$$
-
-当前候选加速度：
-
-$$
-a \in \{-4.0,\ -2.0,\ -1.0,\ 0.0,\ 1.0\}\ \mathrm{m/s^2}
-$$
-
-预测步长和步数：
+预测步长：
 
 $$
 \Delta t = \texttt{MPC\_DT} = 0.10\ \mathrm{s}
 $$
 
-$$
-N = \texttt{MPC\_HORIZON\_STEPS} = 18
-$$
-
-采样式 MPC 使用简化运动学自行车模型。历史上的非路线相对局部轨迹分支已从 `SamplingMPCTracker.control()` 中删除；当前控制器只接受带 `is_route_relative=True` 的路线相对对象。主流程只有在 replacement segment 尚未走完、`current_offset` 非零，或正在执行回归段时，才把基础路线与 replacement segments 合成后的 `TrackingRoute` 传给 MPC；纯基础路线巡航则使用 `speed_control()` 加 `loop_route.steer()`。如果误传旧式轨迹，代码会直接抛出错误，避免静默走旧逻辑。
-
-当前轴距参数：
+LTV 第一版使用较短预测时域：
 
 $$
-\mathrm{WHEEL\_BASE} = 2.85\ \mathrm{m}
+N_{\mathrm{ltv}} = \min(10,\ \texttt{MPC\_HORIZON\_STEPS})
 $$
 
-对于当前主流程使用的合成 `TrackingRoute`，MPC 在全局坐标中预测：
+历史上的非路线相对局部轨迹分支已从跟踪器中删除；当前控制器只接受带 `is_route_relative=True` 的路线相对对象。如果误传旧式轨迹，代码会直接抛出错误，避免静默走旧逻辑。
+
+LTV-MPC 的预测状态为：
 
 $$
-x_{k+1} = x_k + v_{k+1}\cos(\psi_k)\Delta t
+x_k =
+\begin{bmatrix}
+X_k & Y_k & \psi_k & v_{x,k} & v_{y,k} & \omega_k & \delta_k & s_k
+\end{bmatrix}^T
+$$
+
+其中 $X,Y$ 为全局位置，$\psi$ 为航向角，$v_x,v_y$ 为车身坐标系速度，$\omega$ 为横摆角速度，$\delta$ 为实际前轮转角，$s$ 为合成路线上的预测进度。优化输入为：
+
+$$
+u_k =
+\begin{bmatrix}
+\delta_{\mathrm{cmd},k} & a_{x,k}
+\end{bmatrix}^T
+$$
+
+CARLA 的 `steer` 是归一化命令，模型内部先转换为前轮目标转角：
+
+$$
+\delta_{\mathrm{cmd}} = \mathrm{steer}\cdot \delta_{\max}
 $$
 
 $$
-y_{k+1} = y_k + v_{k+1}\sin(\psi_k)\Delta t
+\delta_{\max} = 32^\circ
+$$
+
+车辆初始速度由 CARLA 全局速度投影到车身坐标系：
+
+$$
+v_{x,0}=v_X\cos\psi+v_Y\sin\psi
 $$
 
 $$
-s_{k+1} = s_k + v_{k+1}\Delta t
+v_{y,0}=-v_X\sin\psi+v_Y\cos\psi
+$$
+
+CARLA 的 `angular_velocity.z` 按 deg/s 读取，模型内部统一转换为 rad/s：
+
+$$
+\omega_0 = \operatorname{radians}(\mathrm{angular\_velocity.z})
+$$
+
+线性轮胎动力学预测模型为：
+
+$$
+\dot X=v_x\cos\psi-v_y\sin\psi
 $$
 
 $$
-\psi_{k+1}
-= \operatorname{normalize\_angle}
+\dot Y=v_x\sin\psi+v_y\cos\psi
+$$
+
+$$
+\dot\psi=\omega
+$$
+
+$$
+\dot v_x=a_x
+$$
+
+前后轮侧偏角：
+
+$$
+\alpha_f=
+\delta-\arctan2(v_y+a_f\omega,\ v_{x,\mathrm{safe}})
+$$
+
+$$
+\alpha_r=
+-\arctan2(v_y-a_r\omega,\ v_{x,\mathrm{safe}})
+$$
+
+侧向力：
+
+$$
+F_{yf}=C_f\alpha_f
+$$
+
+$$
+F_{yr}=C_r\alpha_r
+$$
+
+侧向和横摆动力学：
+
+$$
+\dot v_y=\frac{F_{yf}+F_{yr}}{m}-v_x\omega
+$$
+
+$$
+\dot\omega=\frac{a_fF_{yf}-a_rF_{yr}}{I_z}
+$$
+
+前轮转角使用一阶响应，并对转角速度限幅：
+
+$$
+\dot\delta=
+\operatorname{clamp}
 \left(
-\psi_k + \frac{v_{k+1}}{\mathrm{WHEEL\_BASE}}\tan(\delta)\Delta t
+\frac{\delta_{\mathrm{cmd}}-\delta}{\tau_\delta},
+-\dot\delta_{\max},
+\dot\delta_{\max}
 \right)
 $$
 
-其中 $s_k$ 是从 `RouteOffsetLaneChangeTrajectory.to_local()` 得到的路线相对进度。参考点和参考航向来自 `11.2`：
+低速 $v_x<2.0\ \mathrm{m/s}$ 时，跟踪器使用运动学保护，避免侧偏角计算在接近零速时发散。
+
+参考点来自当前合成 `TrackingRoute`：
 
 $$
 P_{\mathrm{ref}}(s_k)
@@ -1697,59 +1763,63 @@ $$
 
 $$
 \psi_{\mathrm{ref}}(s_k)
-= \operatorname{atan2}
-\left(
-y_{\mathrm{ref}}(s_k+\Delta s_d)-y_{\mathrm{ref}}(\max(0,s_k-\Delta s_d)),
-x_{\mathrm{ref}}(s_k+\Delta s_d)-x_{\mathrm{ref}}(\max(0,s_k-\Delta s_d))
-\right)
+= \texttt{trajectory.reference\_yaw\_at}(s_k)
 $$
 
-路线相对分支的横向/位置误差当前使用二维位置误差：
+全局位置误差投影到参考轨迹局部坐标系：
 
 $$
-e_p
-= \sqrt{(x_k-x_{\mathrm{ref}}(s_k))^2 + (y_k-y_{\mathrm{ref}}(s_k))^2}
+e_{\mathrm{long},k}
+=
+(X_k-x_{\mathrm{ref}})\cos\psi_{\mathrm{ref}}
++
+(Y_k-y_{\mathrm{ref}})\sin\psi_{\mathrm{ref}}
 $$
 
 $$
-e_{\psi}
-= \operatorname{normalize\_angle}(\psi_k-\psi_{\mathrm{ref}}(s_k))
+e_{\mathrm{lat},k}
+=
+-(X_k-x_{\mathrm{ref}})\sin\psi_{\mathrm{ref}}
++
+(Y_k-y_{\mathrm{ref}})\cos\psi_{\mathrm{ref}}
 $$
 
-路线相对 MPC 默认使用加速度候选：
-
 $$
-a \in \{-4.0,\ -2.0,\ -1.0,\ 0.0,\ 1.0\}
-$$
-
-为了避免车辆在低速跟踪合成路线时继续选择负加速度并原地停住，若满足：
-
-$$
-v_0 < \max(3.0,\ 0.5v_{\mathrm{target}})
+e_{\psi,k}
+=
+\operatorname{normalize\_angle}(\psi_k-\psi_{\mathrm{ref},k})
 $$
 
-则候选加速度收敛为：
-
-$$
-a \in \{0.0,\ 1.0\}
-$$
-
-单步代价为：
+代价函数中横向误差权重大于纵向误差，并在预测时域末端额外惩罚横向误差和航向误差：
 
 $$
 J_k =
-6.0e_p^2
-+ 1.7e_{\psi}^2
-+ 0.07e_v^2
-+ 0.08\delta^2
-+ 0.01a^2
-+ 0.02k\left|\delta-\delta_{\mathrm{prev}}\right|
+w_y e_{\mathrm{lat},k}^2
++ w_x e_{\mathrm{long},k}^2
++ w_\psi e_{\psi,k}^2
++ w_v(v_{x,k}-v_{\mathrm{target}})^2
++ w_u\|\Delta u_k\|^2
++ w_\beta\beta_k^2
++ w_\omega\omega_k^2
 $$
 
-控制器选择：
+其中当前实现满足 $w_y>w_x$，并对超过稳定性软阈值的 $\beta$、$\omega$ 追加二次惩罚；若侧偏角、质心侧偏角或横摆角速度严重超限，则该控制序列 hard reject。第一版实现用 `scipy.optimize.minimize` 的 `L-BFGS-B` 在目标函数内部滚动上述动力学模型；尚未显式构造线性化后的 $A_k,B_k,c_k$ 或接入独立 QP 求解器。
+
+优化得到第一步控制：
 
 $$
-(\delta^*, a^*) = \arg\min_{\delta, a} J
+(\delta_{\mathrm{cmd},0}^*, a_{x,0}^*) = \arg\min J
+$$
+
+最终输出给 CARLA 前，将前轮目标转角还原为归一化转向命令：
+
+$$
+\mathrm{steer}^* =
+\operatorname{clamp}
+\left(
+\frac{\delta_{\mathrm{cmd},0}^*}{\delta_{\max}},
+-1,\ 1
+\right)
 $$
 
 加速度到 CARLA 油门/制动的映射：
@@ -1757,16 +1827,16 @@ $$
 $$
 \mathrm{throttle} =
 \begin{cases}
-\operatorname{clamp}(0.25 + 0.18a^*,\ 0.0,\ 0.65), & a^* \ge 0 \\
-0.0, & a^* < 0
+\operatorname{clamp}(0.25 + 0.18a_{x,0}^*,\ 0.0,\ 0.65), & a_{x,0}^* \ge 0 \\
+0.0, & a_{x,0}^* < 0
 \end{cases}
 $$
 
 $$
 \mathrm{brake} =
 \begin{cases}
-0.0, & a^* \ge 0 \\
-\operatorname{clamp}\left(-\dfrac{a^*}{7.5},\ 0.0,\ 1.0\right), & a^* < 0
+0.0, & a_{x,0}^* \ge 0 \\
+\operatorname{clamp}\left(-\dfrac{a_{x,0}^*}{7.5},\ 0.0,\ 1.0\right), & a_{x,0}^* < 0
 \end{cases}
 $$
 
@@ -1774,7 +1844,7 @@ $$
 
 $$
 \mathrm{VehicleControl}
-= (\mathrm{throttle},\ \mathrm{brake},\ \mathrm{steer}=\delta^*)
+= (\mathrm{throttle},\ \mathrm{brake},\ \mathrm{steer}=\mathrm{steer}^*)
 $$
 
 ### 11.5 速度控制公式
@@ -2452,4 +2522,15 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：MPC 权重为本次保守调参结果，仍建议在 1x pygame 演示中继续目视观察避障段/回归段是否有轻微残余偏移或转向过急；本次未改状态机、轨迹生成、避障触发和碰撞筛选逻辑。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`2585cd6`。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-14 - 接入 LTV-MPC 轨迹跟踪
+
+- 本次目标：按 `mpc.md` 在不改变状态机、轨迹生成和避障决策逻辑的前提下，将避障段、保持偏移段和回归段的跟踪控制升级为第一版 LTV-MPC，并保留采样式动力学 MPC 作为 fallback。
+- 主要改动：`control.py` 新增 `LTVMPCTracker`，用 CARLA 全局速度投影得到车身坐标系 `vx/vy`，将 `angular_velocity.z` 从 deg/s 统一转为 rad/s，内部维护 `previous_delta_cmd`、`previous_delta` 和 `previous_accel`；优化变量使用真实前轮转角命令 `delta_cmd` 与加速度序列，采用短预测时域和 `scipy.optimize.minimize` 的 `L-BFGS-B` 求解；目标函数继续使用线性轮胎动力学滚动预测，显式提高横向误差、终端横向误差和终端航向误差权重，降低纵向误差权重，并用 `beta`、`yaw_rate`、轮胎侧偏角做 soft penalty + hard reject 稳定性约束；低速 `vx < 2.0m/s` 时使用运动学保护，求解器不可用、超时、失败或预测不稳定时自动退回 `SamplingMPCTracker`。`guiji.py` 将控制器实例从 `SamplingMPCTracker` 切换为 `LTVMPCTracker`。
+- 为什么这样改：上一版采样式 MPC 已能跑完整路线，但动作集合离散，避障/回归段的横向动态仍受枚举粒度限制。LTV-MPC 用连续控制序列直接优化横向、航向、速度和控制增量，可以在不碰上层规划逻辑的情况下改善轨迹跟踪细腻度；保留 fallback 可以避免 SciPy 或求解器偶发问题直接中断演示。
+- 如何验证：已运行 `python -m py_compile control.py guiji.py perception.py config.py utils.py route.py actors.py display.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次运行普通避障在 `6.40s` 规划，回归在 `10.80s` 规划，右侧目标让行在 `35.35s` 触发并于 `40.70s` 完成，路线终点停车保持后正常清理。
+- 未覆盖风险：当前 LTV 实现仍是在目标函数内滚动动力学预测，尚未拆成显式线性化 `A_k/B_k` 与 QP 求解；动力学参数是第一版保守近似值，未做系统辨识；只验证了当前固定 `--free-run` 场景，pygame 画面观感仍建议人工确认。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
 - PR/分支信息：本地修改中，尚未推送。

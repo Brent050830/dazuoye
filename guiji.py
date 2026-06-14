@@ -53,7 +53,7 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     SIM_SECONDS,
     TRAFFIC_RANDOM_SEED,
 )
-from control import SamplingMPCTracker # MPC 控制器实现
+from control import LTVMPCTracker # MPC 控制器实现
 from control import select_best_route_offset_trajectory, select_return_to_base_trajectory
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
@@ -464,7 +464,7 @@ def main(args=None):
         ego_vehicle, lead_vehicle, ego_start_wp = spawn_scenario(world) # 生成自车和前车，并返回自车的起始路点
         actor_list.extend([ego_vehicle, lead_vehicle]) # 将生成的自车和前车添加到演员列表中，以便后续管理和清理
         collision_monitor = CollisionMonitor(world, ego_vehicle, actor_list)
-        mpc = SamplingMPCTracker() # 创建 MPC 控制器实例，用于后续的轨迹跟踪控制
+        mpc = LTVMPCTracker() # 创建 MPC 控制器实例，用于后续的轨迹跟踪控制
         camera_display = PygameDemoDisplay(world, ego_vehicle, actor_list) # 创建仿真显示实例，提供实时画面显示和信息渲染，如果创建失败则保持为 None
 
         world.tick() # 仿真世界进行一次更新，确保所有演员都已生成并准备就绪
