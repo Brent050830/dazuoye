@@ -2442,3 +2442,14 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`e870854`
 - PR/分支信息：已推送至 `origin/feature/decision-control`。
+
+### 2026-06-14 - 优化 MPC 横纵向跟踪代价
+
+- 本次目标：减少避障段和回归段使用 `SamplingMPCTracker` 跟踪时的稳态横向偏移，让 MPC 代价函数更明确地优先贴合参考轨迹横向位置。
+- 主要改动：`control.py` 中的 `SamplingMPCTracker` 将原来的全局二维 `position_error` 改为参考航向 `ref_yaw` 下的切向 `longitudinal_error` 和法向 `lateral_error` 投影；横向误差权重大于纵向误差；只在预测时域最后一步额外加入终端横向误差和终端航向误差惩罚；将 `steer - previous_steer` 的变化惩罚改为平方项；新增内部 `previous_accel`，并对 `accel - previous_accel` 加平方惩罚，且 `previous_steer` / `previous_accel` 只在最终 `best_action` 选定后更新。
+- 为什么这样改：原来的二维距离误差没有区分横向贴线和纵向进度差，MPC 可能用纵向误差抵消一部分横向偏离；在轨迹自身坐标系中提高横向误差和终端横向/航向惩罚，可以让避障段、保持 offset 段和回归段更关注贴合当前参考路线，同时通过控制增量平方项减少转向和加速度抖动。
+- 如何验证：已运行 `python -m py_compile control.py guiji.py perception.py config.py utils.py route.py actors.py display.py`，语法检查通过；已运行 `git diff --check -- control.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已用 `rg` 检查 `previous_accel`、`lateral_error`、`longitudinal_error`、终端步判断和最终动作后更新逻辑；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`，普通避障在 `6.40s` 规划，回归在 `11.75s` 规划，日志中未见避障/回归阶段明显正负来回抖动。
+- 未覆盖风险：MPC 权重为本次保守调参结果，仍建议在 1x pygame 演示中继续目视观察避障段/回归段是否有轻微残余偏移或转向过急；本次未改状态机、轨迹生成、避障触发和碰撞筛选逻辑。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。

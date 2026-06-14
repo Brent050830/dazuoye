@@ -450,7 +450,8 @@ class SamplingMPCTracker:
     """
 
     def __init__(self):
-        self.previous_steer = 0.0  # 上一帧的转向量，用于连续性惩罚
+        self.previous_steer = 0.0
+        self.previous_accel = 0.0
 
     def control(self, ego_vehicle, trajectory, target_speed): # 计算控制指令的主函数，输入自车对象、要跟踪的轨迹和目标速度，输出carla.VehicleControl对象
         """计算当前帧的最优控制指令
@@ -477,6 +478,8 @@ class SamplingMPCTracker:
 
         best_cost = float("inf")
         best_action = (0.0, -3.0)
+        previous_steer = self.previous_steer
+        previous_accel = self.previous_accel
 
         for steer in steer_candidates:
             """对于每个候选转向角，遍历所有候选加速度，进行前向积分预测，并计算代价函数，选取代价最小的动作"""
@@ -488,6 +491,10 @@ class SamplingMPCTracker:
                 speed = v0
                 progress = progress0
                 cost = 0.0
+                steer_delta = steer - previous_steer
+                accel_delta = accel - previous_accel
+                cost += 0.35 * steer_delta**2
+                cost += 0.025 * accel_delta**2
 
                 for step in range(MPC_HORIZON_STEPS):
                     """基于运动学自行车模型进行前向积分预测，计算每个时间步的状态，并根据轨迹计算误差和代价"""
@@ -502,16 +509,23 @@ class SamplingMPCTracker:
                     ref_yaw = trajectory.reference_yaw_at(progress) # 根据预测的进度从轨迹上获取参考位置和参考航向，计算预测状态与轨迹参考状态之间的误差，包括位置误差、航向误差和速度误差
                     dx = x - ref_location.x
                     dy = y - ref_location.y
-                    position_error = math.sqrt(dx * dx + dy * dy)
+                    tangent_x = math.cos(ref_yaw)
+                    tangent_y = math.sin(ref_yaw)
+                    longitudinal_error = dx * tangent_x + dy * tangent_y
+                    lateral_error = -dx * tangent_y + dy * tangent_x
                     yaw_error = normalize_angle(yaw - ref_yaw)
                     speed_error = speed - target_speed # 计算位置误差、航向误差和速度误差，分别表示预测状态与轨迹参考状态之间的偏差
 
-                    cost += 6.0 * position_error**2
+                    cost += 9.0 * lateral_error**2
+                    cost += 1.2 * longitudinal_error**2
                     cost += 1.7 * yaw_error**2
                     cost += 0.07 * speed_error**2 # 代价函数中包含位置误差、航向误差和速度误差的平方项，分别乘以权重系数，鼓励控制动作能够使车辆更好地跟踪轨迹，同时保持接近目标速度
                     cost += 0.08 * steer**2
                     cost += 0.01 * accel**2
-                    cost += 0.02 * step * abs(steer - self.previous_steer)
+                    cost += 0.004 * step * steer_delta**2
+                    if step == MPC_HORIZON_STEPS - 1:
+                        cost += 18.0 * lateral_error**2
+                        cost += 5.0 * yaw_error**2
 
                 if cost < best_cost:
                     best_cost = cost
@@ -519,6 +533,7 @@ class SamplingMPCTracker:
 
         steer, accel = best_action
         self.previous_steer = steer
+        self.previous_accel = accel
 
         if accel >= 0.0:
             throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
