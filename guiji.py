@@ -20,8 +20,11 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     DEBUG_DRAW_INTERVAL_FRAMES, # 调试绘制的帧间隔，控制仿真中轨迹和目标点的绘制频率，避免过于密集导致画面混乱
     DEBUG_DRAW_LIFETIME,
     DEBUG_DRAW_LOOKAHEAD_DISTANCE,
+    DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES,
     DEBUG_DRAW_SENSOR_OVERLAY,
+    DEBUG_DRAW_SELECTED_TRAJECTORY_ONLY,
     DEBUG_DRAW_TRAJECTORY,
+    DEBUG_DRAW_TRAJECTORY_DURATION,
     DEBUG_DRAW_TRAJECTORY_STEP,
     EGO_TARGET_SPEED,
     FIXED_DELTA_SECONDS,
@@ -152,10 +155,13 @@ def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_
     target_speed = 0.0 if front.actor_role == "lead" else max(0.0, getattr(front, "target_speed_along", 0.0))
     predicted_motion = target_speed * min(3.0, max(1.0, front.distance / max(front.closing_speed, 0.1)))
     base_length = max(14.0, min(52.0, LANE_CHANGE_LENGTH + predicted_motion))
-    best_candidate, candidates = select_best_route_offset_trajectory(
+    start_time = time.perf_counter()
+    best_candidate, candidates, diagnostics = select_best_route_offset_trajectory(
         loop_route, ego_vehicle, front, base_length, obstacle_actors=obstacle_actors
     )
+    diagnostics["elapsed_ms"] = (time.perf_counter() - start_time) * 1000.0
     print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=True) # 打印候选路径数量、筛选结果和最终选中的关键参数，便于分析避障轨迹的生成和选择过程
+    print_planning_diagnostics("avoidance", diagnostics)
     selected_trajectory = best_candidate.trajectory if best_candidate is not None else None
     if selected_trajectory is not None:
         print(
@@ -175,10 +181,13 @@ def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_
 
 def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time):
     """生成从当前偏移回到基础路线的候选段。"""
-    best_candidate, candidates = select_return_to_base_trajectory(
+    start_time = time.perf_counter()
+    best_candidate, candidates, diagnostics = select_return_to_base_trajectory(
         loop_route, ego_vehicle, LANE_CHANGE_LENGTH, obstacle_actors=obstacle_actors
     )
+    diagnostics["elapsed_ms"] = (time.perf_counter() - start_time) * 1000.0
     print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=False)
+    print_planning_diagnostics("return", diagnostics)
     if best_candidate is not None:
         print(
             "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, length={:.1f}m, transition_ratio={:.2f}.".format(
@@ -191,6 +200,25 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time):
             )
         )
     return best_candidate, candidates
+
+
+def print_planning_diagnostics(label, diagnostics):
+    """打印规划耗时和候选筛选规模，定位卡顿来源。"""
+    print(
+        "{} planning cost: {:.1f}ms, total={}, valid={}, coarse={}, refine={}, broad={}, return={}, cheap_rejects={}, collision_checks={}, actor_proj={}.".format(
+            label,
+            diagnostics.get("elapsed_ms", 0.0),
+            diagnostics.get("total_candidates", 0),
+            diagnostics.get("valid_candidates", 0),
+            diagnostics.get("coarse_candidates", 0),
+            diagnostics.get("refine_candidates", 0),
+            diagnostics.get("broad_candidates", 0),
+            diagnostics.get("return_candidates", 0),
+            diagnostics.get("cheap_rejects", 0),
+            diagnostics.get("collision_checks", 0),
+            diagnostics.get("actor_projections", 0),
+        )
+    )
 
 
 def print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=False):
@@ -325,6 +353,12 @@ def apply_route_replacement(sensor, candidate):
     return trajectory
 
 
+def reset_mpc_plan_after_route_change(mpc, settle_steps=0):
+    reset_plan = getattr(mpc, "reset_plan", None)
+    if callable(reset_plan):
+        reset_plan(settle_steps=settle_steps)
+
+
 def make_avoidance_target(front, obstacle_actors, target_offset):
     return {
         "actor_id": front.actor_id,
@@ -415,14 +449,27 @@ def draw_tracking_route_lookahead_marker(world, ego_vehicle, tracking_route, loo
 
 
 def draw_avoidance_candidates(world, candidates, selected_trajectory):
-    """用绿色线显示有效候选避障轨迹，选中轨迹使用更亮更粗的线。"""
-    if not candidates:
+    """Draw a small diagnostic subset of avoidance trajectories."""
+    if not selected_trajectory and not candidates:
         return
-    for candidate in candidates:
-        if not candidate.is_valid:
+
+    trajectories = []
+    if selected_trajectory is not None:
+        trajectories.append((selected_trajectory, True))
+
+    if not DEBUG_DRAW_SELECTED_TRAJECTORY_ONLY and DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES > 0:
+        alternative_count = 0
+        for candidate in candidates:
+            if not candidate.is_valid or candidate.trajectory is selected_trajectory:
+                continue
+            trajectories.append((candidate.trajectory, False))
+            alternative_count += 1
+            if alternative_count >= DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES:
+                break
+
+    for trajectory, is_selected in trajectories:
+        if trajectory is None:
             continue
-        trajectory = candidate.trajectory
-        is_selected = trajectory is selected_trajectory
         color = carla.Color(0, 255, 40) if is_selected else carla.Color(0, 170, 0)
         thickness = 0.08 if is_selected else 0.04
         s = 0.0
@@ -434,13 +481,14 @@ def draw_avoidance_candidates(world, candidates, selected_trajectory):
             previous = current
 
 
-def draw_trajectory_debug(world, ego_vehicle, tracking_route, selected_trajectory, candidates, frame):
+def draw_trajectory_debug(world, ego_vehicle, tracking_route, selected_trajectory, candidates, frame, draw_plan_debug):
     """统一绘制当前跟踪路线前视点和最近一次候选轨迹。"""
     if not DEBUG_DRAW_TRAJECTORY:
         return
     if frame % max(1, DEBUG_DRAW_INTERVAL_FRAMES) != 0:
         return
-    draw_avoidance_candidates(world, candidates, selected_trajectory)
+    if draw_plan_debug:
+        draw_avoidance_candidates(world, candidates, selected_trajectory)
     draw_tracking_route_lookahead_marker(world, ego_vehicle, tracking_route)
 
 
@@ -520,6 +568,7 @@ def main(args=None):
         right_object_clear_since = None
         last_plan_failure_log_time = -999.0
         avoidance_candidates = []
+        debug_plan_draw_until_time = -999.0
         active_avoidance_target = None
         mpc_tracking_until_s = None
         obstacle_actors = [lead_vehicle] + [controller.actor for controller in background_vehicles]
@@ -634,6 +683,7 @@ def main(args=None):
                     )
                     selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                     if selected_plan_trajectory is not None:
+                        reset_mpc_plan_after_route_change(mpc)
                         active_avoidance_target = make_avoidance_target(
                             front, obstacle_actors, best_candidate.target_offset
                         )
@@ -664,6 +714,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成返回基础路线的替换路径段，则应用该路径段作为新的跟踪路线，同时清除当前的避让目标，更新 MPC 跟踪的截止点，并打印相关日志；如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
+                    reset_mpc_plan_after_route_change(mpc, settle_steps=8)
                     mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
                         "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(
@@ -690,6 +741,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成替换路线，则应用替换路线并更新相关状态和日志；否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
+                    reset_mpc_plan_after_route_change(mpc)
                     active_avoidance_target = make_avoidance_target(
                         front, obstacle_actors, best_candidate.target_offset
                     )
@@ -779,7 +831,7 @@ def main(args=None):
                         steer=loop_route.steer(ego_vehicle),
                     )
 
-                if front_slowdown_needed:
+                if front_slowdown_needed: # 如果需要前车慢行但不需要紧急制动，则确保至少施加一定的制动值，并且油门为0，以实现减速效果
                     ego_control.brake = max(ego_control.brake, 0.20)
                     ego_control.throttle = 0.0
 
@@ -811,6 +863,8 @@ def main(args=None):
                     ego_control.brake = max(ego_control.brake, 0.85)
             ego_vehicle.apply_control(ego_control) # 应用控制命令，控制自车的油门、制动和转向，根据当前状态和感知信息计算得到的控制命令进行应用，实现跟车、避障、右侧物体避让等行为
 
+            if route_changed_this_frame and selected_plan_trajectory is not None:
+                debug_plan_draw_until_time = sim_time + DEBUG_DRAW_TRAJECTORY_DURATION
             draw_trajectory_debug(
                 world,
                 ego_vehicle,
@@ -818,6 +872,7 @@ def main(args=None):
                 selected_plan_trajectory,
                 avoidance_candidates,
                 frame,
+                sim_time <= debug_plan_draw_until_time,
             )
 
             if frame % int(1.0 / FIXED_DELTA_SECONDS) == 0:

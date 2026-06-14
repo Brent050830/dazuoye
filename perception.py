@@ -216,6 +216,67 @@ def _compose_tracking_points(base_route, segments):
     return points
 
 
+def _merge_replacement_segments(base_route, existing_segments, new_segment):
+    merged = []
+    for existing in existing_segments:
+        if existing.end_s <= new_segment.start_s or existing.start_s >= new_segment.end_s:
+            merged.append(existing)
+            continue
+
+        if existing.start_s < new_segment.start_s:
+            prefix = _trim_replacement_segment(base_route, existing, existing.start_s, new_segment.start_s)
+            if prefix is not None:
+                merged.append(prefix)
+
+    merged.append(new_segment)
+    merged.sort(key=lambda segment: segment.start_s)
+    return merged
+
+
+def _trim_replacement_segment(base_route, segment, start_s, end_s):
+    start_s = max(segment.start_s, start_s)
+    end_s = min(segment.end_s, end_s)
+    if end_s - start_s < 0.05:
+        return None
+
+    step = max(1.0, getattr(base_route, "step_distance", 2.0))
+    sample_count = max(1, int(math.ceil((end_s - start_s) / step)))
+    points = []
+    for index in range(sample_count + 1):
+        route_s = min(end_s, start_s + index * (end_s - start_s) / sample_count)
+        _append_point(points, _replacement_point_at(segment, route_s))
+
+    end_offset = _lateral_offset_from_base(base_route, end_s, points[-1])
+    return ReplacementSegment(start_s, end_s, points, end_offset)
+
+
+def _replacement_point_at(segment, route_s):
+    if not segment.points:
+        return carla.Location()
+    if len(segment.points) == 1 or segment.end_s <= segment.start_s:
+        return segment.points[0]
+
+    ratio = (route_s - segment.start_s) / (segment.end_s - segment.start_s)
+    ratio = max(0.0, min(1.0, ratio))
+    scaled_index = ratio * (len(segment.points) - 1)
+    lower_index = int(math.floor(scaled_index))
+    upper_index = min(len(segment.points) - 1, lower_index + 1)
+    blend = scaled_index - lower_index
+    lower = segment.points[lower_index]
+    upper = segment.points[upper_index]
+    return carla.Location(
+        x=lower.x + (upper.x - lower.x) * blend,
+        y=lower.y + (upper.y - lower.y) * blend,
+        z=lower.z + (upper.z - lower.z) * blend,
+    )
+
+
+def _lateral_offset_from_base(base_route, route_s, location):
+    base_location = base_route.reference.location_at_route_s(route_s)
+    base_right = base_route.reference.right_at_route_s(route_s)
+    return dot_2d(location - base_location, base_right)
+
+
 def _append_base_samples(points, route, start_s, end_s, step, lateral_offset=0.0):
     if end_s < start_s:
         return
@@ -331,12 +392,9 @@ class VirtualGroundTruthSensor:
         if self._base_tracking_route is None or end_s <= start_s:
             return
         segment = ReplacementSegment(start_s, end_s, list(points), end_offset)
-        self._replacement_segments = [
-            existing
-            for existing in self._replacement_segments
-            if existing.end_s <= segment.start_s or existing.start_s >= segment.end_s
-        ]
-        self._replacement_segments.append(segment)
+        self._replacement_segments = _merge_replacement_segments(
+            self._base_tracking_route, self._replacement_segments, segment
+        )
         self._current_offset = segment.end_offset
         self._tracking_route = TrackingRoute.from_base_with_replacements(
             self._base_tracking_route, self._replacement_segments
