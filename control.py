@@ -1,10 +1,37 @@
 import math
+import time
 from dataclasses import dataclass
 
 import carla
 
+try:
+    from scipy.optimize import minimize as scipy_minimize
+except Exception:
+    scipy_minimize = None
+
 from config import FRONT_CONFLICT_LATERAL_MARGIN, MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间步长、预测时域步数和车辆轴距
 from utils import clamp, dot_2d, get_speed, normalize_angle, smooth_reference_for, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
+
+MPC_DELTA_MAX_RAD = math.radians(32.0)
+MPC_DELTA_RESPONSE_TAU = 0.22
+MPC_DELTA_RATE_LIMIT_RAD = math.radians(70.0)
+MPC_DYNAMIC_MIN_VX = 2.0
+MPC_DYNAMIC_VX_SAFE = 2.0
+MPC_VEHICLE_MASS = 1650.0
+MPC_YAW_INERTIA = 2850.0
+MPC_FRONT_AXLE = 1.25
+MPC_REAR_AXLE = max(0.1, WHEEL_BASE - MPC_FRONT_AXLE)
+MPC_FRONT_CORNERING_STIFFNESS = 55000.0
+MPC_REAR_CORNERING_STIFFNESS = 65000.0
+MPC_BETA_SOFT_LIMIT = math.radians(6.0)
+MPC_BETA_HARD_LIMIT = math.radians(18.0)
+MPC_YAW_RATE_SOFT_LIMIT = math.radians(55.0)
+MPC_YAW_RATE_HARD_LIMIT = math.radians(120.0)
+MPC_TIRE_SLIP_HARD_LIMIT = math.radians(20.0)
+LTV_MPC_HORIZON_STEPS = min(10, MPC_HORIZON_STEPS)
+LTV_MPC_MAX_ITER = 24
+LTV_MPC_SOLVE_TIMEOUT_SECONDS = 0.80
+LTV_MPC_STEER_LIMIT = 0.45
 
 
 # ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
@@ -445,12 +472,12 @@ def _tracking_cost(trajectory, length):
 
 
 class SamplingMPCTracker:
-    """基于采样的后退时域MPC控制器，使用运动学自行车模型进行滚动优化。
-    通过枚举转向角和加速度候选值，选取预测代价最小的控制动作。
-    """
+    """Sampling MPC tracker with a linear-tire dynamic bicycle prediction model."""
 
     def __init__(self):
-        self.previous_steer = 0.0  # 上一帧的转向量，用于连续性惩罚
+        self.previous_steer = 0.0
+        self.previous_accel = 0.0
+        self.previous_delta = 0.0
 
     def control(self, ego_vehicle, trajectory, target_speed): # 计算控制指令的主函数，输入自车对象、要跟踪的轨迹和目标速度，输出carla.VehicleControl对象
         """计算当前帧的最优控制指令
@@ -461,64 +488,153 @@ class SamplingMPCTracker:
 
         transform = ego_vehicle.get_transform()
         progress0, _ = trajectory.to_local(transform.location) # 将自车当前位置转换到轨迹的局部坐标系下，得到自车在轨迹上的弧长 s 和横向 d，供后续预测使用
-        x0 = transform.location.x
+        x0 = transform.location.x # 获取自车当前位置的全局坐标 x 和 y，以及航向角 yaw 和当前速度 v0，作为MPC预测的初始状态
         y0 = transform.location.y
         yaw0 = yaw_to_rad(transform.rotation)
-        v0 = get_speed(ego_vehicle)
+        velocity = ego_vehicle.get_velocity()
+        cos_yaw = math.cos(yaw0)
+        sin_yaw = math.sin(yaw0)
+        vx0 = velocity.x * cos_yaw + velocity.y * sin_yaw
+        vy0 = -velocity.x * sin_yaw + velocity.y * cos_yaw
+        speed0 = get_speed(ego_vehicle)
+        if vx0 < 0.1 and speed0 > 0.1:
+            vx0 = speed0
+        vx0 = max(0.0, vx0)
+        if vx0 < MPC_DYNAMIC_MIN_VX:
+            vy0 = 0.0
+        # CARLA angular velocity is reported in degrees/s; the model uses rad/s.
+        yaw_rate0 = math.radians(ego_vehicle.get_angular_velocity().z)
 
         steer_candidates = [
             clamp(self.previous_steer + delta, -0.45, 0.45)
             for delta in (-0.45, -0.32, -0.20, -0.10, 0.0, 0.10, 0.20, 0.32, 0.45)
         ]
-        if v0 < max(3.0, target_speed * 0.5):
+        if speed0 < max(3.0, target_speed * 0.5):
             accel_candidates = (0.0, 1.0)
         else:
             accel_candidates = (-4.0, -2.0, -1.0, 0.0, 1.0)
 
         best_cost = float("inf")
-        best_action = (0.0, -3.0)
+        best_action = (0.0, -3.0, self.previous_delta)
+        previous_steer = self.previous_steer
+        previous_accel = self.previous_accel
 
         for steer in steer_candidates:
-            """对于每个候选转向角，遍历所有候选加速度，进行前向积分预测，并计算代价函数，选取代价最小的动作"""
             for accel in accel_candidates:
-                """初始化预测状态为当前状态"""
                 x = x0
                 y = y0
                 yaw = yaw0
-                speed = v0
+                vx = vx0
+                vy = vy0
+                yaw_rate = yaw_rate0
+                steer_angle = self.previous_delta
                 progress = progress0
+                first_step_delta = steer_angle
+                reject_candidate = False
                 cost = 0.0
+                steer_delta = steer - previous_steer
+                accel_delta = accel - previous_accel
+                delta_cmd = clamp(steer, -1.0, 1.0) * MPC_DELTA_MAX_RAD
+
+                cost += 0.35 * steer_delta**2
+                cost += 0.025 * accel_delta**2
 
                 for step in range(MPC_HORIZON_STEPS):
-                    """基于运动学自行车模型进行前向积分预测，计算每个时间步的状态，并根据轨迹计算误差和代价"""
-                    speed = max(0.0, speed + accel * MPC_DT)
-                    distance_step = speed * MPC_DT
-                    x += distance_step * math.cos(yaw)
-                    y += distance_step * math.sin(yaw)
-                    progress += distance_step
-                    yaw = normalize_angle(yaw + speed / WHEEL_BASE * math.tan(steer) * MPC_DT)
+                    steer_rate = clamp(
+                        (delta_cmd - steer_angle) / MPC_DELTA_RESPONSE_TAU,
+                        -MPC_DELTA_RATE_LIMIT_RAD,
+                        MPC_DELTA_RATE_LIMIT_RAD,
+                    )
+                    steer_angle = clamp(
+                        steer_angle + steer_rate * MPC_DT,
+                        -MPC_DELTA_MAX_RAD,
+                        MPC_DELTA_MAX_RAD,
+                    )
+                    if step == 0:
+                        first_step_delta = steer_angle
 
-                    ref_location = trajectory.location_at(progress) # 根据预测的进度从轨迹上获取参考位置和参考航向，计算预测状态与轨迹参考状态之间的误差，包括位置误差、航向误差和速度误差
-                    ref_yaw = trajectory.reference_yaw_at(progress) # 根据预测的进度从轨迹上获取参考位置和参考航向，计算预测状态与轨迹参考状态之间的误差，包括位置误差、航向误差和速度误差
+                    if vx < MPC_DYNAMIC_MIN_VX:
+                        vx = max(0.0, vx + accel * MPC_DT)
+                        vy = 0.0
+                        yaw_rate = vx / WHEEL_BASE * math.tan(steer_angle)
+                        x += vx * math.cos(yaw) * MPC_DT
+                        y += vx * math.sin(yaw) * MPC_DT
+                        yaw = normalize_angle(yaw + yaw_rate * MPC_DT)
+                        alpha_f = 0.0
+                        alpha_r = 0.0
+                    else:
+                        vx_safe = max(abs(vx), MPC_DYNAMIC_VX_SAFE)
+                        alpha_f = steer_angle - math.atan2(vy + MPC_FRONT_AXLE * yaw_rate, vx_safe)
+                        alpha_r = -math.atan2(vy - MPC_REAR_AXLE * yaw_rate, vx_safe)
+                        force_yf = MPC_FRONT_CORNERING_STIFFNESS * alpha_f
+                        force_yr = MPC_REAR_CORNERING_STIFFNESS * alpha_r
+
+                        x_dot = vx * math.cos(yaw) - vy * math.sin(yaw)
+                        y_dot = vx * math.sin(yaw) + vy * math.cos(yaw)
+                        vy_dot = (force_yf + force_yr) / MPC_VEHICLE_MASS - vx * yaw_rate
+                        yaw_rate_dot = (MPC_FRONT_AXLE * force_yf - MPC_REAR_AXLE * force_yr) / MPC_YAW_INERTIA
+
+                        x += x_dot * MPC_DT
+                        y += y_dot * MPC_DT
+                        yaw = normalize_angle(yaw + yaw_rate * MPC_DT)
+                        vx = max(0.0, vx + accel * MPC_DT)
+                        vy += vy_dot * MPC_DT
+                        yaw_rate += yaw_rate_dot * MPC_DT
+
+                    ref_yaw_for_progress = trajectory.reference_yaw_at(progress)
+                    progress_yaw_error = normalize_angle(yaw - ref_yaw_for_progress)
+                    progress += max(0.0, vx * math.cos(progress_yaw_error)) * MPC_DT
+
+                    ref_location = trajectory.location_at(progress)
+                    ref_yaw = trajectory.reference_yaw_at(progress)
                     dx = x - ref_location.x
                     dy = y - ref_location.y
-                    position_error = math.sqrt(dx * dx + dy * dy)
+                    tangent_x = math.cos(ref_yaw)
+                    tangent_y = math.sin(ref_yaw)
+                    longitudinal_error = dx * tangent_x + dy * tangent_y
+                    lateral_error = -dx * tangent_y + dy * tangent_x
                     yaw_error = normalize_angle(yaw - ref_yaw)
-                    speed_error = speed - target_speed # 计算位置误差、航向误差和速度误差，分别表示预测状态与轨迹参考状态之间的偏差
+                    speed_error = vx - target_speed
+                    vx_safe_for_beta = max(abs(vx), MPC_DYNAMIC_VX_SAFE)
+                    beta = math.atan2(vy, vx_safe_for_beta)
 
-                    cost += 6.0 * position_error**2
+                    cost += 9.0 * lateral_error**2
+                    cost += 0.45 * longitudinal_error**2
                     cost += 1.7 * yaw_error**2
-                    cost += 0.07 * speed_error**2 # 代价函数中包含位置误差、航向误差和速度误差的平方项，分别乘以权重系数，鼓励控制动作能够使车辆更好地跟踪轨迹，同时保持接近目标速度
+                    cost += 0.07 * speed_error**2
                     cost += 0.08 * steer**2
                     cost += 0.01 * accel**2
-                    cost += 0.02 * step * abs(steer - self.previous_steer)
+                    cost += 0.004 * step * steer_delta**2
+                    cost += 1.6 * beta**2
+                    cost += 0.10 * yaw_rate**2
 
-                if cost < best_cost:
+                    beta_excess = max(0.0, abs(beta) - MPC_BETA_SOFT_LIMIT)
+                    yaw_rate_excess = max(0.0, abs(yaw_rate) - MPC_YAW_RATE_SOFT_LIMIT)
+                    cost += 90.0 * beta_excess**2
+                    cost += 8.0 * yaw_rate_excess**2
+
+                    if (
+                        abs(beta) > MPC_BETA_HARD_LIMIT
+                        or abs(yaw_rate) > MPC_YAW_RATE_HARD_LIMIT
+                        or abs(alpha_f) > MPC_TIRE_SLIP_HARD_LIMIT
+                        or abs(alpha_r) > MPC_TIRE_SLIP_HARD_LIMIT
+                    ):
+                        reject_candidate = True
+                        break
+
+                    if step == MPC_HORIZON_STEPS - 1:
+                        cost += 18.0 * lateral_error**2
+                        cost += 5.0 * yaw_error**2
+                        cost += 0.04 * speed_error**2
+
+                if not reject_candidate and cost < best_cost:
                     best_cost = cost
-                    best_action = (steer, accel)
+                    best_action = (steer, accel, first_step_delta)
 
-        steer, accel = best_action
+        steer, accel, first_step_delta = best_action
         self.previous_steer = steer
+        self.previous_accel = accel
+        self.previous_delta = first_step_delta
 
         if accel >= 0.0:
             throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
@@ -528,5 +644,243 @@ class SamplingMPCTracker:
             brake = clamp(-accel / 7.5, 0.0, 1.0)
 
         return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
+
+
+class LTVMPCTracker:
+    """First-version LTV-MPC tracker.
+
+    The implementation keeps the current CARLA-facing interface and uses
+    scipy.optimize.minimize to optimize a short control sequence. The dynamic
+    rollout is kept in the objective for now; it can later be replaced by an
+    explicit A_k/B_k QP form without changing the caller.
+    """
+
+    def __init__(self):
+        self.fallback_tracker = SamplingMPCTracker()
+        self.previous_delta_cmd = 0.0
+        self.previous_accel = 0.0
+        self.previous_delta = 0.0
+        self.previous_solution = None
+        self._warned_fallback = False
+
+    def control(self, ego_vehicle, trajectory, target_speed):
+        if scipy_minimize is None:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "scipy unavailable")
+        if not getattr(trajectory, "is_route_relative", False):
+            return self._fallback(ego_vehicle, trajectory, target_speed, "trajectory is not route-relative")
+
+        initial_state = self._initial_state(ego_vehicle, trajectory)
+        if initial_state is None:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "invalid initial state")
+
+        initial_guess = self._initial_guess()
+        bounds = []
+        for _ in range(LTV_MPC_HORIZON_STEPS):
+            bounds.append((-LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD, LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD))
+            bounds.append((-4.0, 1.0))
+
+        start_time = time.perf_counter()
+        try:
+            result = scipy_minimize(
+                self._objective,
+                initial_guess,
+                args=(initial_state, trajectory, target_speed),
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": LTV_MPC_MAX_ITER, "ftol": 1e-2, "maxls": 8, "disp": False},
+            )
+        except Exception as exc:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "solver exception: {}".format(exc))
+
+        solve_time = time.perf_counter() - start_time
+        if solve_time > LTV_MPC_SOLVE_TIMEOUT_SECONDS:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "solver timeout {:.3f}s".format(solve_time))
+        if not getattr(result, "success", False):
+            return self._fallback(ego_vehicle, trajectory, target_speed, "solver failed")
+        if result.x is None or len(result.x) < 2:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "empty solution")
+
+        delta_cmd = float(result.x[0])
+        accel = float(result.x[1])
+        if not (math.isfinite(delta_cmd) and math.isfinite(accel)):
+            return self._fallback(ego_vehicle, trajectory, target_speed, "non-finite solution")
+
+        delta_cmd = clamp(delta_cmd, -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD, LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD)
+        accel = clamp(accel, -4.0, 1.0)
+        steer = clamp(delta_cmd / MPC_DELTA_MAX_RAD, -1.0, 1.0)
+
+        if self._solution_unstable(initial_state, trajectory, target_speed, result.x):
+            return self._fallback(ego_vehicle, trajectory, target_speed, "unstable solution")
+
+        self.previous_solution = list(result.x)
+        self.previous_delta_cmd = delta_cmd
+        self.previous_accel = accel
+        self.previous_delta = self._advance_delta(self.previous_delta, delta_cmd)
+        self.fallback_tracker.previous_steer = steer
+        self.fallback_tracker.previous_accel = accel
+        self.fallback_tracker.previous_delta = self.previous_delta
+
+        if accel >= 0.0:
+            throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = clamp(-accel / 7.5, 0.0, 1.0)
+        return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
+
+    def _initial_state(self, ego_vehicle, trajectory):
+        transform = ego_vehicle.get_transform()
+        progress0, _ = trajectory.to_local(transform.location)
+        yaw0 = yaw_to_rad(transform.rotation)
+        velocity = ego_vehicle.get_velocity()
+        cos_yaw = math.cos(yaw0)
+        sin_yaw = math.sin(yaw0)
+        vx0 = velocity.x * cos_yaw + velocity.y * sin_yaw
+        vy0 = -velocity.x * sin_yaw + velocity.y * cos_yaw
+        speed0 = get_speed(ego_vehicle)
+        if vx0 < 0.1 and speed0 > 0.1:
+            vx0 = speed0
+        vx0 = max(0.0, vx0)
+        if vx0 < MPC_DYNAMIC_MIN_VX:
+            vy0 = 0.0
+        yaw_rate0 = math.radians(ego_vehicle.get_angular_velocity().z)
+        values = [transform.location.x, transform.location.y, yaw0, vx0, vy0, yaw_rate0, self.previous_delta, progress0]
+        if any(not math.isfinite(value) for value in values):
+            return None
+        return values
+
+    def _initial_guess(self):
+        if self.previous_solution and len(self.previous_solution) == 2 * LTV_MPC_HORIZON_STEPS:
+            shifted = list(self.previous_solution[2:])
+            shifted.extend(self.previous_solution[-2:])
+            return shifted
+        guess = []
+        for _ in range(LTV_MPC_HORIZON_STEPS):
+            guess.append(self.previous_delta_cmd)
+            guess.append(self.previous_accel)
+        return guess
+
+    def _objective(self, controls, initial_state, trajectory, target_speed):
+        x, y, yaw, vx, vy, yaw_rate, steer_angle, progress = initial_state
+        previous_delta_cmd = self.previous_delta_cmd
+        previous_accel = self.previous_accel
+        cost = 0.0
+
+        for step in range(LTV_MPC_HORIZON_STEPS):
+            delta_cmd = float(controls[2 * step])
+            accel = float(controls[2 * step + 1])
+            delta_cmd = clamp(delta_cmd, -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD, LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD)
+            accel = clamp(accel, -4.0, 1.0)
+
+            delta_change = delta_cmd - previous_delta_cmd
+            accel_change = accel - previous_accel
+            rate_excess = max(0.0, abs(delta_change) - MPC_DELTA_RATE_LIMIT_RAD * MPC_DT)
+            cost += 4.0 * delta_change**2 + 0.035 * accel_change**2 + 800.0 * rate_excess**2
+            previous_delta_cmd = delta_cmd
+            previous_accel = accel
+
+            x, y, yaw, vx, vy, yaw_rate, steer_angle, alpha_f, alpha_r = self._dynamic_step(
+                x, y, yaw, vx, vy, yaw_rate, steer_angle, delta_cmd, accel
+            )
+            if not all(math.isfinite(value) for value in (x, y, yaw, vx, vy, yaw_rate, steer_angle, alpha_f, alpha_r)):
+                return 1e9
+
+            ref_yaw_for_progress = trajectory.reference_yaw_at(progress)
+            progress_yaw_error = normalize_angle(yaw - ref_yaw_for_progress)
+            progress += max(0.0, vx * math.cos(progress_yaw_error)) * MPC_DT
+
+            ref_location = trajectory.location_at(progress)
+            ref_yaw = trajectory.reference_yaw_at(progress)
+            lateral_error, longitudinal_error, yaw_error = self._tracking_errors(x, y, yaw, ref_location, ref_yaw)
+            speed_error = vx - target_speed
+            beta = math.atan2(vy, max(abs(vx), MPC_DYNAMIC_VX_SAFE))
+
+            cost += 10.0 * lateral_error**2
+            cost += 0.25 * longitudinal_error**2
+            cost += 2.2 * yaw_error**2
+            cost += 0.06 * speed_error**2
+            cost += 0.45 * delta_cmd**2
+            cost += 0.012 * accel**2
+            cost += 1.8 * beta**2
+            cost += 0.12 * yaw_rate**2
+
+            beta_excess = max(0.0, abs(beta) - MPC_BETA_SOFT_LIMIT)
+            yaw_rate_excess = max(0.0, abs(yaw_rate) - MPC_YAW_RATE_SOFT_LIMIT)
+            cost += 110.0 * beta_excess**2
+            cost += 10.0 * yaw_rate_excess**2
+
+            if abs(beta) > MPC_BETA_HARD_LIMIT or abs(yaw_rate) > MPC_YAW_RATE_HARD_LIMIT:
+                return 1e8 + cost
+            if abs(alpha_f) > MPC_TIRE_SLIP_HARD_LIMIT or abs(alpha_r) > MPC_TIRE_SLIP_HARD_LIMIT:
+                return 1e8 + cost
+
+            if step == LTV_MPC_HORIZON_STEPS - 1:
+                cost += 22.0 * lateral_error**2
+                cost += 7.0 * yaw_error**2
+                cost += 0.04 * speed_error**2
+
+        return cost
+
+    def _dynamic_step(self, x, y, yaw, vx, vy, yaw_rate, steer_angle, delta_cmd, accel):
+        steer_angle = self._advance_delta(steer_angle, delta_cmd)
+        if vx < MPC_DYNAMIC_MIN_VX:
+            vx = max(0.0, vx + accel * MPC_DT)
+            vy = 0.0
+            yaw_rate = vx / WHEEL_BASE * math.tan(steer_angle)
+            x += vx * math.cos(yaw) * MPC_DT
+            y += vx * math.sin(yaw) * MPC_DT
+            yaw = normalize_angle(yaw + yaw_rate * MPC_DT)
+            return x, y, yaw, vx, vy, yaw_rate, steer_angle, 0.0, 0.0
+
+        vx_safe = max(abs(vx), MPC_DYNAMIC_VX_SAFE)
+        alpha_f = steer_angle - math.atan2(vy + MPC_FRONT_AXLE * yaw_rate, vx_safe)
+        alpha_r = -math.atan2(vy - MPC_REAR_AXLE * yaw_rate, vx_safe)
+        force_yf = MPC_FRONT_CORNERING_STIFFNESS * alpha_f
+        force_yr = MPC_REAR_CORNERING_STIFFNESS * alpha_r
+
+        x_dot = vx * math.cos(yaw) - vy * math.sin(yaw)
+        y_dot = vx * math.sin(yaw) + vy * math.cos(yaw)
+        vy_dot = (force_yf + force_yr) / MPC_VEHICLE_MASS - vx * yaw_rate
+        yaw_rate_dot = (MPC_FRONT_AXLE * force_yf - MPC_REAR_AXLE * force_yr) / MPC_YAW_INERTIA
+
+        x += x_dot * MPC_DT
+        y += y_dot * MPC_DT
+        yaw = normalize_angle(yaw + yaw_rate * MPC_DT)
+        vx = max(0.0, vx + accel * MPC_DT)
+        vy += vy_dot * MPC_DT
+        yaw_rate += yaw_rate_dot * MPC_DT
+        return x, y, yaw, vx, vy, yaw_rate, steer_angle, alpha_f, alpha_r
+
+    def _advance_delta(self, current_delta, delta_cmd):
+        steer_rate = clamp(
+            (delta_cmd - current_delta) / MPC_DELTA_RESPONSE_TAU,
+            -MPC_DELTA_RATE_LIMIT_RAD,
+            MPC_DELTA_RATE_LIMIT_RAD,
+        )
+        return clamp(current_delta + steer_rate * MPC_DT, -MPC_DELTA_MAX_RAD, MPC_DELTA_MAX_RAD)
+
+    def _tracking_errors(self, x, y, yaw, ref_location, ref_yaw):
+        dx = x - ref_location.x
+        dy = y - ref_location.y
+        tangent_x = math.cos(ref_yaw)
+        tangent_y = math.sin(ref_yaw)
+        longitudinal_error = dx * tangent_x + dy * tangent_y
+        lateral_error = -dx * tangent_y + dy * tangent_x
+        yaw_error = normalize_angle(yaw - ref_yaw)
+        return lateral_error, longitudinal_error, yaw_error
+
+    def _solution_unstable(self, initial_state, trajectory, target_speed, controls):
+        return self._objective(controls, initial_state, trajectory, target_speed) >= 1e8
+
+    def _fallback(self, ego_vehicle, trajectory, target_speed, reason):
+        if not self._warned_fallback:
+            print("LTV-MPC fallback to SamplingMPCTracker: {}".format(reason))
+            self._warned_fallback = True
+        control = self.fallback_tracker.control(ego_vehicle, trajectory, target_speed)
+        self.previous_delta_cmd = clamp(control.steer, -1.0, 1.0) * MPC_DELTA_MAX_RAD
+        self.previous_accel = 0.0
+        self.previous_delta = getattr(self.fallback_tracker, "previous_delta", self.previous_delta)
+        self.previous_solution = None
+        return control
 
 
