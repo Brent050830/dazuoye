@@ -247,9 +247,12 @@ BACKGROUND_BICYCLE_SPEED_MIN = 2.6
 BACKGROUND_BICYCLE_SPEED_MAX = 4.3
 DEBUG_DRAW_TRAJECTORY = True
 DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0
-DEBUG_DRAW_TRAJECTORY_STEP = 2.0
-DEBUG_DRAW_INTERVAL_FRAMES = 4
-DEBUG_DRAW_LIFETIME = 0.25
+DEBUG_DRAW_TRAJECTORY_STEP = 4.0
+DEBUG_DRAW_INTERVAL_FRAMES = 8
+DEBUG_DRAW_LIFETIME = 0.45
+DEBUG_DRAW_TRAJECTORY_DURATION = 3.0
+DEBUG_DRAW_SELECTED_TRAJECTORY_ONLY = True
+DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES = 0
 ```
 
 后续加入场景开关时，可以再增加：
@@ -1381,10 +1384,10 @@ $$
 \alpha\in[-1.20,-1.10,-1.05,-1.00,-0.90,-0.70,-0.55,-0.45,-0.35,-0.25,-0.15,0,0.15,0.25,0.35,0.45,0.55,0.70,0.90,1.00,1.05,1.10,1.20]\}
 $$
 
-普通避障候选还会枚举横向过渡比例：
+普通避障候选完整集合包含横向过渡比例：
 
 $$
-\mathcal{R}_{\mathrm{avoid}}=\{0.75,\ 0.85,\ 1.00\}
+\mathcal{R}_{\mathrm{avoid}}=\{0.75,\ 0.80,\ 0.85,\ 0.90,\ 1.00\}
 $$
 
 回归候选较保守，只枚举：
@@ -1393,7 +1396,9 @@ $$
 \mathcal{R}_{\mathrm{return}}=\{0.85,\ 1.00\}
 $$
 
-对每一组 $(L,d_t,\rho)$，都构造一条 `RouteOffsetLaneChangeTrajectory`，段尾保持目标偏移。因此当前避障入口处理的是候选 replacement segment 集合：
+为了减少规划时卡顿，当前普通避障不再一开始就完整枚举所有 $(L,d_t,\rho)$ 组合。`select_best_route_offset_trajectory()` 使用两阶段候选：粗筛阶段取稀疏长度、偏移和过渡比例子集，快速判断安全方向和大致偏移范围；若粗筛已有有效候选，加密阶段只围绕低代价有效候选附近的长度/偏移区域使用完整过渡比例局部加密；若粗筛没有有效候选，兜底阶段扩大到“粗长度 + 全偏移”和“全长度 + 粗偏移”的组合，避免直接回到全量 800+ 候选。
+
+对进入评分的每组 $(L,d_t,\rho)$，构造或近似评估一条 `RouteOffsetLaneChangeTrajectory`，段尾保持目标偏移。因此当前避障入口处理的是候选 replacement segment 集合：
 
 $$
 \mathcal{T}
@@ -1433,7 +1438,9 @@ d_{\mathrm{front}}
 + v_{o,\mathrm{plan}}t_e
 $$
 
-候选还会对 `obstacle_actors` 中所有车辆做简化时空冲突硬筛选。硬筛只检查 replacement 段自身及 2m 保守余量，对每个候选采样点 $s_j\in[0,L+2]$，估计车辆沿基础路线方向的预测弧长 $s_o(t_j)$，并根据自车/目标车包围盒半长半宽构造纵向和横向安全包络。若同时满足：
+同一次规划中，`control.py` 会先把 `obstacle_actors` 中每个车辆投影到当前基础路线，缓存 `route_s`、横向偏移、沿路线速度和包围盒尺寸。后续候选冲突检测复用该缓存，不再让每条候选重复调用路线投影。
+
+候选会先经过便宜预筛选：若横向加速度超过 `3.8m/s^2`，或静止/很慢前车在候选路径上的单点横向分离明显不足，则直接拒绝，不进入完整采样碰撞检测。未被预筛拒绝的候选再做简化时空冲突硬筛选。硬筛只检查 replacement 段自身及 2m 保守余量，对每个候选采样点 $s_j\in[0,L+2]$，估计车辆沿基础路线方向的预测弧长 $s_o(t_j)$，并根据自车/目标车包围盒半长半宽构造纵向和横向安全包络。若同时满足：
 
 $$
 \left|s_o(t_j)-s_j\right| \le l_{\mathrm{ego}}+l_o+\Delta_l
@@ -1443,7 +1450,7 @@ $$
 \left|d_o-d_{\mathrm{avoid}}(s_j)\right| \le w_{\mathrm{ego}}+w_o+\Delta_w
 $$
 
-其中横向余量当前取 $\Delta_w=0.35\mathrm{m}$（触发本次规划的前车）或 $0.25\mathrm{m}$（其他车辆）。则该候选被标记为 `candidate conflicts with vehicle` 或 `candidate conflicts with front vehicle` 并直接剔除。当前采样步长为 `1.0m`；候选只有在纵向包络与横向包络同时重叠时才被判定为冲突。$L+2$ 之后保持 `target_offset` 的后续路线不作为候选硬拒绝条件，交由当前合成路线在后续帧继续检测和必要时重规划/制动。候选长度相对前车可用距离不再作为硬拒绝条件，而是进入安全代价。候选路径代价由安全性、舒适性、跟踪难度和目标偏移代价组成：
+其中横向余量当前取 $\Delta_w=0.35\mathrm{m}$（触发本次规划的前车）或 $0.25\mathrm{m}$（其他车辆）。则该候选被标记为 `candidate conflicts with vehicle` 或 `candidate conflicts with front vehicle` 并直接剔除。当前采样步长为 `1.0m`；候选只有在纵向包络与横向包络同时重叠时才被判定为冲突。$L+2$ 之后保持 `target_offset` 的后续路线不作为候选硬拒绝条件，交由当前合成路线在后续帧继续检测和必要时重规划/制动。候选长度相对前车可用距离不再作为硬拒绝条件，而是进入安全代价。规划日志会输出 `planning cost`、总候选数、有效候选数、粗筛/加密/兜底数量、便宜拒绝数、完整碰撞检查次数和 actor 投影缓存数量，用于定位卡顿来自候选计算还是绘制。候选路径代价由安全性、舒适性、跟踪难度和目标偏移代价组成：
 
 $$
 J = 4.0J_s + 2.0J_c + J_t + 0.6J_d
@@ -1811,6 +1818,14 @@ $$
 (\delta_{\mathrm{cmd},0}^*, a_{x,0}^*) = \arg\min J
 $$
 
+当前 LTV-MPC 只负责转向和非负加速度跟踪，暂不主动控制制动：
+
+$$
+a_{x,0}^* \in [0.0,\ 1.0]\ \mathrm{m/s^2}
+$$
+
+若 LTV 求解失败进入 `SamplingMPCTracker` fallback，`LTVMPCTracker` 也会清零 fallback 返回的 `brake`。真正的强制制动仍由外层 `EMERGENCY_BRAKE`、右侧目标 hard stop、路线完成停车和规划失败减速逻辑接管。
+
 最终输出给 CARLA 前，将前轮目标转角还原为归一化转向命令：
 
 $$
@@ -1822,22 +1837,15 @@ $$
 \right)
 $$
 
-加速度到 CARLA 油门/制动的映射：
+加速度到 CARLA 油门的映射：
 
 $$
 \mathrm{throttle} =
-\begin{cases}
-\operatorname{clamp}(0.25 + 0.18a_{x,0}^*,\ 0.0,\ 0.65), & a_{x,0}^* \ge 0 \\
-0.0, & a_{x,0}^* < 0
-\end{cases}
+\operatorname{clamp}(0.25 + 0.18a_{x,0}^*,\ 0.0,\ 0.65)
 $$
 
 $$
-\mathrm{brake} =
-\begin{cases}
-0.0, & a_{x,0}^* \ge 0 \\
-\operatorname{clamp}\left(-\dfrac{a_{x,0}^*}{7.5},\ 0.0,\ 1.0\right), & a_{x,0}^* < 0
-\end{cases}
+\mathrm{brake} = 0.0
 $$
 
 最终输出：
@@ -1946,8 +1954,8 @@ E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --playback-speed 1.0
 当前还通过 CARLA `world.debug` 增加了轨迹调试标记，便于在 pygame/CARLA 画面中观察当前规划目标：
 
 - 在当前合成 `TrackingRoute` 前方约 `DEBUG_DRAW_LOOKAHEAD_DISTANCE = 10.0m` 处绘制红色竖向标记，表示自车下一段路线跟踪目标。
-- 前方规划触发后，把有效候选 replacement segment 绘制为绿色线段，最终选中的候选使用更亮、更粗的绿色线段。
-- 调试绘制由 `DEBUG_DRAW_TRAJECTORY` 控制；线段采样间隔为 `DEBUG_DRAW_TRAJECTORY_STEP = 2.0m`，每 `DEBUG_DRAW_INTERVAL_FRAMES = 4` 帧刷新一次，绘制生命周期为 `DEBUG_DRAW_LIFETIME = 0.25s`，因此视觉上保持连续，同时避免避障时每帧绘制大量候选线拖慢 1x 播放。
+- 前方规划触发后，默认只把最终选中的 replacement segment 绘制为绿色线段；如需观察少量备选候选，可在 `config.py` 中关闭 `DEBUG_DRAW_SELECTED_TRAJECTORY_ONLY` 并设置 `DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES`。
+- 调试绘制由 `DEBUG_DRAW_TRAJECTORY` 控制；线段采样间隔为 `DEBUG_DRAW_TRAJECTORY_STEP = 4.0m`，每 `DEBUG_DRAW_INTERVAL_FRAMES = 8` 帧刷新一次，绘制生命周期为 `DEBUG_DRAW_LIFETIME = 0.45s`。规划轨迹只在 `DEBUG_DRAW_TRAJECTORY_DURATION = 3.0s` 时间窗口内重复绘制，避免上一次规划的数百条候选在后续帧中持续拖慢 1x 播放。
 
 这些标记只用于演示和调试，不参与控制计算；如果画面过密或影响性能，可以在 `config.py` 中关闭 `DEBUG_DRAW_TRAJECTORY`。
 
@@ -2534,3 +2542,47 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`9112b5c`。
 - PR/分支信息：已推送至 `origin/feature/decision-control`。
+
+### 2026-06-14 - 降低候选轨迹调试绘制开销
+
+- 本次目标：缓解避障规划后画面卡顿，减少 CARLA `world.debug.draw_line()` 对 1x 播放和路线生成观感的影响。
+- 主要改动：`config.py` 将轨迹 debug 绘制采样间隔从 `2.0m` 放宽到 `4.0m`，刷新间隔从每 `4` 帧改为每 `8` 帧，绘制生命周期调整为 `0.45s`；新增 `DEBUG_DRAW_TRAJECTORY_DURATION = 3.0s`、`DEBUG_DRAW_SELECTED_TRAJECTORY_ONLY = True` 和 `DEBUG_DRAW_MAX_ALTERNATIVE_TRAJECTORIES = 0`。`guiji.py` 默认只绘制最终选中的 replacement segment，并且只在规划成功后的短时间窗口内绘制，不再把上一次所有有效候选持续重画到仿真结束。
+- 为什么这样改：当前候选轨迹可达数百条，虽然只有有效候选被画出，但旧实现会在后续很多帧里反复绘制上一轮候选，容易让 CARLA debug drawing 和 pygame 显示一起变卡。规划决策仍保留完整候选筛选，只降低可视化绘制量，不改变轨迹生成、碰撞硬筛或状态机。
+- 如何验证：已运行 `python -m py_compile guiji.py config.py control.py perception.py route.py actors.py display.py utils.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示。
+- 未覆盖风险：本次未启动 CARLA 实景回归，实际帧率改善需要在 pygame/CARLA 画面中观察；默认不再显示全部有效候选，如需调试候选分布，需要临时打开备选候选绘制参数。
+- 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/config.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-14 - 禁止 LTV-MPC 在回归段主动制动
+
+- 本次目标：解决第二辆慢车后移后，回归段跟踪过程中 LTV-MPC 因横向/航向误差主动输出较大制动，导致车辆在回归段中途停住并被慢车追撞的问题。
+- 主要改动：`control.py` 将 `LTVMPCTracker` 的加速度优化边界改为 `[0.0, 1.0]`，输出控制时固定 `brake = 0.0`；fallback 到 `SamplingMPCTracker` 时也清零返回的 `brake`，并重置 fallback 的 `previous_accel`。新增 `LTVMPCTracker.reset_plan()`，`guiji.py` 在每次新的避障/回归 replacement segment 写入后清除上一段优化序列和加速度 warm-start，避免上一段轨迹的解带入新段。
+- 为什么这样改：避障/回归段的 MPC 当前主要用于横向跟踪，强制制动应由外层 `EMERGENCY_BRAKE`、右侧目标 hard stop、规划失败减速和路线完成停车控制。让 LTV 在回归段直接控制制动，会在参考线形状突变或求解器 fallback 附近把横向误差转化成停车动作。
+- 如何验证：已运行 `python -m py_compile guiji.py control.py config.py perception.py route.py actors.py display.py utils.py`，语法检查通过；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，在 `SLOW_RIGHT_LANE_DISTANCE = 110.0` 场景下完成一圈，最终 `Collisions: 0`。第二辆慢车避障后回归在 `22.35s` 规划，之后未再出现 `brake=0.53` 或速度归零卡在回归段的情况。
+- 未覆盖风险：LTV-MPC 暂时不主动制动后，避障/回归段的速度收敛主要依赖油门上限和外层安全制动逻辑；若以后要做完整横纵向一体 MPC，需要重新设计纵向制动约束和状态机优先级。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-14 - 优化避障候选生成性能
+
+- 本次目标：缓解超车路径生成瞬间卡顿，减少普通避障每帧全量枚举数百到近千条候选并重复投影所有车辆的开销。
+- 主要改动：`control.py` 新增规划诊断统计和 `ActorPathProjection` 缓存，同一次规划中每个障碍车只投影一次，候选冲突检测复用 `route_s/lateral/speed_along/bbox`；普通避障候选改为粗筛、局部加密和必要兜底三阶段生成；横向加速度超限和很慢前车明显横向分离不足的候选先做便宜拒绝，不进入完整碰撞采样；回归候选也复用 actor 投影缓存。`guiji.py` 的规划日志新增 `planning cost`、总候选数、有效数、粗筛/加密/兜底数量、便宜拒绝数、完整碰撞检查次数和 actor 投影数量。
+- 为什么这样改：此前普通避障可能一次生成 `888` 条候选，并且每条候选都重新对所有车辆做路线投影和采样碰撞检查。当前优化保持“最终采用候选必须通过所有车辆冲突硬筛”的原则，但把无意义候选提前拒绝，并把重复投影缓存下来。
+- 如何验证：已运行 `python -m py_compile guiji.py control.py config.py perception.py route.py actors.py display.py utils.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次日志中第一次避障 `total=201`、`collision_checks=88`、`planning cost=80.7ms`；第二辆慢车避障 `total=378`、`collision_checks=160`、`planning cost=118.0ms`；回归规划保持 `16` 条候选并复用 actor 投影缓存。
+- 未覆盖风险：两阶段候选减少了搜索范围，虽保留粗筛失败后的兜底扩大搜索，但仍可能和原全量枚举在极端场景下选出不同安全候选；当前只验证固定 `--free-run` 场景，1x pygame 画面中的主观卡顿仍需人工观察。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-14 - 平滑回归段起点并限制首帧转角突变
+
+- 本次目标：缓解第二次回归原道开始瞬间 LTV-MPC 偶发大幅向左打方向的问题，修复合成路线在回归段起点处可能出现的几何突变，并限制回归段刚切入时第一拍 steering 命令跳变。
+- 主要改动：`perception.py` 将 `apply_replacement_segment()` 的重叠段处理从“整段删除旧 replacement”改为“保留旧段在新段起点之前的前缀，再用新段覆盖重叠区间”；新增 replacement 前缀裁剪、点插值和基于基础路线计算前缀末端 `end_offset` 的 helper。`control.py` 新增 LTV-MPC 路线切换 steering slew 限制，只限制最终发给 CARLA 的第一拍 `delta_cmd`，若发生限幅则丢弃该次优化序列 warm-start；`guiji.py` 仅在回归段写入后启用 8 帧启动缓冲，普通避障段不额外放慢响应。
+- 为什么这样改：当回归段从已有避障段中间开始时，旧逻辑会把整段避障 replacement 删除，导致回归起点前的合成路线突然从 `offset=d` 退回基础路线 `offset=0`，参考线在车辆附近形成尖角。即使路线几何连续，回归段刚切入时参考轨迹仍可能相对上一帧发生明显变化，因此对回归段首几帧的实际转角命令增加物理式增量限制，避免 MPC 为追新参考线第一拍直接打满。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile perception.py guiji.py control.py`；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行本地小测试构造旧段 `[100, 150]` 与新段 `[120, 145]`，合并结果为 `[(100.0, 120.0, 3.0), (120.0, 145.0, 0.0)]`，确认旧偏移前缀被保留；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次第二辆慢车回归在 `18.60s` 规划，之后 `t=19/20/21/22/23` 的 steer 为 `+0.06/+0.02/+0.02/-0.03/+0.05`，未出现回归起步直接打满。
+- 未覆盖风险：本次仍出现一次 LTV-MPC 求解失败并 fallback 到 `SamplingMPCTracker`，但未导致碰撞；后续如果要彻底消除 fallback，需要继续调 LTV 目标函数或初值，而不是扩大上层规划逻辑。普通避障段仍可能在急转向场景出现较大 steer，这是当前近距离绕障和弯道路段几何共同作用，需要结合画面再判断是否过激。
+- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
