@@ -2522,7 +2522,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：MPC 权重为本次保守调参结果，仍建议在 1x pygame 演示中继续目视观察避障段/回归段是否有轻微残余偏移或转向过急；本次未改状态机、轨迹生成、避障触发和碰撞筛选逻辑。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`2585cd6`。
-- PR/分支信息：本地修改中，尚未推送。
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
 
 ### 2026-06-14 - 接入 LTV-MPC 轨迹跟踪
 
@@ -2533,4 +2533,4 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 未覆盖风险：当前 LTV 实现仍是在目标函数内滚动动力学预测，尚未拆成显式线性化 `A_k/B_k` 与 QP 求解；动力学参数是第一版保守近似值，未做系统辨识；只验证了当前固定 `--free-run` 场景，pygame 画面观感仍建议人工确认。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`9112b5c`。
-- PR/分支信息：本地提交，尚未推送。
+- PR/分支信息：已推送至 `origin/feature/decision-control`。
