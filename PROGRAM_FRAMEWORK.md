@@ -2451,5 +2451,5 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `python -m py_compile control.py guiji.py perception.py config.py utils.py route.py actors.py display.py`，语法检查通过；已运行 `git diff --check -- control.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已用 `rg` 检查 `previous_accel`、`lateral_error`、`longitudinal_error`、终端步判断和最终动作后更新逻辑；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`，普通避障在 `6.40s` 规划，回归在 `11.75s` 规划，日志中未见避障/回归阶段明显正负来回抖动。
 - 未覆盖风险：MPC 权重为本次保守调参结果，仍建议在 1x pygame 演示中继续目视观察避障段/回归段是否有轻微残余偏移或转向过急；本次未改状态机、轨迹生成、避障触发和碰撞筛选逻辑。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
+- 提交代号/Commit ID：`2585cd6`。
 - PR/分支信息：本地修改中，尚未推送。
