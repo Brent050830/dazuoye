@@ -2352,7 +2352,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 为什么这样改：慢车不是静态障碍物，如果只用触发瞬间的前车距离限制候选长度，避障轨迹容易偏短，绕行结束时慢车仍在自车前方。用目标车路线方向速度做轻量预测，可以把“前车在换道期间继续前进的距离”反映到候选长度和安全代价中；横向分离后减小制动，则避免已经绕开目标还继续大力刹车。
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile dazuoye/guiji.py dazuoye/control.py dazuoye/perception.py dazuoye/route.py dazuoye/actors.py`，语法检查通过；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe dazuoye/guiji.py --free-run`，完整 CARLA 场景跑通。第一次急停避障在 `6.20s` 触发，候选 `valid=10/12`，选择长度 `36.4m`，并在 `12.80s` 完成；第二次弯道慢车避障在 `16.10s` 触发，候选 `valid=12/12`，选择长度 `38.8m`，并在 `23.95s` 完成；避障后段日志显示制动收敛到 `0.15`，右侧目标让行和终点停车保持完成，最终 `Collisions: 0`，`Cleanup finished`。
 - 未覆盖风险：当前只是基于路线方向速度的一阶预测，不是完整时空 Lattice/动态障碍物规划；目标速度、路线投影仍来自虚拟真值感知，尚未加入传感器噪声和延迟；只做了一次固定场景 `--free-run` 验证，pygame 画面观感和不同速度组合仍需人工继续观察。
-- 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：`5d326ea`。
 - PR/分支信息：已推送到 `origin/feature/decision-control`；GitHub 连接器创建 PR 时返回 403，PR 需手动在 GitHub 创建或授权后再创建。
 
@@ -2576,13 +2576,13 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 提交代号/Commit ID：待提交。
 - PR/分支信息：本地修改中，尚未推送。
 
-### 2026-06-14 - 平滑回归段起点并限制首帧转角突变
+### 2026-06-15 - 用真实投影起点平滑回归段
 
-- 本次目标：缓解第二次回归原道开始瞬间 LTV-MPC 偶发大幅向左打方向的问题，修复合成路线在回归段起点处可能出现的几何突变，并限制回归段刚切入时第一拍 steering 命令跳变。
-- 主要改动：`perception.py` 将 `apply_replacement_segment()` 的重叠段处理从“整段删除旧 replacement”改为“保留旧段在新段起点之前的前缀，再用新段覆盖重叠区间”；新增 replacement 前缀裁剪、点插值和基于基础路线计算前缀末端 `end_offset` 的 helper。`control.py` 新增 LTV-MPC 路线切换 steering slew 限制，只限制最终发给 CARLA 的第一拍 `delta_cmd`，若发生限幅则丢弃该次优化序列 warm-start；`guiji.py` 仅在回归段写入后启用 8 帧启动缓冲，普通避障段不额外放慢响应。
-- 为什么这样改：当回归段从已有避障段中间开始时，旧逻辑会把整段避障 replacement 删除，导致回归起点前的合成路线突然从 `offset=d` 退回基础路线 `offset=0`，参考线在车辆附近形成尖角。即使路线几何连续，回归段刚切入时参考轨迹仍可能相对上一帧发生明显变化，因此对回归段首几帧的实际转角命令增加物理式增量限制，避免 MPC 为追新参考线第一拍直接打满。
-- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile perception.py guiji.py control.py`；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行本地小测试构造旧段 `[100, 150]` 与新段 `[120, 145]`，合并结果为 `[(100.0, 120.0, 3.0), (120.0, 145.0, 0.0)]`，确认旧偏移前缀被保留；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次第二辆慢车回归在 `18.60s` 规划，之后 `t=19/20/21/22/23` 的 steer 为 `+0.06/+0.02/+0.02/-0.03/+0.05`，未出现回归起步直接打满。
-- 未覆盖风险：本次仍出现一次 LTV-MPC 求解失败并 fallback 到 `SamplingMPCTracker`，但未导致碰撞；后续如果要彻底消除 fallback，需要继续调 LTV 目标函数或初值，而不是扩大上层规划逻辑。普通避障段仍可能在急转向场景出现较大 steer，这是当前近距离绕障和弯道路段几何共同作用，需要结合画面再判断是否过激。
+- 本次目标：撤销回归段首帧 steering slew 限制，定位并修复第二次回归原道开始瞬间 LTV-MPC 偶发大幅向左打方向的几何根因。
+- 主要改动：`control.py` 删除 LTV-MPC 路线切换 steering slew 限制及 `settle_steps` 状态，`RouteOffsetLaneChangeTrajectory` 支持连续 `start_route_s`，`_score_avoidance_candidate()` 和 `select_return_to_base_trajectory()` 支持从真实基础路线投影 `start_route_s/start_offset` 生成回归候选；`guiji.py` 在规划回归段前同时投影车辆到基础路线和当前合成路线，使用基础路线投影得到的真实 `s_start/d_start` 生成回归轨迹，并在日志中输出当前合成路线 `active_s/active_d` 作为诊断。
+- 为什么这样改：回归突变的根因之一是车辆当前相对于合成避障轨迹的进度与程序用 `loop_route.last_index` 推出的基础路线进度不一致，导致新回归轨迹起点与车辆当前位置、航向不连续。直接限制 steering 只能掩盖症状；用车辆真实投影作为回归段起点，可以让回归候选从车实际所在的基础路线 s 和横向 d 开始。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py perception.py`；已运行 `git diff --check`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次第二辆慢车回归在 `16.65s` 规划，日志显示 `s=140.9-177.3, start_offset=3.26m, active_s=139.3, active_d=0.32`，之后 `t=17/18/19/20/21` 的 steer 为 `+0.09/+0.02/+0.20/+0.06/+0.02`，未出现回归起步直接打满。
+- 未覆盖风险：后续路段仍可能因弯道或普通跟踪出现较大 steering，例如本次 `t=22` 出现 `+0.45`，但它发生在回归切入数秒后，不是回归段写入第一拍；若要继续优化，应单独分析弯道跟踪或 LTV/fallback 行为。
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
-- PR/分支信息：本地修改中，尚未推送。
+- 提交代号/Commit ID：本次直接提交，提交号见 `git log`。
+- PR/分支信息：直接推送至 `origin/main`。

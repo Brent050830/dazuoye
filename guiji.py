@@ -179,22 +179,36 @@ def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_
     return best_candidate, candidates
 
 
-def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time):
+def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, tracking_route=None):
     """生成从当前偏移回到基础路线的候选段。"""
     start_time = time.perf_counter()
+    base_projection = project_actor_to_base_route(loop_route, ego_vehicle)
+    active_route_s = None
+    active_lateral = None
+    if tracking_route is not None and tracking_route.is_valid:
+        active_route_s, active_lateral = tracking_route.to_local(ego_vehicle.get_location())
     best_candidate, candidates, diagnostics = select_return_to_base_trajectory(
-        loop_route, ego_vehicle, LANE_CHANGE_LENGTH, obstacle_actors=obstacle_actors
+        loop_route,
+        ego_vehicle,
+        LANE_CHANGE_LENGTH,
+        obstacle_actors=obstacle_actors,
+        start_route_s=base_projection["route_s"],
+        start_offset=base_projection["lateral"],
+        active_route_s=active_route_s,
+        active_lateral=active_lateral,
     )
     diagnostics["elapsed_ms"] = (time.perf_counter() - start_time) * 1000.0
     print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=False)
     print_planning_diagnostics("return", diagnostics)
     if best_candidate is not None:
         print(
-            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, length={:.1f}m, transition_ratio={:.2f}.".format(
+            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, active_s={}, active_d={}, length={:.1f}m, transition_ratio={:.2f}.".format(
                 sim_time,
                 best_candidate.start_route_s,
                 best_candidate.end_route_s,
                 best_candidate.start_offset,
+                "{:.1f}".format(active_route_s) if active_route_s is not None else "n/a",
+                "{:.2f}".format(active_lateral) if active_lateral is not None else "n/a",
                 best_candidate.length,
                 best_candidate.transition_ratio,
             )
@@ -353,10 +367,10 @@ def apply_route_replacement(sensor, candidate):
     return trajectory
 
 
-def reset_mpc_plan_after_route_change(mpc, settle_steps=0):
+def reset_mpc_plan_after_route_change(mpc):
     reset_plan = getattr(mpc, "reset_plan", None)
     if callable(reset_plan):
-        reset_plan(settle_steps=settle_steps)
+        reset_plan()
 
 
 def make_avoidance_target(front, obstacle_actors, target_offset):
@@ -710,11 +724,11 @@ def main(args=None):
                     active_avoidance_target.get("actor_id"),
                 )
                 best_candidate, avoidance_candidates = plan_return_to_base(
-                    loop_route, ego_vehicle, obstacle_actors, sim_time
+                    loop_route, ego_vehicle, obstacle_actors, sim_time, tracking_route=sensor.tracking_route()
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成返回基础路线的替换路径段，则应用该路径段作为新的跟踪路线，同时清除当前的避让目标，更新 MPC 跟踪的截止点，并打印相关日志；如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
-                    reset_mpc_plan_after_route_change(mpc, settle_steps=8)
+                    reset_mpc_plan_after_route_change(mpc)
                     mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
                         "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(

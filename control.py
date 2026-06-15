@@ -34,7 +34,6 @@ LTV_MPC_SOLVE_TIMEOUT_SECONDS = 0.80
 LTV_MPC_STEER_LIMIT = 0.45
 LTV_MPC_ACCEL_MIN = 0.0
 LTV_MPC_ACCEL_MAX = 1.0
-LTV_MPC_ROUTE_CHANGE_DELTA_LIMIT_RAD = math.radians(3.0)
 
 
 # ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
@@ -86,18 +85,23 @@ class RouteOffsetLaneChangeTrajectory:
         start_offset=0.0,
         end_offset=None,
         transition_ratio=1.0,
+        start_route_s=None,
     ):
         self.loop_route = loop_route
-        self.start_index = max(0, min(start_index, len(loop_route.points) - 1))
+        self.step_distance = loop_route.step_distance
+        self.route_reference = smooth_reference_for(loop_route)
+        if start_route_s is None:
+            self.start_index = max(0, min(start_index, len(loop_route.points) - 1))
+            self.start_route_s = self.start_index * self.step_distance
+        else:
+            self.start_route_s = clamp(float(start_route_s), 0.0, self.route_reference.max_s)
+            self.start_index = max(0, min(int(round(self.start_route_s / self.step_distance)), len(loop_route.points) - 1))
         self.start_offset = start_offset
         self.lateral_offset = lateral_offset # 目标侧向偏移；本段内只从起点平滑过渡到该偏移，不再回收到基础路线
         self.end_offset = end_offset if end_offset is not None else lateral_offset
         self.length = length
         self.transition_ratio = clamp(transition_ratio, 0.05, 1.0)
         self.transition_length = max(0.001, self.length * self.transition_ratio)
-        self.step_distance = loop_route.step_distance
-        self.route_reference = smooth_reference_for(loop_route) # 获取全局路径的平滑参考线对象，提供在全局路径上计算坐标和右向量的方法
-        self.start_route_s = self.start_index * self.step_distance # 换道起点在全局路径上的纵向位置，基于起始索引和步距计算得到，表示换道开始时在全局路径上的位置，供后续计算使用
         self.end_route_s = self.start_route_s + self.length # 换道终点在全局路径上的纵向位置，基于起点位置和换道长度计算得到，表示换道结束时在全局路径上的位置，供后续计算使用
         self.is_route_relative = True
 
@@ -303,15 +307,35 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
     return _select_preferred_avoidance_candidate(valid_candidates), candidates, diagnostics
 
 
-def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obstacle_actors=None):
+def select_return_to_base_trajectory(
+    loop_route,
+    ego_vehicle,
+    base_length,
+    obstacle_actors=None,
+    start_route_s=None,
+    start_offset=None,
+    active_route_s=None,
+    active_lateral=None,
+):
     """生成从当前横向偏移回到基础路线的候选段，安全后才允许采用。"""
     route_index = loop_route.last_index
     start_transform = ego_vehicle.get_transform()
     route_reference = smooth_reference_for(loop_route)
-    route_location = route_reference.location_at_route_s(route_index * loop_route.step_distance)
-    route_right = smoothed_route_right_at(loop_route, route_index)
-    start_offset = dot_2d(start_transform.location - route_location, route_right)
+    if start_route_s is None or start_offset is None:
+        route_location = route_reference.location_at_route_s(route_index * loop_route.step_distance)
+        route_right = smoothed_route_right_at(loop_route, route_index)
+        start_route_s = route_index * loop_route.step_distance
+        start_offset = dot_2d(start_transform.location - route_location, route_right)
+    else:
+        start_route_s = route_reference.clamp_s(start_route_s)
+        route_index = max(0, min(int(round(start_route_s / loop_route.step_distance)), len(loop_route.points) - 1))
     diagnostics = _new_planning_diagnostics("return")
+    diagnostics["start_route_s"] = start_route_s
+    diagnostics["start_offset"] = start_offset
+    if active_route_s is not None:
+        diagnostics["active_route_s"] = active_route_s
+    if active_lateral is not None:
+        diagnostics["active_lateral"] = active_lateral
     if abs(start_offset) < 0.20:
         diagnostics["total_candidates"] = 0
         diagnostics["valid_candidates"] = 0
@@ -322,7 +346,7 @@ def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obsta
     length_values = _candidate_lengths(base_length)
     actor_projections = _build_actor_projection_cache(
         route_reference,
-        route_index * loop_route.step_distance,
+        start_route_s,
         max(length_values) + 2.0 if length_values else base_length + 2.0,
         obstacle_actors or [],
         ego_vehicle,
@@ -349,6 +373,7 @@ def select_return_to_base_trajectory(loop_route, ego_vehicle, base_length, obsta
                     ego_vehicle,
                     None,
                     diagnostics,
+                    start_route_s=start_route_s,
                 )
             )
 
@@ -544,6 +569,7 @@ def _score_avoidance_candidate(
     ego_vehicle,
     front_actor_id,
     diagnostics=None,
+    start_route_s=None,
 ):
     lateral_shift = target_offset - start_offset
     transition_ratio = clamp(transition_ratio, 0.05, 1.0)
@@ -552,7 +578,8 @@ def _score_avoidance_candidate(
     lateral_accel = 10.0 * math.sqrt(3.0) * abs(lateral_shift) / (3.0 * max(maneuver_time * maneuver_time, 0.01))
     max_lateral_accel = 3.8
     reject_reason = ""
-    start_route_s = route_index * loop_route.step_distance
+    if start_route_s is None:
+        start_route_s = route_index * loop_route.step_distance
     end_route_s = start_route_s + length
     trajectory = None
 
@@ -583,6 +610,7 @@ def _score_avoidance_candidate(
             start_offset,
             end_offset=target_offset,
             transition_ratio=transition_ratio,
+            start_route_s=start_route_s,
         )
         if diagnostics is not None:
             diagnostics["collision_checks"] = diagnostics.get("collision_checks", 0) + 1
@@ -958,15 +986,13 @@ class LTVMPCTracker:
         self.previous_accel = 0.0
         self.previous_delta = 0.0
         self.previous_solution = None
-        self._route_change_slew_steps = 0
         self._warned_fallback = False
 
-    def reset_plan(self, settle_steps=0):
+    def reset_plan(self):
         """Clear warm-start state after the tracked replacement segment changes."""
         self.previous_solution = None
         self.previous_accel = 0.0
         self.fallback_tracker.previous_accel = 0.0
-        self._route_change_slew_steps = max(self._route_change_slew_steps, int(settle_steps))
 
     def control(self, ego_vehicle, trajectory, target_speed):
         if scipy_minimize is None:
@@ -1005,29 +1031,25 @@ class LTVMPCTracker:
         if result.x is None or len(result.x) < 2:
             return self._fallback(ego_vehicle, trajectory, target_speed, "empty solution")
 
-        raw_delta_cmd = float(result.x[0])
+        delta_cmd = float(result.x[0])
         accel = float(result.x[1])
-        if not (math.isfinite(raw_delta_cmd) and math.isfinite(accel)):
+        if not (math.isfinite(delta_cmd) and math.isfinite(accel)):
             return self._fallback(ego_vehicle, trajectory, target_speed, "non-finite solution")
 
-        raw_delta_cmd = clamp(
-            raw_delta_cmd, -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD, LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD
-        )
-        delta_cmd = self._limit_route_change_delta_cmd(raw_delta_cmd)
+        delta_cmd = clamp(delta_cmd, -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD, LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD)
         accel = clamp(accel, LTV_MPC_ACCEL_MIN, LTV_MPC_ACCEL_MAX)
         steer = clamp(delta_cmd / MPC_DELTA_MAX_RAD, -1.0, 1.0)
 
         if self._solution_unstable(initial_state, trajectory, target_speed, result.x):
             return self._fallback(ego_vehicle, trajectory, target_speed, "unstable solution")
 
-        self.previous_solution = None if abs(delta_cmd - raw_delta_cmd) > 1e-6 else list(result.x)
+        self.previous_solution = list(result.x)
         self.previous_delta_cmd = delta_cmd
         self.previous_accel = accel
         self.previous_delta = self._advance_delta(self.previous_delta, delta_cmd)
         self.fallback_tracker.previous_steer = steer
         self.fallback_tracker.previous_accel = accel
         self.fallback_tracker.previous_delta = self.previous_delta
-        self._consume_route_change_slew_step()
 
         throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
         brake = 0.0
@@ -1177,37 +1199,15 @@ class LTVMPCTracker:
     def _solution_unstable(self, initial_state, trajectory, target_speed, controls):
         return self._objective(controls, initial_state, trajectory, target_speed) >= 1e8
 
-    def _limit_route_change_delta_cmd(self, delta_cmd):
-        if self._route_change_slew_steps <= 0:
-            return delta_cmd
-        return clamp(
-            delta_cmd,
-            self.previous_delta_cmd - LTV_MPC_ROUTE_CHANGE_DELTA_LIMIT_RAD,
-            self.previous_delta_cmd + LTV_MPC_ROUTE_CHANGE_DELTA_LIMIT_RAD,
-        )
-
-    def _limit_route_change_steer(self, steer):
-        if self._route_change_slew_steps <= 0:
-            return steer
-        current_delta = clamp(steer, -1.0, 1.0) * MPC_DELTA_MAX_RAD
-        limited_delta = self._limit_route_change_delta_cmd(current_delta)
-        return clamp(limited_delta / MPC_DELTA_MAX_RAD, -1.0, 1.0)
-
-    def _consume_route_change_slew_step(self):
-        if self._route_change_slew_steps > 0:
-            self._route_change_slew_steps -= 1
-
     def _fallback(self, ego_vehicle, trajectory, target_speed, reason):
         if not self._warned_fallback:
             print("LTV-MPC fallback to SamplingMPCTracker: {}".format(reason))
             self._warned_fallback = True
         control = self.fallback_tracker.control(ego_vehicle, trajectory, target_speed)
-        control.steer = self._limit_route_change_steer(control.steer)
         self.previous_delta_cmd = clamp(control.steer, -1.0, 1.0) * MPC_DELTA_MAX_RAD
         self.previous_accel = LTV_MPC_ACCEL_MIN
         self.previous_delta = getattr(self.fallback_tracker, "previous_delta", self.previous_delta)
         self.previous_solution = None
         self.fallback_tracker.previous_accel = 0.0
         control.brake = 0.0
-        self._consume_route_change_slew_step()
         return control
