@@ -1398,7 +1398,7 @@ $$
 
 为了减少规划时卡顿，当前普通避障不再一开始就完整枚举所有 $(L,d_t,\rho)$ 组合。`select_best_route_offset_trajectory()` 使用两阶段候选：粗筛阶段取稀疏长度、偏移和过渡比例子集，快速判断安全方向和大致偏移范围；若粗筛已有有效候选，加密阶段只围绕低代价有效候选附近的长度/偏移区域使用完整过渡比例局部加密；若粗筛没有有效候选，兜底阶段扩大到“粗长度 + 全偏移”和“全长度 + 粗偏移”的组合，避免直接回到全量 800+ 候选。
 
-对进入评分的每组 $(L,d_t,\rho)$，构造或近似评估一条 `RouteOffsetLaneChangeTrajectory`，段尾保持目标偏移。因此当前避障入口处理的是候选 replacement segment 集合：
+对进入评分的每组 $(L,d_t,\rho)$，`control.py` 通过 `_build_and_evaluate_route_offset_candidate()` 统一完成长度/横向加速度硬约束、`RouteOffsetLaneChangeTrajectory` 构造、前车便宜预筛、所有车辆采样冲突硬筛和代价计算，段尾保持目标偏移。因此当前避障入口处理的是候选 replacement segment 集合：
 
 $$
 \mathcal{T}
@@ -2586,3 +2586,36 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 需要 reviewer 重点看的文件：`dazuoye/perception.py`、`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：本次直接提交，提交号见 `git log`。
 - PR/分支信息：直接推送至 `origin/main`。
+
+### 2026-06-15 - 收敛避障候选轨迹评估入口
+
+- 本次目标：精简 `control.py` 中普通避障/回归候选轨迹的生成、硬约束和代价计算流程，避免读代码时误以为仍保留多套旧路径生成逻辑。
+- 主要改动：将单条候选的前车便宜预筛、`RouteOffsetLaneChangeTrajectory` 构造、所有车辆采样冲突硬筛、安全/舒适/跟踪/偏移代价计算统一收敛到 `_build_and_evaluate_route_offset_candidate()`；删除已被吸收的 `_score_avoidance_candidate()`、`_safety_cost()`、`_front_clearance_prefilter_reason()`、`_candidate_offset_at()`、`_candidate_collision_reason()` 和 `_tracking_cost()`；保留粗筛、局部加密和兜底搜索的外层枚举策略；清理候选长度/偏移 helper 中的冗长解释性注释。
+- 为什么这样改：此前轨迹构造、硬拒绝和代价计算分散在多个 helper 中，虽然行为只有一套，但阅读上像有多套旧逻辑并存。把“单条候选如何从参数变成可选/不可选结果”集中到一个函数后，外层选择器只负责枚举候选参数和选择最优候选，职责边界更清楚。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py perception.py`，语法检查通过；已用 `rg` 检查旧 helper 名称不再被引用；尚未启动 CARLA 实景回归。
+- 未覆盖风险：本次是结构等价重构，未改变候选参数、碰撞阈值、状态机和 MPC；但尚未运行 `--free-run`，如后续推送前建议再跑一次固定场景确认避障/回归日志与画面正常。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-16 - 让新 replacement 段起点切线连续
+
+- 本次目标：解决从回归段或偏移保持段再次切入普通避障段时，虽然起点 `s/d` 已连续，但新轨迹默认 `d'(0)=0` 导致参考航向突变、MPC 偶发瞬间大转角的问题。
+- 主要改动：`RouteOffsetLaneChangeTrajectory` 新增 `start_lateral_slope`，五次横向偏移从固定零起点斜率改为满足 `d(0)=d0`、`d'(0)=start_lateral_slope`、`d''(0)=0`、`d(L)=dt`、`d'(L)=0`、`d''(L)=0`；普通避障和回归规划都从当前合成 `tracking_route` 的参考航向与基础路线参考航向差计算起点横向斜率，并传入所有候选；规划日志增加 `start_slope`。
+- 为什么这样改：上一轮只修复了 replacement 起点位置连续，仍可能在回归段中途重新规划时把新段起点方向强行拉回基础路线方向。传入当前合成路线的起点切线后，新 replacement 段在位置和航向上都更接近当前车辆正在跟踪的路线，减少参考线切换造成的瞬时转向。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py perception.py`；已运行 `git diff --check -- control.py guiji.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。本次从第一段回归中再次规划避障发生在 `12.05s`，日志显示 `start_slope=-0.212`，后续 `t=13/14/15/16` 的 steer 为 `+0.19/-0.04/+0.12/+0.08`，未出现新段切入第一拍直接打满。
+- 未覆盖风险：本次终端日志显示第二次回归附近有一次 `LTV-MPC fallback to SamplingMPCTracker: solver failed`，但未导致碰撞或停车；是否仍存在肉眼可见的轻微转向顿挫，需要在 pygame/CARLA 画面中继续观察。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-16 - 统一普通避障段真实投影起点
+
+- 本次目标：修复从回归/偏移保持状态再次进入普通避障时，新避障 replacement 段起点可能与车辆当前位置不连续，导致 LTV-MPC 首帧转角突变的问题。
+- 主要改动：`control.py` 的 `select_best_route_offset_trajectory()` 不再直接用 `loop_route.last_index * step_distance` 作为普通避障段起点，而是将车辆当前位置投影到基础路线得到真实 `start_route_s/start_offset`；普通避障的 actor 投影缓存和所有候选 `RouteOffsetLaneChangeTrajectory` 均使用该 `start_route_s`；`_append_scored_candidates()` 增加 `start_route_s` 透传参数。
+- 为什么这样改：回归段此前已经改为真实基础路线投影起点，但普通避障段仍可能使用离散路线索引近似起点。车辆处在 `_tracking_route` 的回归段或保持 offset 阶段时，该近似起点可能和车辆真实基础路线投影不一致，导致新合成 `_tracking_route` 在切入新避障段时出现参考线跳变。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py perception.py`；已运行 `git diff --check -- control.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；尚未启动 CARLA 实景回归。
+- 未覆盖风险：本次未运行 `--free-run`，仍需在第二次避障/回归连续切换场景中观察转角是否平滑；当前工作区还有其他未提交改动和历史 `__pycache__` 脏文件，本记录只描述本次普通避障起点修复。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。

@@ -61,7 +61,7 @@ from control import select_best_route_offset_trajectory, select_return_to_base_t
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
-from utils import get_speed, smooth_reference_for, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
+from utils import clamp, get_speed, normalize_angle, smooth_reference_for, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
 
 RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0
 PLAN_RETRY_LOG_INTERVAL = 1.0
@@ -150,14 +150,37 @@ def set_spectator(world, ego_vehicle):
     )
 
 
-def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_time):
+def tracking_route_lateral_slope(loop_route, ego_vehicle, tracking_route, base_route_s):
+    if tracking_route is None or not tracking_route.is_valid:
+        return 0.0
+    try:
+        active_route_s, _ = tracking_route.to_local(ego_vehicle.get_location())
+        active_yaw = tracking_route.reference_yaw_at(active_route_s)
+        base_yaw = smooth_reference_for(loop_route).yaw_at_route_s(base_route_s)
+        return clamp(math.tan(normalize_angle(active_yaw - base_yaw)), -0.60, 0.60)
+    except Exception:
+        return 0.0
+
+
+def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=None):
     """生成一个可替换当前基础路线 s 区间的避障路径段。"""
     target_speed = 0.0 if front.actor_role == "lead" else max(0.0, getattr(front, "target_speed_along", 0.0))
     predicted_motion = target_speed * min(3.0, max(1.0, front.distance / max(front.closing_speed, 0.1)))
     base_length = max(14.0, min(52.0, LANE_CHANGE_LENGTH + predicted_motion))
+    base_projection = project_actor_to_base_route(loop_route, ego_vehicle)
+    start_lateral_slope = tracking_route_lateral_slope(
+        loop_route, ego_vehicle, tracking_route, base_projection["route_s"]
+    )
     start_time = time.perf_counter()
     best_candidate, candidates, diagnostics = select_best_route_offset_trajectory(
-        loop_route, ego_vehicle, front, base_length, obstacle_actors=obstacle_actors
+        loop_route,
+        ego_vehicle,
+        front,
+        base_length,
+        obstacle_actors=obstacle_actors,
+        start_route_s=base_projection["route_s"],
+        start_offset=base_projection["lateral"],
+        start_lateral_slope=start_lateral_slope,
     )
     diagnostics["elapsed_ms"] = (time.perf_counter() - start_time) * 1000.0
     print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=True) # 打印候选路径数量、筛选结果和最终选中的关键参数，便于分析避障轨迹的生成和选择过程
@@ -165,11 +188,12 @@ def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_
     selected_trajectory = best_candidate.trajectory if best_candidate is not None else None
     if selected_trajectory is not None:
         print(
-            "Route replacement planned at {:.2f}s: s={:.1f}-{:.1f}, peak_offset={:.2f}m, transition_ratio={:.2f}, target={}, distance={:.1f}m, TTC={:.2f}s".format(
+            "Route replacement planned at {:.2f}s: s={:.1f}-{:.1f}, peak_offset={:.2f}m, start_slope={:.3f}, transition_ratio={:.2f}, target={}, distance={:.1f}m, TTC={:.2f}s".format(
                 sim_time,
                 best_candidate.start_route_s,
                 best_candidate.end_route_s,
                 best_candidate.target_offset,
+                best_candidate.start_lateral_slope,
                 best_candidate.transition_ratio,
                 right_object_label(front),
                 front.distance,
@@ -187,6 +211,9 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
     active_lateral = None
     if tracking_route is not None and tracking_route.is_valid:
         active_route_s, active_lateral = tracking_route.to_local(ego_vehicle.get_location())
+    start_lateral_slope = tracking_route_lateral_slope(
+        loop_route, ego_vehicle, tracking_route, base_projection["route_s"]
+    )
     best_candidate, candidates, diagnostics = select_return_to_base_trajectory(
         loop_route,
         ego_vehicle,
@@ -194,6 +221,7 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
         obstacle_actors=obstacle_actors,
         start_route_s=base_projection["route_s"],
         start_offset=base_projection["lateral"],
+        start_lateral_slope=start_lateral_slope,
         active_route_s=active_route_s,
         active_lateral=active_lateral,
     )
@@ -202,11 +230,12 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
     print_planning_diagnostics("return", diagnostics)
     if best_candidate is not None:
         print(
-            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, active_s={}, active_d={}, length={:.1f}m, transition_ratio={:.2f}.".format(
+            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, start_slope={:.3f}, active_s={}, active_d={}, length={:.1f}m, transition_ratio={:.2f}.".format(
                 sim_time,
                 best_candidate.start_route_s,
                 best_candidate.end_route_s,
                 best_candidate.start_offset,
+                best_candidate.start_lateral_slope,
                 "{:.1f}".format(active_route_s) if active_route_s is not None else "n/a",
                 "{:.2f}".format(active_lateral) if active_lateral is not None else "n/a",
                 best_candidate.length,
@@ -355,13 +384,14 @@ def front_emergency_brake_needed(front_decision):
 
 
 def apply_route_replacement(sensor, candidate):
+    """将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。"""
     if candidate is None or candidate.trajectory is None:
         return None
     trajectory = candidate.trajectory
-    sensor.apply_replacement_segment(
-        candidate.start_route_s,
-        candidate.end_route_s,
-        trajectory.replacement_points(DEBUG_DRAW_TRAJECTORY_STEP),
+    sensor.apply_replacement_segment( # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        candidate.start_route_s, # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        candidate.end_route_s, # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        trajectory.replacement_points(DEBUG_DRAW_TRAJECTORY_STEP), # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
         end_offset=candidate.target_offset,
     )
     return trajectory
@@ -693,7 +723,7 @@ def main(args=None):
                     )
                 elif planning_needed: # 如果仍然需要规划避障，则尝试生成替换路线，如果成功生成则切换回正常跟随状态并应用替换路线，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
                     best_candidate, avoidance_candidates = plan_route_replacement(
-                        loop_route, ego_vehicle, front, obstacle_actors, sim_time
+                        loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=sensor.tracking_route()
                     )
                     selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                     if selected_plan_trajectory is not None:
@@ -751,7 +781,7 @@ def main(args=None):
 
             if state == "ROUTE_FOLLOW" and planning_needed and not route_changed_this_frame: # 如果当前状态是正常跟随，并且需要进行前车避障规划，并且当前帧还没有进行路线切换，则尝试生成替换路线，如果成功生成则应用替换路线并更新相关状态和日志，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
                 best_candidate, avoidance_candidates = plan_route_replacement(
-                    loop_route, ego_vehicle, front, obstacle_actors, sim_time
+                    loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=sensor.tracking_route()
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成替换路线，则应用替换路线并更新相关状态和日志；否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息

@@ -142,10 +142,11 @@ class TrackingRoute:
 
     @classmethod
     def from_loop_route(cls, loop_route):
+        """ 基于 CARLA 的 LoopRoute 构建跟踪路线，提取其路径点并生成平滑参考；如果输入的 loop_route 无效，则返回 None。通过从 LoopRoute 中提取路径点，并生成一个平滑的参考，可以为前车投影筛选提供一个更准确和连续的路径参考，从而提高前车检测的稳定性和准确性。如果输入的 loop_route 无效，则返回 None，表示无法构建有效的跟踪路线。"""
         if loop_route is None:
             return None
         step = max(loop_route.step_distance, 0.001)
-        return cls(
+        return cls( # 基于 CARLA 的 LoopRoute 构建跟踪路线，提取其路径点并生成平滑参考；如果输入的 loop_route 无效，则返回 None。通过从 LoopRoute 中提取路径点，并生成一个平滑的参考，可以为前车投影筛选提供一个更准确和连续的路径参考，从而提高前车检测的稳定性和准确性。如果输入的 loop_route 无效，则返回 None，表示无法构建有效的跟踪路线。
             loop_route.points,
             reference=smooth_reference_for(loop_route),
             loop_route=loop_route,
@@ -204,7 +205,7 @@ def _compose_tracking_points(base_route, segments):
     cursor = 0.0
     current_offset = 0.0
 
-    for segment in sorted_segments:
+    for segment in sorted_segments: # 根据替换区间列表和基础路线，生成最终的跟踪路线点列表。通过遍历替换区间列表，并将每个替换区间内的路径点插入到基础路线的对应位置，可以生成一个包含所有替换区间的最终跟踪路线点列表。最后返回这个点列表，供后续构建跟踪路线对象使用。
         start_s = max(0.0, min(segment.start_s, max_s))
         end_s = max(start_s, min(segment.end_s, max_s))
         _append_base_samples(points, base_route, cursor, start_s, step, current_offset)
