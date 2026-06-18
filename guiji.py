@@ -406,10 +406,27 @@ def apply_route_replacement(sensor, candidate):
     return trajectory
 
 
-def reset_mpc_plan_after_route_change(mpc):
+def reset_mpc_plan_after_route_change(mpc, last_steer=None, sim_time=None):
     reset_plan = getattr(mpc, "reset_plan", None)
     if callable(reset_plan):
-        reset_plan()
+        reset_plan(last_steer=last_steer)
+        reset_debug = getattr(mpc, "last_reset_debug", None)
+        if reset_debug:
+            prefix = "MPC soft reset"
+            if sim_time is not None:
+                prefix += " at {:.2f}s".format(sim_time)
+            print(
+                "{}: source={}, last_steer={}, delta_init={}rad, steer_init={}, kept_steps={}, guess_uses={}, hold_frames={}.".format(
+                    prefix,
+                    reset_debug.get("source"),
+                    _format_float(last_steer),
+                    _format_float(reset_debug.get("delta_init"), 3),
+                    _format_float(reset_debug.get("steer_init")),
+                    reset_debug.get("kept_solution_steps"),
+                    reset_debug.get("guess_uses"),
+                    reset_debug.get("hold_frames"),
+                )
+            )
 
 
 def make_avoidance_target(front, obstacle_actors, target_offset):
@@ -934,7 +951,7 @@ def main(args=None):
                     )
                     selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                     if selected_plan_trajectory is not None:
-                        reset_mpc_plan_after_route_change(mpc)
+                        reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                         active_avoidance_target = make_avoidance_target(
                             front, obstacle_actors, best_candidate.target_offset
                         )
@@ -965,7 +982,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成返回基础路线的替换路径段，则应用该路径段作为新的跟踪路线，同时清除当前的避让目标，更新 MPC 跟踪的截止点，并打印相关日志；如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
-                    reset_mpc_plan_after_route_change(mpc)
+                    reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                     mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
                         "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(
@@ -992,7 +1009,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成替换路线，则应用替换路线并更新相关状态和日志；否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
-                    reset_mpc_plan_after_route_change(mpc)
+                    reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                     active_avoidance_target = make_avoidance_target(
                         front, obstacle_actors, best_candidate.target_offset
                     )

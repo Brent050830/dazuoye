@@ -169,7 +169,7 @@ dazuoye/display.py
 - 虚拟真值感知，并可选叠加噪声、FOV、漏检和前向毫米波雷达点云聚类。
 - TTC 计算。
 - 基于 `LoopRoute` 真实路线叠加避障起点局部右向五次横向增量的多候选避障轨迹。
-- LTV-MPC 只在避障 replacement、保持偏移或回归段活跃时跟踪合成路线；纯基础路线巡航使用 `LoopRoute.steer()` 前视控制，LTV 求解失败时退回采样式动力学 MPC；MPC 退出到普通前视控制时，`guiji.py` 会执行一个短时 MPC 辅助 steering 过渡，避免首帧控制器接管突跳。
+- LTV-MPC 只在避障 replacement、保持偏移或回归段活跃时跟踪合成路线；纯基础路线巡航使用 `LoopRoute.steer()` 前视控制，LTV 求解失败时退回采样式动力学 MPC；MPC 退出到普通前视控制时，`guiji.py` 会执行一个短时 MPC 辅助 steering 过渡，避免首帧控制器接管突跳；新的 replacement 写入后，LTV-MPC 使用上一帧 `last_steer` 做 soft reset 和 warm-start，降低路线切换首帧的 cold-start 大转角。
 - Town10 固定起点。
 - Town10 固定短路线。
 - 路线进度与一圈完成判断。
@@ -178,7 +178,7 @@ dazuoye/display.py
 - `R344 -> R20` 右转处右侧关键非机动车直行目标。
 - 3 辆 R344 右侧背景自行车，速度各异。
 - 前方车辆和右侧非机动车虚拟感知支持关键目标与背景目标共同参与风险判断。
-- `ROUTE_FOLLOW` 内联右侧目标减速/硬刹让行。
+- `ROUTE_FOLLOW` 内联右侧目标 `pass/brake` 决策，右侧目标风险只在无法确认自车先通过时硬刹。
 - 路线完成后的停车保持控制。
 - pygame 摄像头显示。
 - 碰撞监测。
@@ -1748,7 +1748,7 @@ SmoothRouteReference 平滑路线 + 连续道路右方向五次横向增量
 
 ### 11.4 MPC 跟踪公式
 
-当前主流程使用 `LTVMPCTracker` 跟踪避障 replacement、保持 offset 和回归段；纯基础路线巡航仍使用 `LoopRoute.steer()` 前视控制。MPC 退出时如果普通前视 steer 与上一帧 MPC steer 差异较大，主循环会在约 `0.25s` 内用 MPC 辅助 steer 与普通前视 steer 做短时过渡；该过渡只影响最终 steering，不改变路径规划、速度目标或安全制动优先级。`SamplingMPCTracker` 保留为 fallback：当 `scipy` 不可用、LTV 求解失败、超时或预测状态不稳定时，仍可用同一 `control(self, ego_vehicle, trajectory, target_speed)` 接口输出 CARLA 控制量。
+当前主流程使用 `LTVMPCTracker` 跟踪避障 replacement、保持 offset 和回归段；纯基础路线巡航仍使用 `LoopRoute.steer()` 前视控制。MPC 退出时如果普通前视 steer 与上一帧 MPC steer 差异较大，主循环会在约 `0.25s` 内用 MPC 辅助 steer 与普通前视 steer 做短时过渡；该过渡只影响最终 steering，不改变路径规划、速度目标或安全制动优先级。新的避障或回归 replacement 写入后，`guiji.py` 会把上一帧实际发送给 CARLA 的 `last_steer` 传给 `LTVMPCTracker.reset_plan()`；控制器将其转换为 `previous_delta_cmd/previous_delta`，同步 warm-start 采样式 fallback，并构造一个最多使用 2 次的 soft initial guess。旧 `previous_solution` 只在与 `last_steer` 对应转角差小于约 `8deg` 时保留少量未来步，避免把上一条路线的解硬带到新路线。路线切换后的第 1 帧保持 `last_steer` 输出，让下一帧 LTV 求解从连续转角附近开始。`SamplingMPCTracker` 保留为 fallback：当 `scipy` 不可用、LTV 求解失败、超时或预测状态不稳定时，仍可用同一 `control(self, ego_vehicle, trajectory, target_speed)` 接口输出 CARLA 控制量。
 
 预测步长：
 
@@ -2801,5 +2801,16 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py perception.py`；已运行 `git diff --check -- control.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；尚未启动 CARLA 实景回归。
 - 未覆盖风险：本次未运行 `--free-run`，仍需在第二次避障/回归连续切换场景中观察转角是否平滑；当前工作区还有其他未提交改动和历史 `__pycache__` 脏文件，本记录只描述本次普通避障起点修复。
 - 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
+- 提交代号/Commit ID：待提交。
+- PR/分支信息：本地修改中，尚未推送。
+
+### 2026-06-18 - LTV-MPC 路线切换 soft reset
+
+- 本次目标：解决新的避障/回归 replacement 写入后，LTV-MPC 完全 cold-start 或沿用不合适旧解导致路线切换首帧 steering 突跳的问题。
+- 主要改动：`control.py` 的 `LTVMPCTracker.reset_plan()` 支持接收上一帧实际控制 `last_steer`，并将其转换为内部 `previous_delta_cmd/previous_delta`；同步 warm-start fallback 控制器；构造最多使用 2 次的 soft initial guess；仅当旧 `previous_solution` 与 `last_steer` 对应转角差小于约 `8deg` 时保留少量未来步；路线切换后的第 1 帧保持 `last_steer` 输出，再交给下一帧 LTV 求解。`guiji.py` 在每次 replacement 写入后传入 `last_control_steer`，并打印 `source/delta_init/kept_steps/guess_uses/hold_frames` 诊断信息。
+- 为什么这样改：只保留初始猜测时，实测第二次回归 route-change 仍可能在第一帧求解到 `steer=+0.45`，说明求解器在新路线边界仍会选择激进初值。用 `last_steer` 作为真实执行转角起点，并只保留 1 帧连续输出，可以处理切换边界，同时不把旧路线的整段控制序列强行重映射到新路线。
+- 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile control.py guiji.py config.py perception.py route.py`，语法检查通过；已运行 `git diff --check -- control.py guiji.py PROGRAM_FRAMEWORK.md`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。对比日志中路线切换帧：此前 `14.95s route-change` 曾出现 `steer=+0.45`、`steer_delta=+0.34`；本次 soft reset 后 `14.90s route-change` 为 `steer=+0.15`、`steer_delta=+0.00`，其它 replacement 写入帧也保持 `steer_delta=+0.00`。
+- 未覆盖风险：本次只处理 replacement 写入时的 LTV-MPC warm-start；日志仍显示普通 `LoopRoute.steer()` 在 MPC 退出后、弯道或右侧目标急刹恢复后可能出现普通前视控制的 `steer-jump`，那是独立问题，不在本次改动范围内。第 1 帧保持 `last_steer` 在极少数非常急的新路线下可能稍微延迟响应，当前固定 `--free-run` 场景未出现碰撞或路线失控。
+- 需要 reviewer 重点看的文件：`dazuoye/control.py`、`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
 - 提交代号/Commit ID：待提交。
 - PR/分支信息：本地修改中，尚未推送。

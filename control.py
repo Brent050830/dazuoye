@@ -34,6 +34,10 @@ LTV_MPC_SOLVE_TIMEOUT_SECONDS = 0.80
 LTV_MPC_STEER_LIMIT = 0.45
 LTV_MPC_ACCEL_MIN = 0.0
 LTV_MPC_ACCEL_MAX = 1.0
+LTV_MPC_SOFT_RESET_KEEP_STEPS = 2
+LTV_MPC_SOFT_RESET_USES = 2
+LTV_MPC_SOFT_RESET_HOLD_FRAMES = 1
+LTV_MPC_SOFT_RESET_REUSE_DELTA_TOL = math.radians(8.0)
 MIN_AVOIDANCE_CANDIDATE_LENGTH = 6.0
 NEAR_AVOIDANCE_DISTANCE = 18.0
 SMALL_LATERAL_SHIFT_FOR_FAST_TRANSITION = 1.25
@@ -1020,19 +1024,53 @@ class LTVMPCTracker:
         self.previous_accel = 0.0
         self.previous_delta = 0.0
         self.previous_solution = None
+        self._soft_reset_guess = None
+        self._soft_reset_guess_uses_remaining = 0
+        self._soft_reset_hold_delta_cmd = 0.0
+        self._soft_reset_hold_frames_remaining = 0
+        self.last_reset_debug = None
         self._warned_fallback = False
 
-    def reset_plan(self):
+    def reset_plan(self, last_steer=None, keep_solution_steps=LTV_MPC_SOFT_RESET_KEEP_STEPS):
         """清理控制器的历史状态和缓存，以准备新的规划周期。"""
+        old_solution = self.previous_solution
+        delta_init = self.previous_delta_cmd
+        source = "previous_delta_cmd"
+        if last_steer is not None and math.isfinite(last_steer):
+            delta_init = self._steer_to_ltv_delta(last_steer)
+            source = "last_steer"
+
+        self.previous_delta_cmd = delta_init
+        self.previous_delta = delta_init
         self.previous_solution = None
         self.previous_accel = 0.0
+        self.fallback_tracker.previous_steer = clamp(delta_init / MPC_DELTA_MAX_RAD, -1.0, 1.0)
         self.fallback_tracker.previous_accel = 0.0
+        self.fallback_tracker.previous_delta = delta_init
+        self._soft_reset_guess, kept_steps = self._build_soft_reset_guess(
+            old_solution,
+            delta_init,
+            keep_solution_steps,
+        )
+        self._soft_reset_guess_uses_remaining = LTV_MPC_SOFT_RESET_USES if self._soft_reset_guess else 0
+        self._soft_reset_hold_delta_cmd = delta_init
+        self._soft_reset_hold_frames_remaining = LTV_MPC_SOFT_RESET_HOLD_FRAMES
+        self.last_reset_debug = {
+            "source": source,
+            "delta_init": delta_init,
+            "steer_init": clamp(delta_init / MPC_DELTA_MAX_RAD, -1.0, 1.0),
+            "kept_solution_steps": kept_steps,
+            "guess_uses": self._soft_reset_guess_uses_remaining,
+            "hold_frames": self._soft_reset_hold_frames_remaining,
+        }
 
     def control(self, ego_vehicle, trajectory, target_speed):
-        if scipy_minimize is None:
-            return self._fallback(ego_vehicle, trajectory, target_speed, "scipy unavailable")
         if not getattr(trajectory, "is_route_relative", False):
             return self._fallback(ego_vehicle, trajectory, target_speed, "trajectory is not route-relative")
+        if self._soft_reset_hold_frames_remaining > 0:
+            return self._soft_reset_hold_control(ego_vehicle, target_speed)
+        if scipy_minimize is None:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "scipy unavailable")
 
         initial_state = self._initial_state(ego_vehicle, trajectory)
         if initial_state is None:
@@ -1087,6 +1125,22 @@ class LTVMPCTracker:
 
         return _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer)
 
+    def _soft_reset_hold_control(self, ego_vehicle, target_speed):
+        delta_cmd = clamp(
+            self._soft_reset_hold_delta_cmd,
+            -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+            LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+        )
+        self._soft_reset_hold_frames_remaining -= 1
+        self.previous_delta_cmd = delta_cmd
+        self.previous_accel = 0.0
+        self.previous_delta = self._advance_delta(self.previous_delta, delta_cmd)
+        steer = clamp(delta_cmd / MPC_DELTA_MAX_RAD, -1.0, 1.0)
+        self.fallback_tracker.previous_steer = steer
+        self.fallback_tracker.previous_accel = 0.0
+        self.fallback_tracker.previous_delta = self.previous_delta
+        return _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer)
+
     def _initial_state(self, ego_vehicle, trajectory):
         """获取MPC预测的初始状态，包括自车在轨迹上的位置、航向角、速度以及之前的转向命令。通过将自车当前位置转换到轨迹的局部坐标系下，可以得到自车在轨迹上的位置和横向偏移，作为MPC预测的初始状态。同时，通过获取自车当前的航向角和速度，可以更准确地描述自车的运动状态，为MPC预测提供更合理的初始条件。最后，通过包含之前的转向命令，可以让MPC预测考虑转向动态的连续性，提高预测结果的稳定性和合理性。"""
         transform = ego_vehicle.get_transform()
@@ -1111,6 +1165,12 @@ class LTVMPCTracker:
 
     def _initial_guess(self):
         """生成MPC求解的初始猜测，基于之前的求解结果进行平移，如果没有有效的之前解，则使用之前的转向命令和加速度作为初始猜测。通过将之前的求解结果进行平移，可以为当前的MPC求解提供一个更接近最优解的初始猜测，从而提高求解效率和收敛性。如果没有有效的之前解，则使用之前的转向命令和加速度作为初始猜测，以确保MPC求解有一个合理的起点，避免从完全随机的猜测开始求解可能导致的收敛问题。"""
+        if self._soft_reset_guess is not None and self._soft_reset_guess_uses_remaining > 0:
+            guess = list(self._soft_reset_guess)
+            self._soft_reset_guess_uses_remaining -= 1
+            if self._soft_reset_guess_uses_remaining <= 0:
+                self._soft_reset_guess = None
+            return guess
         if self.previous_solution and len(self.previous_solution) == 2 * LTV_MPC_HORIZON_STEPS:
             shifted = list(self.previous_solution[2:])
             shifted.extend(self.previous_solution[-2:])
@@ -1120,6 +1180,34 @@ class LTVMPCTracker:
             guess.append(self.previous_delta_cmd)
             guess.append(clamp(self.previous_accel, LTV_MPC_ACCEL_MIN, LTV_MPC_ACCEL_MAX))
         return guess
+
+    def _steer_to_ltv_delta(self, steer):
+        normalized = clamp(float(steer), -LTV_MPC_STEER_LIMIT, LTV_MPC_STEER_LIMIT)
+        return normalized * MPC_DELTA_MAX_RAD
+
+    def _build_soft_reset_guess(self, old_solution, delta_init, keep_solution_steps):
+        guess = []
+        for _ in range(LTV_MPC_HORIZON_STEPS):
+            guess.append(delta_init)
+            guess.append(LTV_MPC_ACCEL_MIN)
+
+        kept_steps = 0
+        if old_solution and len(old_solution) == 2 * LTV_MPC_HORIZON_STEPS and keep_solution_steps > 1:
+            shifted = list(old_solution[2:])
+            shifted.extend(old_solution[-2:])
+            max_steps = min(keep_solution_steps, LTV_MPC_HORIZON_STEPS)
+            for step in range(1, max_steps):
+                old_delta = clamp(
+                    float(shifted[2 * step]),
+                    -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+                    LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+                )
+                if abs(old_delta - delta_init) > LTV_MPC_SOFT_RESET_REUSE_DELTA_TOL:
+                    break
+                guess[2 * step] = old_delta
+                guess[2 * step + 1] = clamp(float(shifted[2 * step + 1]), LTV_MPC_ACCEL_MIN, LTV_MPC_ACCEL_MAX)
+                kept_steps += 1
+        return guess, kept_steps
 
     def _objective(self, controls, initial_state, trajectory, target_speed):
         """MPC求解的目标函数，计算给定控制输入序列下的总成本，包括跟踪误差、控制输入变化、动态约束违反等方面的成本。通过对每个时间步的状态进行预测，并计算与参考轨迹的跟踪误差以及控制输入的变化，可以评估当前控制输入序列的性能和合理性。同时，通过对动态约束的违反进行惩罚，可以确保MPC求解得到的控制输入序列在物理上可行，并避免产生不稳定或不可控的行为。最后，通过将所有成本进行加权求和，得到一个综合的目标函数值，供MPC求解器进行优化。"""
