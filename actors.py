@@ -9,6 +9,7 @@ from config import (
     BACKGROUND_BICYCLE_SPEED_MAX,
     BACKGROUND_BICYCLE_SPEED_MIN,
     BACKGROUND_VEHICLE_EGO_CLEARANCE,
+    BACKGROUND_VEHICLE_FIXED_SPEEDS,
     BACKGROUND_VEHICLE_ROUTE_INDICES,
     BACKGROUND_VEHICLE_SPEED_MAX,
     BACKGROUND_VEHICLE_SPEED_MIN,
@@ -376,8 +377,9 @@ def spawn_background_route_vehicles(world, loop_route, actor_list, rng):
     vehicles = []
     for index, blueprint_id in zip(BACKGROUND_VEHICLE_ROUTE_INDICES, preferred_ids):
         blueprint = blueprint_library.find(blueprint_id)
+        vehicle_number = len(vehicles) + 1
         if blueprint.has_attribute("role_name"):
-            blueprint.set_attribute("role_name", "background_vehicle_{}".format(len(vehicles) + 1))
+            blueprint.set_attribute("role_name", "background_vehicle_{}".format(vehicle_number))
 
         waypoint_index = min(index, len(loop_route.waypoints) - 1)
         transform = vehicle_transform_from_waypoint(loop_route.waypoints[waypoint_index])
@@ -388,6 +390,7 @@ def spawn_background_route_vehicles(world, loop_route, actor_list, rng):
 
         actor.set_simulate_physics(False)
         target_speed = rng.uniform(BACKGROUND_VEHICLE_SPEED_MIN, BACKGROUND_VEHICLE_SPEED_MAX)
+        target_speed = BACKGROUND_VEHICLE_FIXED_SPEEDS.get(vehicle_number, target_speed)
         actor_list.append(actor)
         vehicles.append(BackgroundRouteVehicle(actor, target_speed, waypoint_index, loop_route))
         print(
