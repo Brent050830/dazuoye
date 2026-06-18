@@ -2713,7 +2713,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py config.py perception.py control.py`，语法检查通过；已运行 `git diff --check -- guiji.py`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已运行 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，完成 Town10 固定路线一圈，最终 `Collisions: 0`。日志显示 replacement 写入帧 steer 变化较小，而 `18.30s` 的 `mpc-stop` 出现 `steer=+0.45`、`steer_delta=+0.50`，说明明显晃动更可能来自 MPC 退出后切回普通前视控制，而不是显示绘制或 replacement 写入本身。
 - 未覆盖风险：本次只加诊断并观察一轮固定场景，没有修改控制律；如果要真正消除晃动，下一步应围绕 MPC 退出条件或普通前视控制接管连续性处理。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
+- 提交代号/Commit ID：`de80715`。
 - PR/分支信息：本地修改中，尚未推送。
 
 ### 2026-06-18 - MPC 退出加入短时控制器过渡
@@ -2724,7 +2724,7 @@ E:/Anaconda_envs/envs/carla_env/python.exe
 - 如何验证：已运行 `E:/Anaconda_envs/envs/carla_env/python.exe -m py_compile guiji.py config.py perception.py control.py`，语法检查通过；已运行 `git diff --check -- guiji.py PROGRAM_FRAMEWORK.md`，无空白错误，仅有 Windows 下 LF/CRLF 提示；已连续运行三次 `E:/Anaconda_envs/envs/carla_env/python.exe guiji.py --free-run`，均完成 Town10 固定路线一圈，最终 `Collisions: 0`。最终版本日志显示 `18.35s [mpc-exit-blend-start]` 时 `raw_steer=+0.45`，实际 `steer=-0.02`、`steer_delta=+0.00`；`18.60s [mpc-exit-blend]` 时 `blend_alpha=1.00`、`blend_source=+0.42`、`steer_delta=+0.01`，说明退出首帧突跳已被过渡吸收。
 - 未覆盖风险：日志仍显示两个独立的剩余晃动来源：`14.90s route-change` 附近 MPC 内部可能给出 `steer=+0.45` 的大转角，属于 LTV/fallback 或新回归段冷启动问题；`19.20s`、`24.70s-25.90s` 和右侧目标急刹恢复后普通 `LoopRoute.steer()` 在弯道中仍会出现 `steer-jump`，这属于普通前视控制的弯道接管/低速恢复问题，不是显示绘制，也不是 MPC 退出第一拍本身。本次不重写普通路线跟踪器。
 - 需要 reviewer 重点看的文件：`dazuoye/guiji.py`、`dazuoye/PROGRAM_FRAMEWORK.md`。
-- 提交代号/Commit ID：待提交。
+- 提交代号/Commit ID：`de80715`。
 - PR/分支信息：本地修改中，尚未推送。
 
 ### 2026-06-18 - 右侧目标改为先通过/急刹决策
