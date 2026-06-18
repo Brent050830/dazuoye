@@ -10,7 +10,7 @@ except Exception:
     scipy_minimize = None
 
 from config import FRONT_CONFLICT_LATERAL_MARGIN, MPC_DT, MPC_HORIZON_STEPS, WHEEL_BASE # MPC控制器的时间步长、预测时域步数和车辆轴距
-from utils import clamp, dot_2d, get_speed, normalize_angle, smooth_reference_for, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
+from utils import clamp, dot_2d, get_speed, normalize_angle, smooth_reference_for, speed_control, yaw_to_rad # 一些数学工具函数：clamp用于限制数值范围，dot_2d计算二维向量点积，get_speed获取车辆速度，normalize_angle将角度归一化到[-pi, pi]，yaw_to_rad将carla的旋转转换为弧度表示的航向角
 
 MPC_DELTA_MAX_RAD = math.radians(32.0)
 MPC_DELTA_RESPONSE_TAU = 0.22
@@ -34,9 +34,23 @@ LTV_MPC_SOLVE_TIMEOUT_SECONDS = 0.80
 LTV_MPC_STEER_LIMIT = 0.45
 LTV_MPC_ACCEL_MIN = 0.0
 LTV_MPC_ACCEL_MAX = 1.0
+LTV_MPC_SOFT_RESET_KEEP_STEPS = 2
+LTV_MPC_SOFT_RESET_USES = 2
+LTV_MPC_SOFT_RESET_HOLD_FRAMES = 1
+LTV_MPC_SOFT_RESET_REUSE_DELTA_TOL = math.radians(8.0)
+MIN_AVOIDANCE_CANDIDATE_LENGTH = 6.0
+NEAR_AVOIDANCE_DISTANCE = 18.0
+SMALL_LATERAL_SHIFT_FOR_FAST_TRANSITION = 1.25
+FRONT_CANDIDATE_TRACKING_LATERAL_ALLOWANCE = 0.1
 
 
 # ===================== 换道轨迹规划与 MPC 轨迹跟踪控制器 =====================
+
+
+def _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer):
+    """Use MPC only for steering; close the longitudinal loop with speed control."""
+    throttle, brake = speed_control(get_speed(ego_vehicle), target_speed)
+    return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
 
 @dataclass
 class AvoidancePathCandidate:
@@ -57,6 +71,7 @@ class AvoidancePathCandidate:
     reject_reason: str = ""
     start_route_s: float = 0.0
     end_route_s: float = 0.0
+    start_lateral_slope: float = 0.0
 
 
 @dataclass
@@ -86,24 +101,40 @@ class RouteOffsetLaneChangeTrajectory:
         end_offset=None,
         transition_ratio=1.0,
         start_route_s=None,
+        start_lateral_slope=0.0,
     ):
-        self.loop_route = loop_route
-        self.step_distance = loop_route.step_distance
-        self.route_reference = smooth_reference_for(loop_route)
-        if start_route_s is None:
+        self.loop_route = loop_route # 基础路线对象，包含全局路径点和相关信息，供换道轨迹计算使用
+        self.step_distance = loop_route.step_distance # 基础路线的步距，表示全局路径上相邻点之间的距离，供换道轨迹计算使用
+        self.route_reference = smooth_reference_for(loop_route) # 基础路线的平滑参考对象，提供在全局路径上计算坐标和右向单位向量的方法，供换道轨迹计算使用
+        if start_route_s is None: # 如果没有提供起点位置，则根据起点索引计算起点位置；如果提供了起点位置，则根据全局路径的范围进行限制，并计算对应的起点索引。通过这种方式，可以灵活地指定换道轨迹的起点位置，无论是通过索引还是通过全局路径上的位置，都能够正确地计算出换道轨迹的起点坐标和相关信息。
             self.start_index = max(0, min(start_index, len(loop_route.points) - 1))
-            self.start_route_s = self.start_index * self.step_distance
+            self.start_route_s = self.start_index * self.step_distance # 根据起点索引计算起点位置，表示换道开始时在全局路径上的位置，供后续计算使用
         else:
             self.start_route_s = clamp(float(start_route_s), 0.0, self.route_reference.max_s)
             self.start_index = max(0, min(int(round(self.start_route_s / self.step_distance)), len(loop_route.points) - 1))
         self.start_offset = start_offset
+        self.start_lateral_slope = clamp(float(start_lateral_slope), -0.60, 0.60)
         self.lateral_offset = lateral_offset # 目标侧向偏移；本段内只从起点平滑过渡到该偏移，不再回收到基础路线
         self.end_offset = end_offset if end_offset is not None else lateral_offset
+        self.end_lateral_slope = 0.0
         self.length = length
         self.transition_ratio = clamp(transition_ratio, 0.05, 1.0)
         self.transition_length = max(0.001, self.length * self.transition_ratio)
+        self._offset_coefficients = self._build_offset_coefficients()
         self.end_route_s = self.start_route_s + self.length # 换道终点在全局路径上的纵向位置，基于起点位置和换道长度计算得到，表示换道结束时在全局路径上的位置，供后续计算使用
         self.is_route_relative = True
+
+    def _build_offset_coefficients(self):
+        scale = self.transition_length
+        c0 = self.start_offset
+        c1 = self.start_lateral_slope * scale
+        c2 = 0.0
+        target_delta = self.end_offset - c0 - c1
+        target_slope_delta = self.end_lateral_slope * scale - c1
+        c3 = 10.0 * target_delta - 4.0 * target_slope_delta
+        c4 = 7.0 * target_slope_delta - 15.0 * target_delta
+        c5 = 6.0 * target_delta - 3.0 * target_slope_delta
+        return c0, c1, c2, c3, c4, c5
 
     def _route_pose_at(self, s):
         """计算全局路径上纵向位置 s 处的坐标和右向单位向量"""
@@ -120,20 +151,19 @@ class RouteOffsetLaneChangeTrajectory:
             return self.end_offset # 如果 s 大于等于横向过渡长度，直接保持结束侧向偏移量
 
         tau = s / self.transition_length # 计算当前 s 在横向过渡长度中的归一化位置 tau，范围在 [0, 1] 之间
-        return self._blend_offset(self.start_offset, self.end_offset, tau)
-
-    def _blend_offset(self, start, end, tau):
-        blend = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5 # 五次多项式的值，表示侧向偏移随纵向位置的变化比例
-        return start + (end - start) * blend
+        c0, c1, c2, c3, c4, c5 = self._offset_coefficients
+        return c0 + c1 * tau + c2 * tau**2 + c3 * tau**3 + c4 * tau**4 + c5 * tau**5
 
     def lateral_slope_at(self, s):
         """计算纵向位置 s 处的轨迹横向斜率（用于计算参考航向角）"""
-        if s <= 0.0 or s >= self.transition_length:
-            return 0.0
+        if s <= 0.0:
+            return self.start_lateral_slope
+        if s >= self.transition_length:
+            return self.end_lateral_slope
         tau = s / self.transition_length
-        offset_delta = self.end_offset - self.start_offset # 计算侧向偏移的总变化量，表示从换道开始到结束的横向移动距离
-        blend_dot = 30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4 # 五次多项式的导数值，表示侧向偏移随纵向位置变化的斜率，影响参考航向角的计算
-        return offset_delta * blend_dot / self.transition_length # 计算横向斜率，表示轨迹在当前 s 位置的横向变化率，供参考航向角计算使用
+        _, c1, c2, c3, c4, c5 = self._offset_coefficients
+        slope_tau = c1 + 2.0 * c2 * tau + 3.0 * c3 * tau**2 + 4.0 * c4 * tau**3 + 5.0 * c5 * tau**4
+        return slope_tau / self.transition_length
 
     def location_at(self, s):
         """计算纵向位置 s 处的全局坐标，基于全局路径坐标加上侧向偏移"""
@@ -165,6 +195,7 @@ class RouteOffsetLaneChangeTrajectory:
         return progress, lateral # 返回局部坐标 (s, d)，其中 s 是沿全局路径的进度，d 是相对于全局路径的横向偏移
 
     def replacement_points(self, step=2.0):
+        """生成换道轨迹的离散坐标点列表，间隔为 step，供后续控制和可视化使用。通过在换道轨迹上以固定的步长采样，可以得到一系列离散的坐标点，这些点可以用于MPC求解的状态预测和控制输入计算，以及在仿真环境中的可视化展示。最后返回这些离散坐标点的列表，供后续使用。"""
         points = []
         sample_count = max(1, int(math.ceil(self.length / max(step, 0.5))))
         for index in range(sample_count + 1):
@@ -178,14 +209,33 @@ def smoothed_route_right_at(loop_route, index):
     return smooth_reference_for(loop_route).right_at_route_s(index * loop_route.step_distance)
 
 
-def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_length, obstacle_actors=None):
+def select_best_route_offset_trajectory(
+    loop_route,
+    ego_vehicle,
+    front,
+    base_length,
+    obstacle_actors=None,
+    start_route_s=None,
+    start_offset=None,
+    start_lateral_slope=0.0,
+):
     """生成左右多偏移避障替换段，按约束和车辆冲突筛选最优候选。"""
     route_index = loop_route.last_index
     start_transform = ego_vehicle.get_transform()
     route_reference = smooth_reference_for(loop_route)
-    route_location = route_reference.location_at_route_s(route_index * loop_route.step_distance)
-    route_right = smoothed_route_right_at(loop_route, route_index)
-    start_offset = dot_2d(start_transform.location - route_location, route_right)
+    if start_route_s is None or start_offset is None:
+        route_s_hint = route_index * loop_route.step_distance
+        start_projection = route_reference.project(
+            start_transform.location,
+            route_s_hint,
+            search_back=max(12.0, 6.0 * loop_route.step_distance),
+            search_ahead=max(40.0, 20.0 * loop_route.step_distance),
+        )
+        start_route_s = route_reference.clamp_s(start_projection["route_s"])
+        start_offset = start_projection["lateral"]
+    else:
+        start_route_s = route_reference.clamp_s(start_route_s)
+    route_index = max(0, min(int(round(start_route_s / loop_route.step_distance)), len(loop_route.points) - 1))
     lane_width = max(loop_route.waypoints[route_index].lane_width, 2.5)
     ego_speed = max(get_speed(ego_vehicle), 4.0)
     front_distance = getattr(front, "distance", float("inf"))
@@ -193,23 +243,30 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
     front_target_speed = max(0.0, getattr(front, "target_speed_along", 0.0))
     front_actor_id = getattr(front, "actor_id", None)
 
-    min_avoidance_length = front_distance if math.isfinite(front_distance) else 14.0
+    min_avoidance_length = front_distance if math.isfinite(front_distance) else MIN_AVOIDANCE_CANDIDATE_LENGTH
     length_values = _candidate_lengths(base_length, min_length=min_avoidance_length)
-    target_values = _candidate_target_offsets(start_offset, lane_width)
     transition_values = _avoidance_transition_ratios()
-    coarse_lengths = _coarse_values(length_values, max_count=4)
-    coarse_targets = _coarse_target_offsets(start_offset, lane_width, target_values)
-    coarse_transitions = _coarse_transition_ratios(transition_values)
     diagnostics = _new_planning_diagnostics("avoidance")
+    diagnostics["start_route_s"] = start_route_s
+    diagnostics["start_offset"] = start_offset
+    diagnostics["start_lateral_slope"] = start_lateral_slope
     actor_projections = _build_actor_projection_cache(
         route_reference,
-        route_index * loop_route.step_distance,
+        start_route_s,
         max(length_values) + 2.0 if length_values else base_length + 2.0,
         obstacle_actors or [],
         ego_vehicle,
         front_actor_id,
     )
     diagnostics["actor_projections"] = len(actor_projections)
+    front_projection = next(
+        (projection for projection in actor_projections if projection.actor_id == front_actor_id),
+        None,
+    )
+    target_values = _candidate_target_offsets(start_offset, lane_width, front_projection=front_projection)
+    coarse_lengths = _coarse_values(length_values, max_count=4)
+    coarse_targets = _coarse_target_offsets(start_offset, lane_width, target_values)
+    coarse_transitions = _coarse_transition_ratios(transition_values)
 
     candidates = []
     seen = set()
@@ -232,6 +289,8 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
         actor_projections,
         ego_vehicle,
         front_actor_id,
+        start_route_s=start_route_s,
+        start_lateral_slope=start_lateral_slope,
     )
 
     valid_candidates = [candidate for candidate in candidates if candidate.is_valid]
@@ -256,6 +315,8 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
             actor_projections,
             ego_vehicle,
             front_actor_id,
+            start_route_s=start_route_s,
+            start_lateral_slope=start_lateral_slope,
         )
     else:
         _append_scored_candidates(
@@ -277,6 +338,8 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
             actor_projections,
             ego_vehicle,
             front_actor_id,
+            start_route_s=start_route_s,
+            start_lateral_slope=start_lateral_slope,
         )
         _append_scored_candidates(
             candidates,
@@ -297,6 +360,8 @@ def select_best_route_offset_trajectory(loop_route, ego_vehicle, front, base_len
             actor_projections,
             ego_vehicle,
             front_actor_id,
+            start_route_s=start_route_s,
+            start_lateral_slope=start_lateral_slope,
         )
 
     valid_candidates = [candidate for candidate in candidates if candidate.is_valid]
@@ -314,6 +379,7 @@ def select_return_to_base_trajectory(
     obstacle_actors=None,
     start_route_s=None,
     start_offset=None,
+    start_lateral_slope=0.0,
     active_route_s=None,
     active_lateral=None,
 ):
@@ -332,6 +398,7 @@ def select_return_to_base_trajectory(
     diagnostics = _new_planning_diagnostics("return")
     diagnostics["start_route_s"] = start_route_s
     diagnostics["start_offset"] = start_offset
+    diagnostics["start_lateral_slope"] = start_lateral_slope
     if active_route_s is not None:
         diagnostics["active_route_s"] = active_route_s
     if active_lateral is not None:
@@ -357,7 +424,7 @@ def select_return_to_base_trajectory(
     for length in length_values:
         for transition_ratio in _return_transition_ratios():
             candidates.append(
-                _score_avoidance_candidate(
+                _build_and_evaluate_route_offset_candidate(
                     loop_route,
                     route_index,
                     length,
@@ -374,6 +441,7 @@ def select_return_to_base_trajectory(
                     None,
                     diagnostics,
                     start_route_s=start_route_s,
+                    start_lateral_slope=start_lateral_slope,
                 )
             )
 
@@ -387,6 +455,7 @@ def select_return_to_base_trajectory(
 
 
 def _new_planning_diagnostics(kind):
+    """生成一个新的诊断信息字典，用于记录规划过程中的各种统计数据和约束检查结果。"""
     return {
         "kind": kind,
         "coarse_candidates": 0,
@@ -420,17 +489,20 @@ def _append_scored_candidates(
     actor_projections,
     ego_vehicle,
     front_actor_id,
+    start_route_s=None,
+    start_lateral_slope=0.0,
 ):
+    """生成一批候选路径，计算它们的约束满足情况和代价，并添加到候选列表中。通过 seen 集合避免重复计算相同参数组合的候选路径。"""
     for length in length_values:
         for target_offset in target_values:
-            ratios = (1.0,) if abs(target_offset - start_offset) < 0.05 else transition_values
+            ratios = _candidate_transition_ratios(transition_values, target_offset - start_offset, front_distance)
             for transition_ratio in ratios:
                 key = (round(length, 2), round(target_offset, 2), round(transition_ratio, 2))
                 if key in seen:
                     continue
                 seen.add(key)
                 candidates.append(
-                    _score_avoidance_candidate(
+                    _build_and_evaluate_route_offset_candidate(
                         loop_route,
                         route_index,
                         length,
@@ -446,6 +518,8 @@ def _append_scored_candidates(
                         ego_vehicle,
                         front_actor_id,
                         diagnostics,
+                        start_route_s=start_route_s,
+                        start_lateral_slope=start_lateral_slope,
                     )
                 )
                 diagnostics["{}_candidates".format(stage)] = diagnostics.get("{}_candidates".format(stage), 0) + 1
@@ -464,7 +538,7 @@ def _coarse_values(values, max_count=4):
 
 
 def _coarse_transition_ratios(values):
-    preferred = (0.80, 0.90, 1.00)
+    preferred = (0.55, 0.75, 1.00)
     result = []
     for ratio in preferred:
         nearest = min(values, key=lambda value: abs(value - ratio))
@@ -474,6 +548,7 @@ def _coarse_transition_ratios(values):
 
 
 def _coarse_target_offsets(start_offset, lane_width, full_targets):
+    """生成一系列粗略的候选目标侧向偏移，基于起始偏移和车道宽度进行缩放，并确保与现有偏移值有足够的间隔。通过对起始偏移进行不同程度的缩放，生成一系列粗略的候选目标侧向偏移，以适应不同的换道需求和车道宽度。同时，通过确保生成的候选目标侧向偏移与现有偏移值有足够的间隔，可以避免生成过于相似的候选路径，提高找到更优路径的机会。"""
     coarse_scales = (-1.10, -0.90, -0.70, -0.45, 0.0, 0.45, 0.70, 0.90, 1.10)
     result = []
     for scale in coarse_scales:
@@ -485,6 +560,7 @@ def _coarse_target_offsets(start_offset, lane_width, full_targets):
 
 
 def _refinement_values(valid_candidates, length_values, target_values, lane_width):
+    """基于初步评估的有效候选路径，生成更密集的长度和目标偏移值用于细化搜索。通过分析有效候选路径的长度和目标偏移分布，选择与这些候选路径相近但不重复的参数值，以提高找到更优路径的机会。"""
     seeds = sorted(valid_candidates, key=lambda candidate: candidate.total_cost)[:4]
     length_result = []
     target_result = []
@@ -501,7 +577,7 @@ def _refinement_values(valid_candidates, length_values, target_values, lane_widt
 
 
 def _select_preferred_avoidance_candidate(valid_candidates):
-    """普通避障优先选择向右偏移的安全候选；右侧无安全候选时再选左侧。"""
+    """在有效候选路径中优先选择右侧偏移的路径，如果没有明显右侧偏移的路径，则选择左侧偏移的路径，否则选择代价最低的路径。通过优先选择右侧偏移的路径，可以更好地避开前方障碍物，同时保持与其他车辆的安全距离。如果没有明显右侧偏移的路径，则选择左侧偏移的路径作为次优选项。最后，如果没有明显左右偏移的路径，则选择代价最低的路径作为最终选项。"""
     right_candidates = [
         candidate for candidate in valid_candidates
         if candidate.target_offset > candidate.start_offset + 0.05
@@ -520,40 +596,59 @@ def _select_preferred_avoidance_candidate(valid_candidates):
 
 
 def _candidate_lengths(base_length, min_length=14.0):
-    """围绕基础避障长度生成候选纵向长度，避免只固定一条路径。"""
+    """生成一系列候选换道长度，基于基础长度进行缩放，并确保满足最小长度要求。通过对基础长度进行不同程度的缩放，生成一系列候选换道长度，以适应不同的交通情况和障碍物位置。同时，通过设置最小长度要求，确保生成的候选路径具有足够的长度来完成安全的换道操作。"""
     values = []
-    lower_bound = clamp(min_length, 14.0, 56.0) # 设置候选长度的下限，确保生成的避障路径至少有一定的长度以提供足够的时间和空间进行安全避障，同时避免过长的路径导致不必要的复杂性和风险
+    lower_bound = clamp(min_length, MIN_AVOIDANCE_CANDIDATE_LENGTH, 56.0)
     for scale in (0.50, 0.60, 0.70, 0.80, 0.90, 1.0, 1.15, 1.30):
-        length = clamp(base_length * scale, lower_bound, 56.0) # 根据基础长度和缩放比例计算候选长度，并确保在合理范围内，避免生成过短或过长的避障路径，同时提供多样化的长度选择以适应不同的交通场景和避障需求
+        length = clamp(base_length * scale, lower_bound, 56.0) # 根据基础长度和缩放比例计算候选长度，并确保在最小长度和最大长度之间
         if all(abs(length - existing) > 0.1 for existing in values):
             values.append(length)
     return values
 
 
 def _avoidance_transition_ratios():
-    return (0.75,0.8, 0.85,0.9, 1.0)
+    """生成一系列避让过渡比率，用于控制换道过程中的过渡长度。"""
+    return (0.55, 0.65, 0.75, 0.8, 0.85, 0.9, 1.0)
 
 
 def _return_transition_ratios():
+    """生成一系列返回过渡比率，用于控制换道过程中的返回长度。"""
     return (0.85, 1.0)
 
 
-def _candidate_target_offsets(start_offset, lane_width):
-    """围绕当前路线左右生成候选峰值横向偏移。"""
+def _candidate_transition_ratios(transition_values, lateral_shift, front_distance):
+    """近距离小偏移允许更早完成横向动作，其它候选保持保守过渡。"""
+    if abs(lateral_shift) < 0.05:
+        return (1.0,)
+    near_front = math.isfinite(front_distance) and front_distance <= NEAR_AVOIDANCE_DISTANCE
+    small_shift = abs(lateral_shift) <= SMALL_LATERAL_SHIFT_FOR_FAST_TRANSITION
+    min_ratio = 0.55 if near_front and small_shift else 0.75
+    return tuple(value for value in transition_values if value >= min_ratio)
+
+
+def _candidate_target_offsets(start_offset, lane_width, front_projection=None):
+    """生成一系列候选目标侧向偏移，基于起始偏移和车道宽度进行缩放，并确保与现有偏移值有足够的间隔。通过对起始偏移进行不同程度的缩放，生成一系列候选目标侧向偏移，以适应不同的换道需求和车道宽度。同时，通过确保生成的候选目标侧向偏移与现有偏移值有足够的间隔，可以避免生成过于相似的候选路径，提高找到更优路径的机会。"""
     offsets = (
         -1.20, -1.10, -1.05, -1.00, -0.90, -0.70, -0.55, -0.45, -0.35, -0.25, -0.15,
         0.0,
         0.15, 0.25, 0.35, 0.45, 0.55, 0.70, 0.90, 1.00, 1.05, 1.10, 1.20,
     )
     values = []
-    for scale in offsets: # 对于每个偏移量，计算对应的目标侧向偏移，并确保与现有候选值之间有足够的差距，避免生成过于相似的候选路径，增加换道策略的多样性和适应性
-        target = start_offset + scale * lane_width
+    def append_target(target):
         if all(abs(target - existing) > 0.05 for existing in values):
             values.append(target)
+
+    for scale in offsets:
+        append_target(start_offset + scale * lane_width)
+    if front_projection is not None:
+        required_clearance = max(0.0, front_projection.lateral_buffer - 0.05)
+        for side in (1.0, -1.0):
+            for extra_clearance in (0.0, 0.15, 0.30, 0.45):
+                append_target(front_projection.lateral + side * (required_clearance + extra_clearance))
     return values
 
 
-def _score_avoidance_candidate(
+def _build_and_evaluate_route_offset_candidate(
     loop_route,
     route_index,
     length,
@@ -570,7 +665,9 @@ def _score_avoidance_candidate(
     front_actor_id,
     diagnostics=None,
     start_route_s=None,
+    start_lateral_slope=0.0,
 ):
+    """基于给定参数构建一条候选换道轨迹，并评估其约束满足情况和代价。通过计算换道过程中的侧向位移、侧向加速度以及与前车的距离和时间关系，评估候选路径的安全性、舒适性和跟踪性能，并根据这些评估结果计算总代价。最后，根据约束检查结果和代价计算，确定候选路径是否有效，并返回包含轨迹和评估信息的 AvoidancePathCandidate 对象。"""
     lateral_shift = target_offset - start_offset
     transition_ratio = clamp(transition_ratio, 0.05, 1.0)
     transition_length = max(0.001, length * transition_ratio)
@@ -583,21 +680,29 @@ def _score_avoidance_candidate(
     end_route_s = start_route_s + length
     trajectory = None
 
-    if length < 14.0:
+    if length < MIN_AVOIDANCE_CANDIDATE_LENGTH:
         reject_reason = "length too short"
     elif lateral_accel > max_lateral_accel:
         reject_reason = "lateral acceleration too high"
     else:
-        reject_reason = _front_clearance_prefilter_reason(
-            start_route_s,
-            length,
-            transition_ratio,
-            start_offset,
-            target_offset,
-            actor_projections,
-            front_actor_id,
-            ego_speed,
+        front_projection = next(
+            (projection for projection in actor_projections if projection.actor_id == front_actor_id),
+            None,
         )
+        if front_projection is not None and front_projection.speed_along <= max(2.0, 0.45 * ego_speed):
+            local_s = front_projection.route_s - start_route_s
+            if 0.0 <= local_s <= length + 2.0:
+                if local_s <= 0.0:
+                    candidate_offset = start_offset
+                elif local_s >= transition_length:
+                    candidate_offset = target_offset
+                else:
+                    tau = local_s / transition_length
+                    blend = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
+                    candidate_offset = start_offset + lateral_shift * blend
+                lateral_gap = front_projection.lateral - candidate_offset
+                if abs(lateral_gap) <= max(0.0, front_projection.lateral_buffer - 0.35):
+                    reject_reason = "front lateral clearance too small"
     predicted_front_motion = front_target_speed * maneuver_time
     front_clear_distance = front_distance + predicted_front_motion
 
@@ -611,25 +716,63 @@ def _score_avoidance_candidate(
             end_offset=target_offset,
             transition_ratio=transition_ratio,
             start_route_s=start_route_s,
+            start_lateral_slope=start_lateral_slope,
         )
         if diagnostics is not None:
             diagnostics["collision_checks"] = diagnostics.get("collision_checks", 0) + 1
-        reject_reason = _candidate_collision_reason(
-            trajectory,
-            length,
-            ego_speed,
-            actor_projections,
-        )
+        sample_step = 1.0
+        check_length = length + 2.0
+        sample_count = max(1, int(math.ceil(check_length / sample_step)))
+        for actor_projection in actor_projections:
+            for index in range(sample_count + 1):
+                local_s = min(check_length, index * check_length / sample_count)
+                route_s = trajectory.start_route_s + local_s
+                time_to_sample = local_s / max(ego_speed, 0.1)
+                predicted_actor_s = actor_projection.route_s + actor_projection.speed_along * time_to_sample
+                longitudinal_gap = predicted_actor_s - route_s
+                if abs(longitudinal_gap) > actor_projection.longitudinal_buffer:
+                    continue
+                lateral_gap = actor_projection.lateral - trajectory.avoidance_delta_at(local_s)
+                if abs(lateral_gap) <= actor_projection.lateral_buffer:
+                    reject_reason = "{}: actor={}, local_s={:.1f}, longitudinal_gap={:.1f}, lateral_gap={:.2f}, lateral_buffer={:.2f}".format(
+                        "candidate conflicts with front vehicle" if actor_projection.is_front_actor else "candidate conflicts with vehicle",
+                        actor_projection.role_name,
+                        local_s,
+                        longitudinal_gap,
+                        lateral_gap,
+                        actor_projection.lateral_buffer,
+                    )
+                    break
+            if reject_reason:
+                break
     elif diagnostics is not None:
         diagnostics["cheap_rejects"] = diagnostics.get("cheap_rejects", 0) + 1
 
     center_error = abs(target_offset) / lane_width
-    safety_cost = _safety_cost(length, maneuver_time, front_clear_distance, front_ttc)
+    distance_cost = 0.0
+    if math.isfinite(front_clear_distance):
+        distance_cost = max(0.0, length * 0.75 - front_clear_distance + 4.0) ** 2 / 25.0
+    ttc_cost = 0.0
+    if math.isfinite(front_ttc):
+        ttc_cost = max(0.0, maneuver_time - front_ttc + 0.4) ** 2
+    safety_cost = distance_cost + ttc_cost
     comfort_cost = (lateral_accel / max_lateral_accel) ** 2 + 0.20 * abs(lateral_shift) / lane_width
-    tracking_cost = _tracking_cost(trajectory, length) if trajectory is not None else 0.0
+    tracking_cost = 0.0
+    if trajectory is not None:
+        samples = 6
+        yaws = []
+        max_slope = 0.0
+        for index in range(samples + 1):
+            s = length * index / samples
+            yaws.append(trajectory.reference_yaw_at(s))
+            max_slope = max(max_slope, abs(trajectory.lateral_slope_at(s)))
+        yaw_variation = 0.0
+        for before, after in zip(yaws, yaws[1:]):
+            yaw_variation += abs(normalize_angle(after - before))
+        tracking_cost = 0.35 * yaw_variation + 0.30 * max_slope
     total_cost = 4.0 * safety_cost + 2.0 * comfort_cost + tracking_cost + 0.6 * center_error
 
-    return AvoidancePathCandidate(
+    return AvoidancePathCandidate( # 返回一个包含候选路径和评估信息的 AvoidancePathCandidate 对象，供后续选择最优路径使用
         trajectory=trajectory,
         length=length,
         transition_ratio=transition_ratio,
@@ -645,22 +788,12 @@ def _score_avoidance_candidate(
         reject_reason=reject_reason,
         start_route_s=start_route_s,
         end_route_s=end_route_s,
+        start_lateral_slope=start_lateral_slope,
     )
 
 
-def _safety_cost(length, maneuver_time, front_distance, front_ttc):
-    """安全代价：TTC 越紧迫越偏向较短、较快完成横向避障的路径。"""
-    distance_cost = 0.0
-    if math.isfinite(front_distance): # 如果前车距离是有限的，计算距离代价，距离越近代价越高，鼓励选择较短的换道路径
-        distance_cost = max(0.0, length * 0.75 - front_distance + 4.0) ** 2 / 25.0
-    ttc_cost = 0.0
-    if math.isfinite(front_ttc): # 如果前车TTC是有限的，计算TTC代价，TTC越紧迫（越小）代价越高，鼓励选择较快完成换道的路径
-        ttc_cost = max(0.0, maneuver_time - front_ttc + 0.4) ** 2 # 如果换道所需时间超过前车TTC，说明在换道过程中可能会与前车发生冲突，代价会显著增加，鼓励选择更快完成换道的路径以避开前车
-    return distance_cost + ttc_cost
-
-
 def _actor_half_extents(actor, default_length=2.4, default_width=1.0):
-    """返回车辆包围盒半长、半宽；无包围盒时使用保守默认值。"""
+    """获取演员的半长和半宽，基于其边界框的尺寸。如果无法获取边界框或尺寸，则返回默认值。通过获取演员的边界框尺寸，可以估计演员在换道过程中占用的空间，从而更准确地评估候选路径与演员之间的距离和碰撞风险。如果无法获取边界框或尺寸，则使用默认值作为近似估计，以确保规划过程能够继续进行。"""
     bbox = getattr(actor, "bounding_box", None)
     extent = getattr(bbox, "extent", None)
     if extent is None:
@@ -669,7 +802,7 @@ def _actor_half_extents(actor, default_length=2.4, default_width=1.0):
 
 
 def _build_actor_projection_cache(route_reference, start_route_s, max_check_length, obstacle_actors, ego_vehicle, front_actor_id):
-    """Project each actor once for the current planning cycle."""
+    """为障碍演员构建一个投影缓存，包含它们在全局路径上的位置、速度以及与换道轨迹的相对位置关系。通过将障碍演员的位置投影到全局路径上，可以更方便地评估候选换道路径与这些演员之间的距离和碰撞风险。同时，通过计算演员的速度沿路径切线的分量，可以更准确地预测演员在换道过程中的运动状态，从而更有效地评估候选路径的安全性。最后，通过区分前车和其他车辆，可以针对不同类型的演员应用不同的安全约束，提高规划结果的合理性和安全性。"""
     ego_actor_id = getattr(ego_vehicle, "id", None)
     ego_half_length, ego_half_width = _actor_half_extents(ego_vehicle)
     projections = []
@@ -681,8 +814,10 @@ def _build_actor_projection_cache(route_reference, start_route_s, max_check_leng
         actor_half_length, actor_half_width = _actor_half_extents(actor)
         is_front_actor = front_actor_id is not None and actor.id == front_actor_id
         longitudinal_buffer = ego_half_length + actor_half_length + (3.0 if is_front_actor else 2.0)
-        lateral_margin = FRONT_CONFLICT_LATERAL_MARGIN if is_front_actor else 0.25
+        lateral_margin = FRONT_CONFLICT_LATERAL_MARGIN if is_front_actor else 0.20
         lateral_buffer = ego_half_width + actor_half_width + lateral_margin
+        if is_front_actor:
+            lateral_buffer += FRONT_CANDIDATE_TRACKING_LATERAL_ALLOWANCE
         projection = route_reference.project(
             actor.get_location(),
             start_route_s,
@@ -709,91 +844,6 @@ def _build_actor_projection_cache(route_reference, start_route_s, max_check_leng
             )
         )
     return projections
-
-
-def _front_clearance_prefilter_reason(
-    start_route_s,
-    length,
-    transition_ratio,
-    start_offset,
-    target_offset,
-    actor_projections,
-    front_actor_id,
-    ego_speed,
-):
-    if front_actor_id is None:
-        return ""
-    front_projection = next((projection for projection in actor_projections if projection.actor_id == front_actor_id), None)
-    if front_projection is None:
-        return ""
-    if front_projection.speed_along > max(2.0, 0.45 * ego_speed):
-        return ""
-
-    local_s = front_projection.route_s - start_route_s
-    if local_s < 0.0 or local_s > length + 2.0:
-        return ""
-    candidate_offset = _candidate_offset_at(local_s, length, transition_ratio, start_offset, target_offset)
-    lateral_gap = front_projection.lateral - candidate_offset
-    if abs(lateral_gap) <= max(0.0, front_projection.lateral_buffer - 0.15):
-        return "front lateral clearance too small"
-    return ""
-
-
-def _candidate_offset_at(s, length, transition_ratio, start_offset, target_offset):
-    transition_length = max(0.001, length * clamp(transition_ratio, 0.05, 1.0))
-    if s <= 0.0:
-        return start_offset
-    if s >= transition_length:
-        return target_offset
-    tau = s / transition_length
-    blend = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
-    return start_offset + (target_offset - start_offset) * blend
-
-
-def _candidate_collision_reason(trajectory, length, ego_speed, actor_projections):
-    """用当前候选路径与所有车辆的简化时空包络筛掉明显冲突路径。"""
-    if not actor_projections:
-        return ""
-
-    sample_step = 1.0
-    check_length = length + 2.0
-    sample_count = max(1, int(math.ceil(check_length / sample_step)))
-
-    for actor_projection in actor_projections:
-        for index in range(sample_count + 1): # 遍历采样点
-            local_s = min(check_length, index * check_length / sample_count)
-            route_s = trajectory.start_route_s + local_s # 计算当前采样点在全局路径上的纵向位置，基于换道起点位置和当前采样点的局部纵向位置计算得到，表示当前采样点在全局路径上的位置，供后续预测使用
-            time_to_sample = local_s / max(ego_speed, 0.1)
-            predicted_actor_s = actor_projection.route_s + actor_projection.speed_along * time_to_sample # 预测actor在当前采样点时间点的纵向位置，基于actor当前在全局路径上的位置和沿切线方向的速度预测得到，表示在换道过程中与该actor可能发生交互的时间点，供后续碰撞检查使用
-            longitudinal_gap = predicted_actor_s - route_s
-            if abs(longitudinal_gap) > actor_projection.longitudinal_buffer:
-                continue
-            lateral_gap = actor_projection.lateral - trajectory.avoidance_delta_at(local_s)
-            if abs(lateral_gap) <= actor_projection.lateral_buffer:
-                return "{}: actor={}, local_s={:.1f}, longitudinal_gap={:.1f}, lateral_gap={:.2f}, lateral_buffer={:.2f}".format(
-                    "candidate conflicts with front vehicle" if actor_projection.is_front_actor else "candidate conflicts with vehicle",
-                    actor_projection.role_name,
-                    local_s,
-                    longitudinal_gap,
-                    lateral_gap,
-                    actor_projection.lateral_buffer,
-                )
-    return ""
-
-
-def _tracking_cost(trajectory, length):
-    """跟踪难度代价：参考航向变化和五次曲线斜率越大，MPC 越难稳定跟踪。"""
-    samples = 6
-    yaws = []
-    max_slope = 0.0
-    for index in range(samples + 1):
-        s = length * index / samples
-        yaws.append(trajectory.reference_yaw_at(s))
-        max_slope = max(max_slope, abs(trajectory.lateral_slope_at(s)))
-    yaw_variation = 0.0
-    for before, after in zip(yaws, yaws[1:]):
-        yaw_variation += abs(normalize_angle(after - before))
-    return 0.35 * yaw_variation + 0.30 * max_slope
 
 
 class SamplingMPCTracker:
@@ -926,7 +976,7 @@ class SamplingMPCTracker:
                     cost += 9.0 * lateral_error**2
                     cost += 0.45 * longitudinal_error**2
                     cost += 1.7 * yaw_error**2
-                    cost += 0.07 * speed_error**2
+                    cost += 0.02 * speed_error**2
                     cost += 0.08 * steer**2
                     cost += 0.01 * accel**2
                     cost += 0.004 * step * steer_delta**2
@@ -950,7 +1000,7 @@ class SamplingMPCTracker:
                     if step == MPC_HORIZON_STEPS - 1:
                         cost += 18.0 * lateral_error**2
                         cost += 5.0 * yaw_error**2
-                        cost += 0.04 * speed_error**2
+                        cost += 0.02 * speed_error**2
 
                 if not reject_candidate and cost < best_cost:
                     best_cost = cost
@@ -961,23 +1011,11 @@ class SamplingMPCTracker:
         self.previous_accel = accel
         self.previous_delta = first_step_delta
 
-        if accel >= 0.0:
-            throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
-            brake = 0.0
-        else:
-            throttle = 0.0
-            brake = clamp(-accel / 7.5, 0.0, 1.0)
-
-        return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
+        return _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer)
 
 
 class LTVMPCTracker:
-    """First-version LTV-MPC tracker.
-
-    The implementation keeps the current CARLA-facing interface and uses
-    scipy.optimize.minimize to optimize a short control sequence. The dynamic
-    rollout is kept in the objective for now; it can later be replaced by an
-    explicit A_k/B_k QP form without changing the caller.
+    """控制器使用线性时变模型预测控制（LTV-MPC）方法，基于线性化的动态自行车模型进行预测和优化，以计算最优的转向和加速度指令。
     """
 
     def __init__(self):
@@ -986,19 +1024,53 @@ class LTVMPCTracker:
         self.previous_accel = 0.0
         self.previous_delta = 0.0
         self.previous_solution = None
+        self._soft_reset_guess = None
+        self._soft_reset_guess_uses_remaining = 0
+        self._soft_reset_hold_delta_cmd = 0.0
+        self._soft_reset_hold_frames_remaining = 0
+        self.last_reset_debug = None
         self._warned_fallback = False
 
-    def reset_plan(self):
-        """Clear warm-start state after the tracked replacement segment changes."""
+    def reset_plan(self, last_steer=None, keep_solution_steps=LTV_MPC_SOFT_RESET_KEEP_STEPS):
+        """清理控制器的历史状态和缓存，以准备新的规划周期。"""
+        old_solution = self.previous_solution
+        delta_init = self.previous_delta_cmd
+        source = "previous_delta_cmd"
+        if last_steer is not None and math.isfinite(last_steer):
+            delta_init = self._steer_to_ltv_delta(last_steer)
+            source = "last_steer"
+
+        self.previous_delta_cmd = delta_init
+        self.previous_delta = delta_init
         self.previous_solution = None
         self.previous_accel = 0.0
+        self.fallback_tracker.previous_steer = clamp(delta_init / MPC_DELTA_MAX_RAD, -1.0, 1.0)
         self.fallback_tracker.previous_accel = 0.0
+        self.fallback_tracker.previous_delta = delta_init
+        self._soft_reset_guess, kept_steps = self._build_soft_reset_guess(
+            old_solution,
+            delta_init,
+            keep_solution_steps,
+        )
+        self._soft_reset_guess_uses_remaining = LTV_MPC_SOFT_RESET_USES if self._soft_reset_guess else 0
+        self._soft_reset_hold_delta_cmd = delta_init
+        self._soft_reset_hold_frames_remaining = LTV_MPC_SOFT_RESET_HOLD_FRAMES
+        self.last_reset_debug = {
+            "source": source,
+            "delta_init": delta_init,
+            "steer_init": clamp(delta_init / MPC_DELTA_MAX_RAD, -1.0, 1.0),
+            "kept_solution_steps": kept_steps,
+            "guess_uses": self._soft_reset_guess_uses_remaining,
+            "hold_frames": self._soft_reset_hold_frames_remaining,
+        }
 
     def control(self, ego_vehicle, trajectory, target_speed):
-        if scipy_minimize is None:
-            return self._fallback(ego_vehicle, trajectory, target_speed, "scipy unavailable")
         if not getattr(trajectory, "is_route_relative", False):
             return self._fallback(ego_vehicle, trajectory, target_speed, "trajectory is not route-relative")
+        if self._soft_reset_hold_frames_remaining > 0:
+            return self._soft_reset_hold_control(ego_vehicle, target_speed)
+        if scipy_minimize is None:
+            return self._fallback(ego_vehicle, trajectory, target_speed, "scipy unavailable")
 
         initial_state = self._initial_state(ego_vehicle, trajectory)
         if initial_state is None:
@@ -1024,7 +1096,7 @@ class LTVMPCTracker:
             return self._fallback(ego_vehicle, trajectory, target_speed, "solver exception: {}".format(exc))
 
         solve_time = time.perf_counter() - start_time
-        if solve_time > LTV_MPC_SOLVE_TIMEOUT_SECONDS:
+        if solve_time > LTV_MPC_SOLVE_TIMEOUT_SECONDS: # 如果求解时间超过设定的阈值，则使用备用控制器，并记录警告信息。通过设置求解时间的阈值，可以避免在求解过程中出现过长的延迟，从而提高控制响应的及时性和稳定性。如果求解时间超过阈值，则使用备用控制器来计算控制指令，并记录警告信息以便后续分析和调试。
             return self._fallback(ego_vehicle, trajectory, target_speed, "solver timeout {:.3f}s".format(solve_time))
         if not getattr(result, "success", False):
             return self._fallback(ego_vehicle, trajectory, target_speed, "solver failed")
@@ -1051,11 +1123,26 @@ class LTVMPCTracker:
         self.fallback_tracker.previous_accel = accel
         self.fallback_tracker.previous_delta = self.previous_delta
 
-        throttle = clamp(0.25 + 0.18 * accel, 0.0, 0.65)
-        brake = 0.0
-        return carla.VehicleControl(throttle=throttle, brake=brake, steer=steer)
+        return _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer)
+
+    def _soft_reset_hold_control(self, ego_vehicle, target_speed):
+        delta_cmd = clamp(
+            self._soft_reset_hold_delta_cmd,
+            -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+            LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+        )
+        self._soft_reset_hold_frames_remaining -= 1
+        self.previous_delta_cmd = delta_cmd
+        self.previous_accel = 0.0
+        self.previous_delta = self._advance_delta(self.previous_delta, delta_cmd)
+        steer = clamp(delta_cmd / MPC_DELTA_MAX_RAD, -1.0, 1.0)
+        self.fallback_tracker.previous_steer = steer
+        self.fallback_tracker.previous_accel = 0.0
+        self.fallback_tracker.previous_delta = self.previous_delta
+        return _vehicle_control_from_mpc_steer(ego_vehicle, target_speed, steer)
 
     def _initial_state(self, ego_vehicle, trajectory):
+        """获取MPC预测的初始状态，包括自车在轨迹上的位置、航向角、速度以及之前的转向命令。通过将自车当前位置转换到轨迹的局部坐标系下，可以得到自车在轨迹上的位置和横向偏移，作为MPC预测的初始状态。同时，通过获取自车当前的航向角和速度，可以更准确地描述自车的运动状态，为MPC预测提供更合理的初始条件。最后，通过包含之前的转向命令，可以让MPC预测考虑转向动态的连续性，提高预测结果的稳定性和合理性。"""
         transform = ego_vehicle.get_transform()
         progress0, _ = trajectory.to_local(transform.location)
         yaw0 = yaw_to_rad(transform.rotation)
@@ -1077,6 +1164,13 @@ class LTVMPCTracker:
         return values
 
     def _initial_guess(self):
+        """生成MPC求解的初始猜测，基于之前的求解结果进行平移，如果没有有效的之前解，则使用之前的转向命令和加速度作为初始猜测。通过将之前的求解结果进行平移，可以为当前的MPC求解提供一个更接近最优解的初始猜测，从而提高求解效率和收敛性。如果没有有效的之前解，则使用之前的转向命令和加速度作为初始猜测，以确保MPC求解有一个合理的起点，避免从完全随机的猜测开始求解可能导致的收敛问题。"""
+        if self._soft_reset_guess is not None and self._soft_reset_guess_uses_remaining > 0:
+            guess = list(self._soft_reset_guess)
+            self._soft_reset_guess_uses_remaining -= 1
+            if self._soft_reset_guess_uses_remaining <= 0:
+                self._soft_reset_guess = None
+            return guess
         if self.previous_solution and len(self.previous_solution) == 2 * LTV_MPC_HORIZON_STEPS:
             shifted = list(self.previous_solution[2:])
             shifted.extend(self.previous_solution[-2:])
@@ -1087,7 +1181,36 @@ class LTVMPCTracker:
             guess.append(clamp(self.previous_accel, LTV_MPC_ACCEL_MIN, LTV_MPC_ACCEL_MAX))
         return guess
 
+    def _steer_to_ltv_delta(self, steer):
+        normalized = clamp(float(steer), -LTV_MPC_STEER_LIMIT, LTV_MPC_STEER_LIMIT)
+        return normalized * MPC_DELTA_MAX_RAD
+
+    def _build_soft_reset_guess(self, old_solution, delta_init, keep_solution_steps):
+        guess = []
+        for _ in range(LTV_MPC_HORIZON_STEPS):
+            guess.append(delta_init)
+            guess.append(LTV_MPC_ACCEL_MIN)
+
+        kept_steps = 0
+        if old_solution and len(old_solution) == 2 * LTV_MPC_HORIZON_STEPS and keep_solution_steps > 1:
+            shifted = list(old_solution[2:])
+            shifted.extend(old_solution[-2:])
+            max_steps = min(keep_solution_steps, LTV_MPC_HORIZON_STEPS)
+            for step in range(1, max_steps):
+                old_delta = clamp(
+                    float(shifted[2 * step]),
+                    -LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+                    LTV_MPC_STEER_LIMIT * MPC_DELTA_MAX_RAD,
+                )
+                if abs(old_delta - delta_init) > LTV_MPC_SOFT_RESET_REUSE_DELTA_TOL:
+                    break
+                guess[2 * step] = old_delta
+                guess[2 * step + 1] = clamp(float(shifted[2 * step + 1]), LTV_MPC_ACCEL_MIN, LTV_MPC_ACCEL_MAX)
+                kept_steps += 1
+        return guess, kept_steps
+
     def _objective(self, controls, initial_state, trajectory, target_speed):
+        """MPC求解的目标函数，计算给定控制输入序列下的总成本，包括跟踪误差、控制输入变化、动态约束违反等方面的成本。通过对每个时间步的状态进行预测，并计算与参考轨迹的跟踪误差以及控制输入的变化，可以评估当前控制输入序列的性能和合理性。同时，通过对动态约束的违反进行惩罚，可以确保MPC求解得到的控制输入序列在物理上可行，并避免产生不稳定或不可控的行为。最后，通过将所有成本进行加权求和，得到一个综合的目标函数值，供MPC求解器进行优化。"""
         x, y, yaw, vx, vy, yaw_rate, steer_angle, progress = initial_state
         previous_delta_cmd = self.previous_delta_cmd
         previous_accel = self.previous_accel
@@ -1124,12 +1247,12 @@ class LTVMPCTracker:
 
             cost += 10.0 * lateral_error**2
             cost += 0.25 * longitudinal_error**2
-            cost += 2.2 * yaw_error**2
-            cost += 0.06 * speed_error**2
+            cost += 5.0 * yaw_error**2
+            cost += 0.02 * speed_error**2
             cost += 0.45 * delta_cmd**2
             cost += 0.012 * accel**2
             cost += 1.8 * beta**2
-            cost += 0.12 * yaw_rate**2
+            cost += 0.28 * yaw_rate**2
 
             beta_excess = max(0.0, abs(beta) - MPC_BETA_SOFT_LIMIT)
             yaw_rate_excess = max(0.0, abs(yaw_rate) - MPC_YAW_RATE_SOFT_LIMIT)
@@ -1144,11 +1267,12 @@ class LTVMPCTracker:
             if step == LTV_MPC_HORIZON_STEPS - 1:
                 cost += 22.0 * lateral_error**2
                 cost += 7.0 * yaw_error**2
-                cost += 0.04 * speed_error**2
+                cost += 0.02 * speed_error**2
 
         return cost
 
     def _dynamic_step(self, x, y, yaw, vx, vy, yaw_rate, steer_angle, delta_cmd, accel):
+        """基于线性化的动态自行车模型，预测车辆在给定控制输入下的状态变化。通过计算前轮和后轮的侧滑角，以及相应的侧向力，可以模拟车辆在转向和加速过程中的动态行为。同时，通过考虑低速情况下的特殊处理，可以确保模型在不同速度范围内的稳定性和合理性。最后，通过更新车辆的状态变量，包括位置、航向角、速度和转向角，可以为MPC求解提供准确的状态预测，从而提高控制性能和跟踪精度。"""
         steer_angle = self._advance_delta(steer_angle, delta_cmd)
         if vx < MPC_DYNAMIC_MIN_VX:
             vx = max(0.0, vx + accel * MPC_DT)
@@ -1179,6 +1303,7 @@ class LTVMPCTracker:
         return x, y, yaw, vx, vy, yaw_rate, steer_angle, alpha_f, alpha_r
 
     def _advance_delta(self, current_delta, delta_cmd):
+        """根据当前的转向角和目标转向命令，计算下一个时间步的转向角，考虑转向响应时间和转向速率限制。通过计算转向速率，并将其限制在设定的范围内，可以确保转向角的变化不会过快，从而提高控制的平滑性和稳定性。最后，通过更新当前的转向角，可以为MPC求解提供更准确的状态预测，从而提高控制性能和跟踪精度。"""
         steer_rate = clamp(
             (delta_cmd - current_delta) / MPC_DELTA_RESPONSE_TAU,
             -MPC_DELTA_RATE_LIMIT_RAD,
@@ -1187,6 +1312,7 @@ class LTVMPCTracker:
         return clamp(current_delta + steer_rate * MPC_DT, -MPC_DELTA_MAX_RAD, MPC_DELTA_MAX_RAD)
 
     def _tracking_errors(self, x, y, yaw, ref_location, ref_yaw):
+        """计算车辆当前状态与参考轨迹之间的跟踪误差，包括横向误差、纵向误差和航向误差。通过将车辆当前位置与参考位置进行比较，并考虑参考航向的方向，可以得到车辆在轨迹上的横向和纵向偏移，以及航向角的误差。这些误差可以用于评估MPC求解的性能，并作为目标函数的一部分进行优化，从而提高控制性能和跟踪精度。"""
         dx = x - ref_location.x
         dy = y - ref_location.y
         tangent_x = math.cos(ref_yaw)
@@ -1197,9 +1323,11 @@ class LTVMPCTracker:
         return lateral_error, longitudinal_error, yaw_error
 
     def _solution_unstable(self, initial_state, trajectory, target_speed, controls):
+        """评估MPC求解得到的控制输入序列是否导致车辆状态出现不稳定或不可控的行为。通过对控制输入序列进行动态仿真，并检查预测的状态变量是否出现非有限值或违反动态约束的情况，可以判断求解得到的控制输入序列是否稳定。如果预测过程中出现非有限值或违反约束的情况，则认为求解结果不稳定，应该使用备用控制器来计算控制指令，以确保车辆的安全和稳定性。"""
         return self._objective(controls, initial_state, trajectory, target_speed) >= 1e8
 
     def _fallback(self, ego_vehicle, trajectory, target_speed, reason):
+        """当MPC求解失败或得到不稳定的解时，使用备用控制器来计算控制指令，并记录警告信息。通过设置求解失败的原因，可以帮助后续分析和调试，了解MPC求解失败的具体情况。同时，通过使用备用控制器来计算控制指令，可以确保车辆在MPC求解失败的情况下仍然能够得到合理的控制输入，从而提高系统的鲁棒性和安全性。最后，通过记录警告信息，可以为后续的性能评估和改进提供有价值的数据支持。"""
         if not self._warned_fallback:
             print("LTV-MPC fallback to SamplingMPCTracker: {}".format(reason))
             self._warned_fallback = True
@@ -1209,5 +1337,4 @@ class LTVMPCTracker:
         self.previous_delta = getattr(self.fallback_tracker, "previous_delta", self.previous_delta)
         self.previous_solution = None
         self.fallback_tracker.previous_accel = 0.0
-        control.brake = 0.0
         return control

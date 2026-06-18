@@ -25,18 +25,15 @@ from config import (
     RADAR_ENABLED,
     RADAR_MIN_POINTS_PER_CLUSTER,
     RIGHT_CONFIRM_FRAMES,
-    RIGHT_OBJECT_DETECT_DISTANCE,
     RIGHT_OBJECT_LATERAL_MAX,
     RIGHT_OBJECT_LATERAL_MIN,
     RIGHT_OBJECT_LONGITUDINAL_MAX,
     RIGHT_OBJECT_LONGITUDINAL_MIN,
-    RIGHT_OBJECT_STOP_DISTANCE,
     RIGHT_OBJECT_TTC_THRESHOLD,
     SENSOR_NOISE_ENABLED,
     SIDE_DETECTION_RANGE,
     SIDE_FOV_HALF_ANGLE_DEG,
     SPEED_STD,
-    TTC_AVOID_THRESHOLD,
 )
 from utils import SmoothRouteReference, dot_2d, smooth_reference_for, vector_length
 
@@ -80,8 +77,15 @@ class RightSideObjectReading:
     lateral: float = 0.0
     risk_level: int = 0
     is_moving_toward_conflict: bool = False
-    predicted_ttc: float = float("inf")
     object_type: str = ""
+    decision: str = "normal"
+    cross_s: float = float("inf")
+    t_ego: float = float("inf")
+    x_path: float = float("inf")
+    y_path: float = float("inf")
+    y_rel: float = float("inf")
+    line_ttc: float = float("inf")
+    y_safe: float = 0.0
 
 
 @dataclass
@@ -142,10 +146,11 @@ class TrackingRoute:
 
     @classmethod
     def from_loop_route(cls, loop_route):
+        """ 基于 CARLA 的 LoopRoute 构建跟踪路线，提取其路径点并生成平滑参考；如果输入的 loop_route 无效，则返回 None。通过从 LoopRoute 中提取路径点，并生成一个平滑的参考，可以为前车投影筛选提供一个更准确和连续的路径参考，从而提高前车检测的稳定性和准确性。如果输入的 loop_route 无效，则返回 None，表示无法构建有效的跟踪路线。"""
         if loop_route is None:
             return None
         step = max(loop_route.step_distance, 0.001)
-        return cls(
+        return cls( # 基于 CARLA 的 LoopRoute 构建跟踪路线，提取其路径点并生成平滑参考；如果输入的 loop_route 无效，则返回 None。通过从 LoopRoute 中提取路径点，并生成一个平滑的参考，可以为前车投影筛选提供一个更准确和连续的路径参考，从而提高前车检测的稳定性和准确性。如果输入的 loop_route 无效，则返回 None，表示无法构建有效的跟踪路线。
             loop_route.points,
             reference=smooth_reference_for(loop_route),
             loop_route=loop_route,
@@ -204,7 +209,7 @@ def _compose_tracking_points(base_route, segments):
     cursor = 0.0
     current_offset = 0.0
 
-    for segment in sorted_segments:
+    for segment in sorted_segments: # 根据替换区间列表和基础路线，生成最终的跟踪路线点列表。通过遍历替换区间列表，并将每个替换区间内的路径点插入到基础路线的对应位置，可以生成一个包含所有替换区间的最终跟踪路线点列表。最后返回这个点列表，供后续构建跟踪路线对象使用。
         start_s = max(0.0, min(segment.start_s, max_s))
         end_s = max(start_s, min(segment.end_s, max_s))
         _append_base_samples(points, base_route, cursor, start_s, step, current_offset)
@@ -639,11 +644,7 @@ class VirtualGroundTruthSensor:
                 continue
             if best_nearby is None or reading.distance < best_nearby.distance:
                 best_nearby = reading
-            if reading.is_conflict_object and (
-                best_conflict is None
-                or reading.risk_level > best_conflict.risk_level
-                or (reading.risk_level == best_conflict.risk_level and reading.ttc < best_conflict.ttc)
-            ):
+            if reading.is_conflict_object and (best_conflict is None or reading.ttc < best_conflict.ttc):
                 best_conflict = reading
 
         if best_conflict is not None and best_conflict.is_conflict_object:
@@ -657,6 +658,7 @@ class VirtualGroundTruthSensor:
         if result.is_conflict_object and self._right_confirm_count < self._right_confirm_frames:
             result.is_conflict_object = False
             result.risk_level = min(result.risk_level, 1)
+            result.decision = "normal"
         return result
 
     def side_vehicle(self, side="left"):
@@ -744,8 +746,7 @@ class VirtualGroundTruthSensor:
             ego_velocity.z - scenario.velocity.z,
         )
         closing_speed = dot_2d(relative_speed, to_object)
-        noisy_closing_speed = self._add_noise(closing_speed, SPEED_STD)
-        ttc = noisy_distance / noisy_closing_speed if noisy_closing_speed > 0.1 else float("inf")
+        ttc = distance / closing_speed if closing_speed > 0.1 else float("inf")
 
         object_type = ""
         if getattr(scenario, "is_walker", False):
@@ -758,38 +759,22 @@ class VirtualGroundTruthSensor:
             and RIGHT_OBJECT_LATERAL_MIN <= lateral <= RIGHT_OBJECT_LATERAL_MAX
         )
         is_conflict = scenario.is_active and scenario.is_conflict_window(route_index) and in_geometry_gate
-        is_moving_toward = False
-        predicted_ttc = float("inf")
-        if is_conflict:
-            ego_speed = vector_length(ego_velocity)
-            object_forward_speed = dot_2d(scenario.velocity, forward)
-            relative_long_speed = ego_speed - object_forward_speed
-            if relative_long_speed > 0.5 and longitudinal > 0.0:
-                is_moving_toward = True
-                predicted_ttc = longitudinal / relative_long_speed
-                predicted_ttc = self._add_noise(predicted_ttc, 0.3)
-            elif RIGHT_OBJECT_LATERAL_MIN < lateral < 10.0:
-                is_moving_toward = True
+        is_dangerous = is_conflict and ttc < RIGHT_OBJECT_TTC_THRESHOLD
 
         risk_level = 0
-        if is_conflict:
-            if ttc < RIGHT_OBJECT_TTC_THRESHOLD or predicted_ttc < TTC_AVOID_THRESHOLD:
-                risk_level = 3
-            elif noisy_distance < RIGHT_OBJECT_STOP_DISTANCE:
-                risk_level = 2
-            elif noisy_distance < RIGHT_OBJECT_DETECT_DISTANCE:
-                risk_level = 1
+        if is_dangerous:
+            risk_level = 3
 
         return RightSideObjectReading(
             distance=noisy_distance,
             ttc=ttc,
-            is_conflict_object=is_conflict,
+            is_conflict_object=is_dangerous,
             actor_id=scenario.actor.id,
             actor_role=getattr(scenario, "name", scenario.actor.type_id),
             longitudinal=noisy_longitudinal,
             lateral=noisy_lateral,
             risk_level=risk_level,
-            is_moving_toward_conflict=is_moving_toward,
-            predicted_ttc=predicted_ttc,
+            is_moving_toward_conflict=is_dangerous,
             object_type=object_type,
+            line_ttc=ttc,
         )

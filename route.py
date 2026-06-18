@@ -50,6 +50,7 @@ class LoopRoute:
         self.right_lane_before_turn = self.right_lane_prepare_index is not None
 
     def _select_next_waypoint(self, waypoint, next_waypoints):
+        """在多个候选路点中选择下一个路点，优先选择 TOWN10_SHORT_LOOP_BRANCH_OVERRIDES 中指定的路点。"""
         preferred_road = TOWN10_SHORT_LOOP_BRANCH_OVERRIDES.get((waypoint.road_id, waypoint.lane_id))
         if preferred_road is not None:
             for candidate in next_waypoints:

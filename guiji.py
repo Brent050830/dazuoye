@@ -47,11 +47,12 @@ from config import ( # 仿真参数配置，包括服务器连接、仿真时间
     RADAR_FOV_VERTICAL_DEG,
     RADAR_POINTS_PER_SECOND,
     RADAR_RANGE,
-    RIGHT_OBJECT_DETECT_DISTANCE,
-    RIGHT_OBJECT_STOP_RELEASE_DISTANCE,
-    RIGHT_OBJECT_STOP_DISTANCE,
+    RIGHT_OBJECT_CROSS_X_MARGIN,
+    RIGHT_OBJECT_EGO_TIME_MIN_SPEED,
+    RIGHT_OBJECT_PATH_LOOKAHEAD,
+    RIGHT_OBJECT_PATH_SAMPLE_STEP,
+    RIGHT_OBJECT_PASS_MARGIN,
     RIGHT_OBJECT_TTC_THRESHOLD,
-    RIGHT_OBJECT_YIELD_SPEED,
     ROUTE_COMPLETION_HOLD_SECONDS,
     SIM_SECONDS,
     TRAFFIC_RANDOM_SEED,
@@ -61,11 +62,15 @@ from control import select_best_route_offset_trajectory, select_return_to_base_t
 from display import CollisionMonitor, PygameDemoDisplay # 碰撞监测和仿真显示实现
 from perception import VirtualGroundTruthSensor # 虚拟传感器实现，提供前车和右侧过街物体的距离、TTC 等信息
 from route import LoopRoute # 固定路线实现，提供路线点、航向和转弯信息
-from utils import get_speed, smooth_reference_for, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
+from utils import clamp, get_speed, normalize_angle, smooth_reference_for, speed_control, waypoint_steer # 工具函数，包括获取速度、速度控制和航向控制等
 
 RIGHT_OBJECT_CLEAR_HOLD_SECONDS = 2.0
 PLAN_RETRY_LOG_INTERVAL = 1.0
 RETURN_TO_BASE_CLEARANCE = 2.0
+CONTROL_DEBUG_STEER_JUMP = 0.22
+CONTROL_DEBUG_MIN_INTERVAL = 0.25
+CONTROL_MPC_EXIT_BLEND_SECONDS = 0.25
+CONTROL_MPC_EXIT_BLEND_MIN_DELTA = 0.08
 
 
 @dataclass
@@ -150,14 +155,41 @@ def set_spectator(world, ego_vehicle):
     )
 
 
-def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_time):
+def tracking_route_lateral_slope(loop_route, ego_vehicle, tracking_route, base_route_s):
+    """计算当前跟踪路线在自车位置的航向相对于基础路线的横向坡度，用于辅助判断转向时机和评估转向安全性。"""
+    if tracking_route is None or not tracking_route.is_valid:
+        return 0.0
+    try:
+        active_route_s, _ = tracking_route.to_local(ego_vehicle.get_location())
+        active_yaw = tracking_route.reference_yaw_at(active_route_s)
+        base_yaw = smooth_reference_for(loop_route).yaw_at_route_s(base_route_s)
+        return clamp(math.tan(normalize_angle(active_yaw - base_yaw)), -0.60, 0.60)
+    except Exception:
+        return 0.0
+
+
+def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=None):
     """生成一个可替换当前基础路线 s 区间的避障路径段。"""
     target_speed = 0.0 if front.actor_role == "lead" else max(0.0, getattr(front, "target_speed_along", 0.0))
     predicted_motion = target_speed * min(3.0, max(1.0, front.distance / max(front.closing_speed, 0.1)))
-    base_length = max(14.0, min(52.0, LANE_CHANGE_LENGTH + predicted_motion))
+    d_clear = front.distance + predicted_motion
+    if not math.isfinite(d_clear):
+        d_clear = LANE_CHANGE_LENGTH + predicted_motion
+    base_length = clamp(d_clear, 6.0, 52.0)
+    base_projection = project_actor_to_base_route(loop_route, ego_vehicle)
+    start_lateral_slope = tracking_route_lateral_slope(
+        loop_route, ego_vehicle, tracking_route, base_projection["route_s"]
+    )
     start_time = time.perf_counter()
     best_candidate, candidates, diagnostics = select_best_route_offset_trajectory(
-        loop_route, ego_vehicle, front, base_length, obstacle_actors=obstacle_actors
+        loop_route,
+        ego_vehicle,
+        front,
+        base_length,
+        obstacle_actors=obstacle_actors,
+        start_route_s=base_projection["route_s"],
+        start_offset=base_projection["lateral"],
+        start_lateral_slope=start_lateral_slope,
     )
     diagnostics["elapsed_ms"] = (time.perf_counter() - start_time) * 1000.0
     print_avoidance_candidate_summary(best_candidate, candidates, show_rejection_samples=True) # 打印候选路径数量、筛选结果和最终选中的关键参数，便于分析避障轨迹的生成和选择过程
@@ -165,11 +197,12 @@ def plan_route_replacement(loop_route, ego_vehicle, front, obstacle_actors, sim_
     selected_trajectory = best_candidate.trajectory if best_candidate is not None else None
     if selected_trajectory is not None:
         print(
-            "Route replacement planned at {:.2f}s: s={:.1f}-{:.1f}, peak_offset={:.2f}m, transition_ratio={:.2f}, target={}, distance={:.1f}m, TTC={:.2f}s".format(
+            "Route replacement planned at {:.2f}s: s={:.1f}-{:.1f}, peak_offset={:.2f}m, start_slope={:.3f}, transition_ratio={:.2f}, target={}, distance={:.1f}m, TTC={:.2f}s".format(
                 sim_time,
                 best_candidate.start_route_s,
                 best_candidate.end_route_s,
                 best_candidate.target_offset,
+                best_candidate.start_lateral_slope,
                 best_candidate.transition_ratio,
                 right_object_label(front),
                 front.distance,
@@ -187,6 +220,9 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
     active_lateral = None
     if tracking_route is not None and tracking_route.is_valid:
         active_route_s, active_lateral = tracking_route.to_local(ego_vehicle.get_location())
+    start_lateral_slope = tracking_route_lateral_slope(
+        loop_route, ego_vehicle, tracking_route, base_projection["route_s"]
+    )
     best_candidate, candidates, diagnostics = select_return_to_base_trajectory(
         loop_route,
         ego_vehicle,
@@ -194,6 +230,7 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
         obstacle_actors=obstacle_actors,
         start_route_s=base_projection["route_s"],
         start_offset=base_projection["lateral"],
+        start_lateral_slope=start_lateral_slope,
         active_route_s=active_route_s,
         active_lateral=active_lateral,
     )
@@ -202,11 +239,12 @@ def plan_return_to_base(loop_route, ego_vehicle, obstacle_actors, sim_time, trac
     print_planning_diagnostics("return", diagnostics)
     if best_candidate is not None:
         print(
-            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, active_s={}, active_d={}, length={:.1f}m, transition_ratio={:.2f}.".format(
+            "Return-to-base planned at {:.2f}s: s={:.1f}-{:.1f}, start_offset={:.2f}m, start_slope={:.3f}, active_s={}, active_d={}, length={:.1f}m, transition_ratio={:.2f}.".format(
                 sim_time,
                 best_candidate.start_route_s,
                 best_candidate.end_route_s,
                 best_candidate.start_offset,
+                best_candidate.start_lateral_slope,
                 "{:.1f}".format(active_route_s) if active_route_s is not None else "n/a",
                 "{:.2f}".format(active_lateral) if active_lateral is not None else "n/a",
                 best_candidate.length,
@@ -355,22 +393,40 @@ def front_emergency_brake_needed(front_decision):
 
 
 def apply_route_replacement(sensor, candidate):
+    """将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。"""
     if candidate is None or candidate.trajectory is None:
         return None
     trajectory = candidate.trajectory
-    sensor.apply_replacement_segment(
-        candidate.start_route_s,
-        candidate.end_route_s,
-        trajectory.replacement_points(DEBUG_DRAW_TRAJECTORY_STEP),
+    sensor.apply_replacement_segment( # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        candidate.start_route_s, # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        candidate.end_route_s, # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
+        trajectory.replacement_points(DEBUG_DRAW_TRAJECTORY_STEP), # 将选中的避障路径段应用到当前基础路线的替换区间，更新传感器的路线参考。通过调用传感器的 apply_replacement_segment 方法，将选中的避障路径段应用到当前基础路线的指定 s 区间，并设置相应的目标横向偏移，从而更新传感器的路线参考，使其能够在后续的控制和规划过程中考虑新的避障路径段。最后，返回应用了避障路径段后的轨迹对象，供后续使用。
         end_offset=candidate.target_offset,
     )
     return trajectory
 
 
-def reset_mpc_plan_after_route_change(mpc):
+def reset_mpc_plan_after_route_change(mpc, last_steer=None, sim_time=None):
     reset_plan = getattr(mpc, "reset_plan", None)
     if callable(reset_plan):
-        reset_plan()
+        reset_plan(last_steer=last_steer)
+        reset_debug = getattr(mpc, "last_reset_debug", None)
+        if reset_debug:
+            prefix = "MPC soft reset"
+            if sim_time is not None:
+                prefix += " at {:.2f}s".format(sim_time)
+            print(
+                "{}: source={}, last_steer={}, delta_init={}rad, steer_init={}, kept_steps={}, guess_uses={}, hold_frames={}.".format(
+                    prefix,
+                    reset_debug.get("source"),
+                    _format_float(last_steer),
+                    _format_float(reset_debug.get("delta_init"), 3),
+                    _format_float(reset_debug.get("steer_init")),
+                    reset_debug.get("kept_solution_steps"),
+                    reset_debug.get("guess_uses"),
+                    reset_debug.get("hold_frames"),
+                )
+            )
 
 
 def make_avoidance_target(front, obstacle_actors, target_offset):
@@ -443,6 +499,200 @@ def right_object_label(reading):
     if reading.actor_id is None:
         return "none"
     return "{}#{}".format(reading.actor_role or "actor", reading.actor_id)
+
+
+def _format_float(value, digits=2):
+    if value is None:
+        return "none"
+    return "{:.{}f}".format(value, digits) if math.isfinite(value) else "inf"
+
+
+def print_right_object_decision(action, sim_time, right_object, route_index):
+    print(
+        "Right object decision {} at {:.2f}s: decision={}, target={}, TTC={}s, cross_s={}m, "
+        "t_ego={}s, x_path={}m, y_path={}m, y_rel={}m, Y_safe={}m, distance={}m, actor_id={}, route_index={}.".format(
+            action,
+            sim_time,
+            right_object.decision,
+            right_object_label(right_object),
+            _format_float(right_object.line_ttc),
+            _format_float(right_object.cross_s),
+            _format_float(right_object.t_ego),
+            _format_float(right_object.x_path),
+            _format_float(right_object.y_path),
+            _format_float(right_object.y_rel),
+            _format_float(right_object.y_safe),
+            _format_float(right_object.distance),
+            right_object.actor_id,
+            route_index,
+        )
+    )
+
+
+def print_control_switch_debug(
+    sim_time,
+    reason,
+    ego_vehicle,
+    tracking_route,
+    base_route_s,
+    mpc_tracking_until_s,
+    current_offset,
+    use_mpc_tracking,
+    route_changed_this_frame,
+    target_speed,
+    ego_control,
+    steer_delta,
+    right_object_decision,
+    raw_steer=None,
+    blend_alpha=None,
+    blend_source_steer=None,
+):
+    progress = float("inf")
+    lateral = float("inf")
+    if tracking_route is not None and getattr(tracking_route, "is_valid", False):
+        try:
+            progress, lateral = tracking_route.to_local(ego_vehicle.get_location())
+        except Exception:
+            pass
+    print(
+        "Control tracking debug at {:.2f}s [{}]: route_changed={}, use_mpc={}, base_s={}m, "
+        "mpc_until={}m, track_s={}m, track_d={}m, current_offset={}m, ego_speed={}m/s, "
+        "target_speed={}m/s, steer={:+.2f}, raw_steer={}, blend_alpha={}, blend_source={}, "
+        "steer_delta={:+.2f}, brake={:.2f}, right_decision={}.".format(
+            sim_time,
+            reason,
+            route_changed_this_frame,
+            use_mpc_tracking,
+            _format_float(base_route_s),
+            _format_float(mpc_tracking_until_s),
+            _format_float(progress),
+            _format_float(lateral),
+            _format_float(current_offset),
+            _format_float(get_speed(ego_vehicle)),
+            _format_float(target_speed),
+            ego_control.steer,
+            _format_float(raw_steer),
+            _format_float(blend_alpha),
+            _format_float(blend_source_steer),
+            steer_delta,
+            ego_control.brake,
+            right_object_decision,
+        )
+    )
+
+
+def find_right_object_scenario(right_object_scenarios, actor_id):
+    if actor_id is None:
+        return None
+    for scenario in right_object_scenarios:
+        actor = getattr(scenario, "actor", None)
+        if actor is not None and actor.is_alive and actor.id == actor_id:
+            return scenario
+    return None
+
+
+def _right_object_default_decision(right_object, decision="brake", y_safe=0.0):
+    right_object.decision = decision
+    right_object.cross_s = float("inf")
+    right_object.t_ego = float("inf")
+    right_object.x_path = float("inf")
+    right_object.y_path = float("inf")
+    right_object.y_rel = float("inf")
+    right_object.y_safe = y_safe
+    right_object.risk_level = 2 if decision == "pass" else (3 if decision == "brake" else 0)
+    return decision
+
+
+def _right_object_axes(scenario):
+    actor = getattr(scenario, "actor", None)
+    if actor is None or not actor.is_alive:
+        return None
+    velocity = getattr(scenario, "velocity", actor.get_velocity())
+    speed = math.hypot(velocity.x, velocity.y)
+    if speed > 0.2:
+        ey_x = velocity.x / speed
+        ey_y = velocity.y / speed
+    else:
+        forward = actor.get_transform().get_forward_vector()
+        forward_length = math.hypot(forward.x, forward.y)
+        if forward_length <= 0.01:
+            return None
+        ey_x = forward.x / forward_length
+        ey_y = forward.y / forward_length
+    ex_x = -ey_y
+    ex_y = ey_x
+    object_speed_y = velocity.x * ey_x + velocity.y * ey_y
+    return ex_x, ex_y, ey_x, ey_y, object_speed_y
+
+
+def _route_sample_context(ego_vehicle, loop_route, tracking_route):
+    ego_location = ego_vehicle.get_location()
+    if tracking_route is not None and getattr(tracking_route, "is_valid", False):
+        try:
+            start_s, _ = tracking_route.to_local(ego_location)
+            end_s = min(tracking_route.length, start_s + RIGHT_OBJECT_PATH_LOOKAHEAD)
+            return start_s, end_s, tracking_route.location_at
+        except Exception:
+            pass
+
+    reference = smooth_reference_for(loop_route)
+    center_s = loop_route.last_index * loop_route.step_distance
+    projection = reference.project(
+        ego_location,
+        center_s,
+        search_back=20.0,
+        search_ahead=60.0,
+    )
+    start_s = reference.clamp_s(projection["route_s"])
+    end_s = min(reference.max_s, start_s + RIGHT_OBJECT_PATH_LOOKAHEAD)
+    return start_s, end_s, reference.location_at_route_s
+
+
+def decide_right_object_by_route(right_object, right_object_scenarios, ego_vehicle, loop_route, tracking_route):
+    scenario = find_right_object_scenario(right_object_scenarios, right_object.actor_id)
+    actor = getattr(scenario, "actor", None) if scenario is not None else None
+    if actor is None or not actor.is_alive:
+        return _right_object_default_decision(right_object, "brake")
+
+    axes = _right_object_axes(scenario)
+    ego_half_length, ego_half_width = vehicle_half_extents(ego_vehicle)
+    object_half_length, object_half_width = vehicle_half_extents(actor)
+    x_safe = ego_half_width + object_half_width + RIGHT_OBJECT_CROSS_X_MARGIN
+    y_safe = ego_half_length + object_half_length + RIGHT_OBJECT_PASS_MARGIN
+    if axes is None:
+        return _right_object_default_decision(right_object, "brake", y_safe)
+
+    ex_x, ex_y, ey_x, ey_y, object_speed_y = axes
+    actor_location = actor.get_location()
+    start_s, end_s, location_at = _route_sample_context(ego_vehicle, loop_route, tracking_route)
+    if end_s <= start_s:
+        return _right_object_default_decision(right_object, "brake", y_safe)
+
+    ego_time_speed = max(get_speed(ego_vehicle), RIGHT_OBJECT_EGO_TIME_MIN_SPEED)
+    sample_count = max(1, int(math.ceil((end_s - start_s) / max(RIGHT_OBJECT_PATH_SAMPLE_STEP, 0.2))))
+    for index in range(sample_count + 1):
+        route_s = min(end_s, start_s + index * (end_s - start_s) / sample_count)
+        route_distance = max(0.0, route_s - start_s)
+        route_location = location_at(route_s)
+        relative = route_location - actor_location
+        x_path = relative.x * ex_x + relative.y * ex_y
+        if abs(x_path) >= x_safe:
+            continue
+        y_path = relative.x * ey_x + relative.y * ey_y
+        t_ego = route_distance / ego_time_speed
+        y_rel = y_path - object_speed_y * t_ego
+        decision = "pass" if y_rel > y_safe else "brake"
+        right_object.decision = decision
+        right_object.cross_s = route_s
+        right_object.t_ego = t_ego
+        right_object.x_path = x_path
+        right_object.y_path = y_path
+        right_object.y_rel = y_rel
+        right_object.y_safe = y_safe
+        right_object.risk_level = 2 if decision == "pass" else 3
+        return decision
+
+    return _right_object_default_decision(right_object, "brake", y_safe)
 
 
 def draw_debug_marker(world, location, color, life_time=DEBUG_DRAW_LIFETIME):
@@ -579,12 +829,19 @@ def main(args=None):
         route_completion_time = None
         right_object_stop_active = False
         last_right_object_actor_id = None
+        last_right_object_decision = "normal"
+        last_right_object_debug_time = -float("inf")
         right_object_clear_since = None
         last_plan_failure_log_time = -999.0
         avoidance_candidates = []
         debug_plan_draw_until_time = -999.0
         active_avoidance_target = None
         mpc_tracking_until_s = None
+        last_use_mpc_tracking = False
+        last_control_steer = 0.0
+        last_control_debug_time = -float("inf")
+        mpc_exit_blend_start_time = None
+        mpc_exit_blend_start_steer = 0.0
         obstacle_actors = [lead_vehicle] + [controller.actor for controller in background_vehicles]
 
         if args.free_run:
@@ -670,14 +927,11 @@ def main(args=None):
                 not front_limit.front_conflict
                 or front_limit.s_clear > front_limit.d_brake + FRONT_BRAKE_RELEASE_MARGIN
             )
-            right_object_risk = ( # 判断右侧过街物体是否构成风险，基于物体是否为避让对象，以及其 TTC、距离和风险等级等信息来决定，如果物体是需要避让的，并且 TTC 或距离 低于设定的阈值，或者风险等级较高，则认为存在风险，需要进行避让
+            right_object_risk = (
                 right_object.is_conflict_object
-                and (
-                    right_object.risk_level >= 2
-                    or right_object.ttc < RIGHT_OBJECT_TTC_THRESHOLD
-                    or right_object.distance < RIGHT_OBJECT_DETECT_DISTANCE
-                )
+                and right_object.ttc < RIGHT_OBJECT_TTC_THRESHOLD
             )
+            right_object_decision = "normal"
 
             route_changed_this_frame = False
 
@@ -693,11 +947,11 @@ def main(args=None):
                     )
                 elif planning_needed: # 如果仍然需要规划避障，则尝试生成替换路线，如果成功生成则切换回正常跟随状态并应用替换路线，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
                     best_candidate, avoidance_candidates = plan_route_replacement(
-                        loop_route, ego_vehicle, front, obstacle_actors, sim_time
+                        loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=sensor.tracking_route()
                     )
                     selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                     if selected_plan_trajectory is not None:
-                        reset_mpc_plan_after_route_change(mpc)
+                        reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                         active_avoidance_target = make_avoidance_target(
                             front, obstacle_actors, best_candidate.target_offset
                         )
@@ -728,7 +982,7 @@ def main(args=None):
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成返回基础路线的替换路径段，则应用该路径段作为新的跟踪路线，同时清除当前的避让目标，更新 MPC 跟踪的截止点，并打印相关日志；如果需要规划但没有成功生成替换路线，并且满足日志间隔条件，则打印当前规划失败的状态和相关信息
-                    reset_mpc_plan_after_route_change(mpc)
+                    reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                     mpc_tracking_until_s = best_candidate.end_route_s + 2.0
                     print(
                         "Avoidance target passed, returning to base route at {:.2f}s: target={}, offset={:.2f}m.".format(
@@ -751,11 +1005,11 @@ def main(args=None):
 
             if state == "ROUTE_FOLLOW" and planning_needed and not route_changed_this_frame: # 如果当前状态是正常跟随，并且需要进行前车避障规划，并且当前帧还没有进行路线切换，则尝试生成替换路线，如果成功生成则应用替换路线并更新相关状态和日志，否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
                 best_candidate, avoidance_candidates = plan_route_replacement(
-                    loop_route, ego_vehicle, front, obstacle_actors, sim_time
+                    loop_route, ego_vehicle, front, obstacle_actors, sim_time, tracking_route=sensor.tracking_route()
                 )
                 selected_plan_trajectory = apply_route_replacement(sensor, best_candidate)
                 if selected_plan_trajectory is not None: # 如果成功生成替换路线，则应用替换路线并更新相关状态和日志；否则如果仍然需要紧急制动且没有替换路线可用，则保持在紧急制动状态，并根据设定的日志间隔打印当前状态和风险信息
-                    reset_mpc_plan_after_route_change(mpc)
+                    reset_mpc_plan_after_route_change(mpc, last_control_steer, sim_time)
                     active_avoidance_target = make_avoidance_target(
                         front, obstacle_actors, best_candidate.target_offset
                     )
@@ -786,20 +1040,32 @@ def main(args=None):
                             )
                             last_plan_failure_log_time = sim_time
 
-            if right_object_risk: # 如果右侧过街物体构成风险，首先判断是否发生了目标切换，如果发生了目标切换则打印相关日志；然后重置右侧物体清除计时器；如果右侧过街物体不再构成风险但之前存在一个有效的目标，则启动清除计时器，如果清除计时器达到设定的保持时间，则认为避让完成，重置相关状态并打印完成日志
-                if last_right_object_actor_id != right_object.actor_id:
-                    action = "started" if last_right_object_actor_id is None else "target changed"
-                    print(
-                        "Right object yield {} at {:.2f}s: target={}, distance={:.1f}m, TTC={:.2f}s, route_index={}.".format(
-                            action,
-                            sim_time,
-                            right_object_label(right_object),
-                            right_object.distance,
-                            right_object.ttc if math.isfinite(right_object.ttc) else 99.99,
-                            loop_route.last_index,
-                        )
-                    )
+            if right_object_risk:
+                right_object_decision = decide_right_object_by_route(
+                    right_object,
+                    right_object_scenarios,
+                    ego_vehicle,
+                    loop_route,
+                    sensor.tracking_route(),
+                )
+            else:
+                right_object.decision = "normal"
+                right_object.risk_level = 0
+
+            if right_object_risk: # 如果右侧过街物体构成风险，记录最危险目标的 pass/brake 决策；如果风险解除，则启动清除保持计时器，避免刹车抖动
+                target_changed = last_right_object_actor_id != right_object.actor_id
+                decision_changed = last_right_object_decision != right_object_decision
+                if target_changed or decision_changed or sim_time - last_right_object_debug_time >= 1.0:
+                    if target_changed:
+                        action = "started" if last_right_object_actor_id is None else "target changed"
+                    elif decision_changed:
+                        action = "changed"
+                    else:
+                        action = "debug"
+                    print_right_object_decision(action, sim_time, right_object, loop_route.last_index)
                     last_right_object_actor_id = right_object.actor_id
+                    last_right_object_decision = right_object_decision
+                    last_right_object_debug_time = sim_time
                 right_object_clear_since = None
             elif last_right_object_actor_id is not None:
                 if right_object_clear_since is None:
@@ -807,8 +1073,19 @@ def main(args=None):
                 elif sim_time - right_object_clear_since >= RIGHT_OBJECT_CLEAR_HOLD_SECONDS:
                     right_object_stop_active = False
                     last_right_object_actor_id = None
+                    last_right_object_decision = "normal"
                     right_object_clear_since = None
-                    print("Right object yield completed at {:.2f}s.".format(sim_time))
+                    print("Right object decision completed at {:.2f}s.".format(sim_time))
+
+            target_speed = 0.0
+            tracking_route_for_control = sensor.tracking_route()
+            base_route_s = base_route_s_for_decision
+            use_mpc_tracking = False
+            raw_control_steer = 0.0
+            mpc_exit_blend_alpha = None
+            mpc_exit_blend_started = False
+            mpc_exit_blend_active = False
+            mpc_exit_blend_source_steer = None
 
             if route_completion_time is not None: # 如果已经完成了一圈路线，则保持在原地等待，应用全制动控制命令，油门为0，制动为1，方向盘不转动
                 ego_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
@@ -820,23 +1097,21 @@ def main(args=None):
                 target_speed = EGO_TARGET_SPEED
                 if front_slowdown_needed:
                     target_speed = min(target_speed, max(0.0, ego_speed - FRONT_PLANNING_RETRY_SPEED_DROP))
-                if right_object_risk or right_object_clear_since is not None or right_object_stop_active:
-                    target_speed = min(target_speed, RIGHT_OBJECT_YIELD_SPEED)
 
-                tracking_route = sensor.tracking_route()
+                tracking_route_for_control = sensor.tracking_route()
                 base_route_s = project_actor_to_base_route(loop_route, ego_vehicle)["route_s"]
                 if mpc_tracking_until_s is not None and base_route_s > mpc_tracking_until_s:
                     mpc_tracking_until_s = None
                 replacement_segment_active = mpc_tracking_until_s is not None
                 offset_route_active = abs(sensor.current_offset()) > 0.05
                 use_mpc_tracking = (
-                    tracking_route is not None
-                    and tracking_route.is_valid
+                    tracking_route_for_control is not None
+                    and tracking_route_for_control.is_valid
                     and (replacement_segment_active or offset_route_active)
                 )
 
                 if use_mpc_tracking:
-                    ego_control = mpc.control(ego_vehicle, tracking_route, target_speed)
+                    ego_control = mpc.control(ego_vehicle, tracking_route_for_control, target_speed)
                 else:
                     throttle, brake = speed_control(ego_speed, target_speed)
                     ego_control = carla.VehicleControl(
@@ -844,27 +1119,22 @@ def main(args=None):
                         brake=brake,
                         steer=loop_route.steer(ego_vehicle),
                     )
+                raw_control_steer = ego_control.steer
 
                 if front_slowdown_needed: # 如果需要前车慢行但不需要紧急制动，则确保至少施加一定的制动值，并且油门为0，以实现减速效果
                     ego_control.brake = max(ego_control.brake, 0.20)
                     ego_control.throttle = 0.0
 
-                if right_object_risk and not right_object_stop_active and right_object.distance < RIGHT_OBJECT_STOP_DISTANCE:
+                if right_object_decision == "brake" and not right_object_stop_active:
                     right_object_stop_active = True
                     print(
-                        "Right object hard stop engaged at {:.2f}s: target={}, distance={:.1f}m.".format(
-                            sim_time, right_object_label(right_object), right_object.distance
-                        )
-                    )
-                elif (
-                    right_object_stop_active
-                    and right_object.actor_id is not None
-                    and right_object.distance > RIGHT_OBJECT_STOP_RELEASE_DISTANCE
-                ):
-                    right_object_stop_active = False
-                    print(
-                        "Right object hard stop released at {:.2f}s: target={}, distance={:.1f}m.".format(
-                            sim_time, right_object_label(right_object), right_object.distance
+                        "Right object hard stop engaged at {:.2f}s: target={}, decision={}, TTC={}s, cross_s={}m, t_ego={}s.".format(
+                            sim_time,
+                            right_object_label(right_object),
+                            right_object_decision,
+                            _format_float(right_object.line_ttc),
+                            _format_float(right_object.cross_s),
+                            _format_float(right_object.t_ego),
                         )
                     )
 
@@ -875,6 +1145,96 @@ def main(args=None):
                 if right_object_stop_active or clear_waiting:
                     ego_control.throttle = 0.0
                     ego_control.brake = max(ego_control.brake, 0.85)
+
+            if route_completion_time is not None or state == "EMERGENCY_BRAKE":
+                mpc_exit_blend_start_time = None
+            elif use_mpc_tracking:
+                mpc_exit_blend_start_time = None
+            elif last_use_mpc_tracking:
+                steer_gap = abs(raw_control_steer - last_control_steer)
+                if steer_gap >= CONTROL_MPC_EXIT_BLEND_MIN_DELTA:
+                    mpc_exit_blend_start_time = sim_time
+                    mpc_exit_blend_start_steer = last_control_steer
+                    mpc_exit_blend_started = True
+                else:
+                    mpc_exit_blend_start_time = None
+
+            if (
+                mpc_exit_blend_start_time is not None
+                and not use_mpc_tracking
+            ):
+                if ego_control.brake >= 0.80:
+                    mpc_exit_blend_start_time = None
+                else:
+                    blend_elapsed = max(0.0, sim_time - mpc_exit_blend_start_time)
+                    if blend_elapsed <= CONTROL_MPC_EXIT_BLEND_SECONDS:
+                        mpc_exit_blend_alpha = clamp(
+                            blend_elapsed / CONTROL_MPC_EXIT_BLEND_SECONDS,
+                            0.0,
+                            1.0,
+                        )
+                        mpc_exit_blend_source_steer = mpc_exit_blend_start_steer
+                        if (
+                            blend_elapsed > 0.0
+                            and tracking_route_for_control is not None
+                            and getattr(tracking_route_for_control, "is_valid", False)
+                        ):
+                            try:
+                                mpc_exit_control = mpc.control(
+                                    ego_vehicle,
+                                    tracking_route_for_control,
+                                    target_speed,
+                                )
+                                mpc_exit_blend_source_steer = mpc_exit_control.steer
+                            except Exception:
+                                mpc_exit_blend_source_steer = mpc_exit_blend_start_steer
+                        ego_control.steer = clamp(
+                            (1.0 - mpc_exit_blend_alpha) * mpc_exit_blend_source_steer
+                            + mpc_exit_blend_alpha * raw_control_steer,
+                            -1.0,
+                            1.0,
+                        )
+                        mpc_exit_blend_active = True
+                    else:
+                        mpc_exit_blend_start_time = None
+
+            steer_delta = ego_control.steer - last_control_steer
+            debug_reason = None
+            if route_changed_this_frame:
+                debug_reason = "route-change"
+            elif mpc_exit_blend_started:
+                debug_reason = "mpc-exit-blend-start"
+            elif mpc_exit_blend_active and sim_time - last_control_debug_time >= CONTROL_DEBUG_MIN_INTERVAL:
+                debug_reason = "mpc-exit-blend"
+            elif use_mpc_tracking != last_use_mpc_tracking:
+                debug_reason = "mpc-start" if use_mpc_tracking else "mpc-stop"
+            elif (
+                abs(steer_delta) >= CONTROL_DEBUG_STEER_JUMP
+                and sim_time - last_control_debug_time >= CONTROL_DEBUG_MIN_INTERVAL
+            ):
+                debug_reason = "mpc-steer-jump" if use_mpc_tracking else "steer-jump"
+            if debug_reason is not None:
+                print_control_switch_debug(
+                    sim_time,
+                    debug_reason,
+                    ego_vehicle,
+                    tracking_route_for_control,
+                    base_route_s,
+                    mpc_tracking_until_s,
+                    sensor.current_offset(),
+                    use_mpc_tracking,
+                    route_changed_this_frame,
+                    target_speed,
+                    ego_control,
+                    steer_delta,
+                    right_object_decision,
+                    raw_steer=raw_control_steer,
+                    blend_alpha=mpc_exit_blend_alpha,
+                    blend_source_steer=mpc_exit_blend_source_steer,
+                )
+                last_control_debug_time = sim_time
+            last_use_mpc_tracking = use_mpc_tracking
+            last_control_steer = ego_control.steer
             ego_vehicle.apply_control(ego_control) # 应用控制命令，控制自车的油门、制动和转向，根据当前状态和感知信息计算得到的控制命令进行应用，实现跟车、避障、右侧物体避让等行为
 
             if route_changed_this_frame and selected_plan_trajectory is not None:
